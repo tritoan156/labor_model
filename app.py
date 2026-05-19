@@ -769,19 +769,67 @@ def tab_data_validation(machine_df, acc_df):
 
 def tab_source_data(machine_df, acc_df, schedule_df):
     st.header("📁 Source Data")
-    st.caption("Raw inputs to the model. Filter and search to verify any specific SKU.")
+    st.caption(
+        "Raw inputs to the model. SKUs used in the current schedule/manual entry "
+        "are highlighted and listed first."
+    )
+
+    # Aggregate qty per FG and Accessory SKU from the schedule
+    used_fg = schedule_df.groupby("FG_BASE")["BUILD QTY"].sum().to_dict() \
+        if not schedule_df.empty else {}
+    used_acc = schedule_df[schedule_df["ACC"] != ""].groupby("ACC")["BUILD QTY"].sum().to_dict() \
+        if not schedule_df.empty else {}
 
     sub = st.radio(
         "Choose dataset",
         ["Schedule", "Machine_Clean", "Acc_Clean"],
         horizontal=True,
     )
+
     if sub == "Schedule":
         st.dataframe(schedule_df, use_container_width=True, height=600)
     elif sub == "Machine_Clean":
-        st.dataframe(machine_df, use_container_width=True, height=600)
-    else:
-        st.dataframe(acc_df, use_container_width=True, height=600)
+        only_used = st.checkbox(
+            "Show only SKUs used in current schedule", value=False, key="m_only_used"
+        )
+        m_disp = machine_df.copy()
+        m_disp.insert(0, "Used (qty)", m_disp.index.map(lambda s: used_fg.get(s, 0)))
+        m_disp.insert(1, "In schedule", m_disp["Used (qty)"] > 0)
+        if only_used:
+            m_disp = m_disp[m_disp["In schedule"]]
+        # Sort: used first (by qty desc), then alphabetical
+        m_disp = m_disp.sort_values(
+            by=["In schedule", "Used (qty)", "SKU"],
+            ascending=[False, False, True],
+        )
+        # Highlight rows that are in the schedule
+        def _highlight_machine(row):
+            return ["background-color: #FFF3CD"] * len(row) if row["In schedule"] else [""] * len(row)
+        st.dataframe(
+            m_disp.style.apply(_highlight_machine, axis=1),
+            use_container_width=True, height=600,
+        )
+        st.caption(f"🟡 highlighted = used in current schedule ({sum(m_disp['In schedule'])} of {len(m_disp)} shown)")
+    else:  # Acc_Clean
+        only_used = st.checkbox(
+            "Show only SKUs used in current schedule", value=False, key="a_only_used"
+        )
+        a_disp = acc_df.copy()
+        a_disp.insert(0, "Used (qty)", a_disp.index.map(lambda s: used_acc.get(s, 0)))
+        a_disp.insert(1, "In schedule", a_disp["Used (qty)"] > 0)
+        if only_used:
+            a_disp = a_disp[a_disp["In schedule"]]
+        a_disp = a_disp.sort_values(
+            by=["In schedule", "Used (qty)", "SKU"],
+            ascending=[False, False, True],
+        )
+        def _highlight_acc(row):
+            return ["background-color: #FFF3CD"] * len(row) if row["In schedule"] else [""] * len(row)
+        st.dataframe(
+            a_disp.style.apply(_highlight_acc, axis=1),
+            use_container_width=True, height=600,
+        )
+        st.caption(f"🟡 highlighted = used in current schedule ({sum(a_disp['In schedule'])} of {len(a_disp)} shown)")
 
 
 # =============================================================

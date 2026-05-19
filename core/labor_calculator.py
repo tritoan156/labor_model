@@ -59,10 +59,18 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
         a = None
 
     cls = classify_unit(fg_base)
-    bat = int(m["Bat"]) if m["Bat"] else 1
+
+    # Battery applies only to BOSS units. PDS / SDG (diesel generators) may show
+    # Bat=1 in the source machine catalog, but they have no batteries — so we
+    # force their battery count and battery labor to 0.
+    is_boss = str(fg_base).upper().startswith("BOSS")
+    bat_in_catalog = int(m["Bat"]) if m["Bat"] else 0
+    bat = bat_in_catalog if is_boss else 0
 
     # Battery total
-    if a is not None and (a["BattSubRaw"] > 0 or a["BattPrep"] > 0):
+    if not is_boss:
+        batt_total = 0
+    elif a is not None and (a["BattSubRaw"] > 0 or a["BattPrep"] > 0):
         batt_total = a["BattSubRaw"] * bat + a["BattPrep"]
     elif bat > 0:
         batt_total = DEFAULT_BATT_RAW * bat + DEFAULT_BATT_PREP

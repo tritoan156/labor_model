@@ -70,8 +70,12 @@ def validate_machine_catalog(machine_df: pd.DataFrame) -> list[dict]:
             _add(issues, "warning", "ST abbreviation", str(sku),
                  "Description contains 'ST' — flagged in HANDOFF as likely typo.")
 
-        # 8) Bat count > 0 but Bat is a count, no battery labor in machine (informational)
-        # (just confirms the design — not an error)
+        # 8) Non-BOSS units with Bat > 0 (PDS/SDG should have Bat=0)
+        if row.get("Bat", 0) and row.get("Bat", 0) > 0 \
+                and not str(sku).upper().startswith("BOSS"):
+            _add(issues, "info", "Non-BOSS with Bat>0", str(sku),
+                 f"Bat={row['Bat']} but SKU is not BOSS — battery labor is "
+                 "ignored. Consider setting Bat=0 in the source CSV.")
 
     return issues
 

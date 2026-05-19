@@ -799,8 +799,8 @@ def tab_source_data(machine_df, acc_df, schedule_df):
             m_disp = m_disp[m_disp["In schedule"]]
         # Sort: used first (by qty desc), then alphabetical
         m_disp = m_disp.sort_values(
-            by=["In schedule", "Used (qty)", "SKU"],
-            ascending=[False, False, True],
+            by=["In schedule", "Used (qty)"],
+            ascending=[False, False],
         )
         # Highlight rows that are in the schedule
         def _highlight_machine(row):
@@ -820,8 +820,8 @@ def tab_source_data(machine_df, acc_df, schedule_df):
         if only_used:
             a_disp = a_disp[a_disp["In schedule"]]
         a_disp = a_disp.sort_values(
-            by=["In schedule", "Used (qty)", "SKU"],
-            ascending=[False, False, True],
+            by=["In schedule", "Used (qty)"],
+            ascending=[False, False],
         )
         def _highlight_acc(row):
             return ["background-color: #FFF3CD"] * len(row) if row["In schedule"] else [""] * len(row)

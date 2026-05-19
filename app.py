@@ -27,7 +27,7 @@ from core.scheduler import (
 )
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
-    DEFAULT_SAFETY_FACTOR,
+    DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
 )
 from core.facility_storage import (
     load_facility_crew_df, save_facility_crew_to_github,
@@ -149,6 +149,15 @@ def render_sidebar() -> dict:
         value=DEFAULT_SAFETY_FACTOR, step=0.05,
         help="0.85 = 15% buffer (recommended). 1.00 = raw capacity, no buffer.",
     )
+    efficiency = st.sidebar.slider(
+        "Efficiency factor",
+        min_value=0.40, max_value=1.00,
+        value=DEFAULT_EFFICIENCY_FACTOR, step=0.025,
+        help=(
+            "Fraction of shift time that is actually productive (breaks, setup, "
+            "rework reduce it). 1.00 = no loss. 0.625 ≈ VSM productive-time rate."
+        ),
+    )
     days = st.sidebar.number_input(
         "Working days/month",
         min_value=1, max_value=31,
@@ -219,6 +228,7 @@ def render_sidebar() -> dict:
         "schedule_mode": schedule_mode,
         "location": location,
         "safety": safety,
+        "efficiency": efficiency,
         "days": days,
         "shift": shift,
         "crew_config": edited,
@@ -238,16 +248,42 @@ def tab_overview(units, capacity, batt_type, sched, inputs, schedule_month: str 
     total_batt = int(units["Bat"].where(units["Battery"] > 0, 0).sum())
     total_hc = int(inputs["crew_config"]["HC"].sum())
     active_stations = int((inputs["crew_config"]["HC"] > 0).sum())
+    total_required_hc = int(capacity["required_hc"].sum())
+    total_hc_gap = total_required_hc - total_hc
 
     over_stations = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
     bottleneck = over_stations[0] if over_stations else "None"
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total units", f"{total_units:,}")
     c2.metric("Total labor (person-mins)", f"{int(total_labor):,}")
     c3.metric("Total batteries", f"{total_batt:,}")
-    c4.metric("Total HC", f"{total_hc}", help=f"{active_stations} active stations")
-    c5.metric("Primary bottleneck", bottleneck)
+    c4.metric("Primary bottleneck", bottleneck)
+
+    # Second row — headcount picture
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Current HC", f"{total_hc}", help=f"{active_stations} active stations")
+    c6.metric(
+        "Required HC",
+        f"{total_required_hc}",
+        help=(
+            f"Sum of HC needed at each station, given safety={inputs['safety']:.2f} "
+            f"× efficiency={inputs['efficiency']:.3f}."
+        ),
+    )
+    c7.metric(
+        "HC gap",
+        f"{total_hc_gap:+d}",
+        delta=f"{total_hc_gap:+d}",
+        delta_color="inverse",
+        help="Positive = short staffed; negative = surplus.",
+    )
+    over_stations_count = int((capacity["hc_gap"] > 0).sum())
+    c8.metric(
+        "Stations short",
+        f"{over_stations_count}",
+        help="Stations where Required HC > Current HC.",
+    )
 
     st.markdown("---")
 
@@ -295,13 +331,16 @@ def tab_overview(units, capacity, batt_type, sched, inputs, schedule_month: str 
 def tab_capacity_vs_demand(capacity, inputs):
     st.header("📊 Capacity vs Demand")
     st.caption(
-        f"Shift: {inputs['shift']} min · Days: {inputs['days']} · Safety factor: {inputs['safety']:.2f}  ·  "
+        f"Shift: {inputs['shift']} min · Days: {inputs['days']} · "
+        f"Safety: {inputs['safety']:.2f} · Efficiency: {inputs['efficiency']:.3f}  ·  "
         f"Battery row reports BATTERIES/day (not units/day)."
     )
 
     # Compose a display-friendly DataFrame
     disp = pd.DataFrame(index=capacity.index)
     disp["HC"] = capacity["HC"]
+    disp["Required HC"] = capacity["required_hc"]
+    disp["HC gap"] = capacity["hc_gap"]
     disp["Conc"] = capacity["Conc"]
     disp["Crew"] = capacity["Crew"]
     disp["Labor demand"] = capacity["labor_demand"].astype(int)
@@ -733,7 +772,8 @@ def main():
         return
 
     capacity = build_capacity_table(
-        units, inputs["crew_config"], inputs["shift"], inputs["days"], inputs["safety"],
+        units, inputs["crew_config"], inputs["shift"], inputs["days"],
+        inputs["safety"], inputs["efficiency"],
     )
     batt_sku = battery_demand_by_sku(units)
     batt_type = battery_demand_by_type(units)

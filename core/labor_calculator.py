@@ -2,6 +2,8 @@
 
 Pure functions: take inputs, return DataFrames. No I/O, no UI.
 """
+import math
+
 import pandas as pd
 import numpy as np
 
@@ -172,13 +174,15 @@ def weighted_avg_cycle(units_df: pd.DataFrame, station: str, crew: int) -> float
 
 def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
                           shift_minutes: int, working_days: int,
-                          safety_factor: float) -> pd.DataFrame:
+                          safety_factor: float,
+                          efficiency_factor: float = 1.0) -> pd.DataFrame:
     """Build the headline capacity-vs-demand table.
 
     Args:
       units_df:    Output of expand_schedule()
       crew_config: DataFrame indexed by station_display with cols HC, Conc, Crew
-      shift_minutes, working_days, safety_factor: scalar inputs
+      shift_minutes, working_days, safety_factor, efficiency_factor: scalar inputs.
+        Effective capacity per HC = shift × days × efficiency × safety.
 
     Returns DataFrame indexed by station display name with columns:
       HC, Conc, Crew,
@@ -187,6 +191,7 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
       avg_cycle, units_or_batt, need_per_day,
       thru_cap_safe, thru_util_safe, thru_status_safe,
       thru_cap_raw, thru_util_raw, thru_status_raw,
+      required_hc, hc_gap,
       overall_status
     """
     demand_tbl = station_demand_table(units_df)
@@ -203,8 +208,20 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
         labor_demand = float(demand_tbl.loc[st_key, "demand"])
         units_touching = int(demand_tbl.loc[st_key, "units_touching"])
 
+        # Effective capacity layers:
+        #   raw  = theoretical maximum (HC × shift × days)
+        #   safe = raw × efficiency × safety  (planning capacity)
         labor_cap_raw = hc * shift_minutes * working_days
-        labor_cap_safe = labor_cap_raw * safety_factor
+        labor_cap_safe = labor_cap_raw * efficiency_factor * safety_factor
+
+        # Required HC to meet labor demand at the safe rate (rounded up).
+        # Uses efficiency × safety so the number reflects realistic planning.
+        denom = shift_minutes * working_days * efficiency_factor * safety_factor
+        if denom > 0:
+            required_hc = int(math.ceil(labor_demand / denom)) if labor_demand > 0 else 0
+        else:
+            required_hc = 0
+        hc_gap = required_hc - hc  # +ve = short; -ve = surplus
 
         # For Battery: report in BATTERIES (not units), since multi-batt units
         # consume cell time differently.
@@ -220,7 +237,7 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
         need_per_day = count_for_table / working_days if working_days > 0 else 0
         if avg_cycle > 0:
             thru_cap_raw = conc * (shift_minutes / avg_cycle)
-            thru_cap_safe = thru_cap_raw * safety_factor
+            thru_cap_safe = thru_cap_raw * efficiency_factor * safety_factor
         else:
             thru_cap_raw = thru_cap_safe = 0
 
@@ -253,6 +270,8 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
             "thru_cap_raw": thru_cap_raw,
             "thru_util_raw": thru_util_raw,
             "thru_status_raw": _status_emoji(thru_util_raw, station_missing, has_demand),
+            "required_hc": required_hc,
+            "hc_gap": hc_gap,
             "station_missing": station_missing,
         })
 

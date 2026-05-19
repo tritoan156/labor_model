@@ -10,6 +10,7 @@ LOCATIONS = ["Henderson", "Spartanburg", "Cypress"]
 DEFAULT_SHIFT_MINUTES = 480
 DEFAULT_WORKING_DAYS = 20
 DEFAULT_SAFETY_FACTOR = 0.85
+DEFAULT_EFFICIENCY_FACTOR = 1.00  # 1.00 = no efficiency loss; 0.625 ≈ VSM productive-time rate
 
 # === Final Assembly labor by unit class (person-mins) ===
 # HS = PM only, Final = 30 (1 person × 30 min)

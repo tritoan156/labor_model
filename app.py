@@ -27,6 +27,9 @@ from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
     DEFAULT_SAFETY_FACTOR,
 )
+from core.facility_storage import (
+    load_facility_crew_df, save_facility_crew_to_github,
+)
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -122,19 +125,25 @@ def render_sidebar() -> dict:
         value=DEFAULT_SHIFT_MINUTES, step=30,
     )
 
-    # Crew config
-    st.sidebar.subheader("Station crew")
-    st.sidebar.caption("Edit HC / Conc / Crew per station (changes propagate everywhere).")
+    # Crew config — loaded per-facility from data/facility_crew.json
+    st.sidebar.subheader(f"Station crew — {location}")
+    st.sidebar.caption("HC=0 means the station does not exist at this facility.")
 
-    crew_data = []
-    for st_name, (hc, conc, crew) in STATION_DEFAULTS.items():
-        crew_data.append({"Station": st_name, "HC": hc, "Conc": conc, "Crew": crew})
-    crew_default_df = pd.DataFrame(crew_data).set_index("Station")
+    # Track the previously-selected facility so we can re-load when it changes
+    prev_location = st.session_state.get("_loaded_location")
+    if prev_location != location:
+        # User switched facilities: reload that facility's saved config from disk
+        st.session_state["_loaded_location"] = location
+        loaded_df = load_facility_crew_df(location)
+        # Force the data_editor to re-initialize by using a facility-scoped key
+        st.session_state[f"crew_editor_{location}"] = loaded_df
+    crew_default_df = load_facility_crew_df(location)
+
     edited = st.sidebar.data_editor(
         crew_default_df,
         use_container_width=True,
         num_rows="fixed",
-        key="crew_editor",
+        key=f"crew_editor_{location}",
         column_config={
             "HC": st.column_config.NumberColumn(
                 "HC", min_value=0, step=1,
@@ -147,6 +156,25 @@ def render_sidebar() -> dict:
             "Crew": st.column_config.NumberColumn("Crew", min_value=1, step=1),
         },
     )
+
+    # Save button — persists to GitHub for everyone
+    if st.sidebar.button(f"💾 Save crew for {location}", use_container_width=True):
+        token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+        if not token:
+            st.sidebar.error(
+                "GitHub token not configured. Add `github_token` to Streamlit Secrets "
+                "to enable saving."
+            )
+        else:
+            try:
+                with st.spinner(f"Saving {location} crew to GitHub..."):
+                    save_facility_crew_to_github(location, edited, token)
+                st.sidebar.success(
+                    f"✅ Saved! All users will see the new {location} values "
+                    "after Streamlit Cloud redeploys (~1 min)."
+                )
+            except Exception as e:
+                st.sidebar.error(f"Save failed: {e}")
 
     # Total headcount summary (live)
     total_hc = int(edited["HC"].sum())

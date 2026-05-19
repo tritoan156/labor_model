@@ -86,6 +86,13 @@ def schedule_batteries(units_df: pd.DataFrame,
     if sticky_threshold_min is None:
         sticky_threshold_min = shift_minutes
 
+    # Need at least 1 cell to schedule anything; return empty schedule otherwise
+    if n_cells < 1:
+        return pd.DataFrame(columns=[
+            "cell_id", "day", "start_min", "end_min", "unit_id", "unit_label",
+            "fg_base", "batt_type", "batt_idx", "batt_total", "carryover", "eto",
+        ])
+
     items = build_battery_items(units_df)
     items.sort(key=lambda x: _priority_key(x, type_rank))
 

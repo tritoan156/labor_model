@@ -136,8 +136,8 @@ def render_sidebar() -> dict:
         num_rows="fixed",
         key="crew_editor",
         column_config={
-            "HC": st.column_config.NumberColumn("HC", min_value=0, step=1),
-            "Conc": st.column_config.NumberColumn("Conc", min_value=0, step=1),
+            "HC": st.column_config.NumberColumn("HC", min_value=1, step=1),
+            "Conc": st.column_config.NumberColumn("Conc", min_value=1, step=1),
             "Crew": st.column_config.NumberColumn("Crew", min_value=1, step=1),
         },
     )

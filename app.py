@@ -126,17 +126,11 @@ def render_sidebar() -> dict:
     )
 
     # Crew config — loaded per-facility from data/facility_crew.json
+    # Using a facility-scoped widget key means edits to one facility don't
+    # bleed into another; Streamlit preserves each facility's edits separately.
     st.sidebar.subheader(f"Station crew — {location}")
     st.sidebar.caption("HC=0 means the station does not exist at this facility.")
 
-    # Track the previously-selected facility so we can re-load when it changes
-    prev_location = st.session_state.get("_loaded_location")
-    if prev_location != location:
-        # User switched facilities: reload that facility's saved config from disk
-        st.session_state["_loaded_location"] = location
-        loaded_df = load_facility_crew_df(location)
-        # Force the data_editor to re-initialize by using a facility-scoped key
-        st.session_state[f"crew_editor_{location}"] = loaded_df
     crew_default_df = load_facility_crew_df(location)
 
     edited = st.sidebar.data_editor(

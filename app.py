@@ -15,7 +15,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from core.data_loader import load_machine_labor, load_acc_labor, load_schedule
+from core.data_loader import (
+    load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
+)
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
@@ -96,15 +98,48 @@ def render_sidebar() -> dict:
         help="Filter the schedule to the selected facility.",
     )
 
-    # Schedule upload
+    # Schedule data — pick CSV upload OR manual SKU entry
     st.sidebar.subheader("Schedule data")
-    uploaded = st.sidebar.file_uploader(
-        "Upload production schedule CSV",
-        type=["csv"],
-        help="Defaults to bundled May 2026 Henderson schedule.",
+    schedule_mode = st.sidebar.radio(
+        "Mode",
+        ["📤 Upload CSV", "✏️ Manual entry"],
+        index=0,
+        help="Upload a production schedule, or quickly type a few SKUs for an ad-hoc capacity check.",
     )
-    if uploaded is None:
-        st.sidebar.caption("📁 Using bundled May 2026 Henderson schedule")
+
+    uploaded = None
+    manual_entries = None
+
+    if schedule_mode == "📤 Upload CSV":
+        uploaded = st.sidebar.file_uploader(
+            "Upload production schedule CSV",
+            type=["csv"],
+            help="Defaults to bundled May 2026 Henderson schedule.",
+        )
+        if uploaded is None:
+            st.sidebar.caption("📁 Using bundled May 2026 Henderson schedule")
+    else:
+        st.sidebar.caption(
+            "Type FG SKU + Accessory SKU + Qty. Leave Accessory blank if none."
+        )
+        default_entries = pd.DataFrame({
+            "FG SKU": [""] * 8,
+            "Accessory SKU": [""] * 8,
+            "Qty": [0] * 8,
+        })
+        manual_entries = st.sidebar.data_editor(
+            default_entries,
+            use_container_width=True,
+            num_rows="dynamic",
+            key=f"manual_entries_{location}",
+            column_config={
+                "FG SKU": st.column_config.TextColumn("FG SKU", help="e.g. BOSS25-006"),
+                "Accessory SKU": st.column_config.TextColumn(
+                    "Accessory SKU", help="e.g. BOSS25-A016 (optional)"
+                ),
+                "Qty": st.column_config.NumberColumn("Qty", min_value=0, step=1),
+            },
+        )
 
     # Working time
     st.sidebar.subheader("Working time")
@@ -180,6 +215,8 @@ def render_sidebar() -> dict:
 
     return {
         "uploaded": uploaded,
+        "manual_entries": manual_entries,
+        "schedule_mode": schedule_mode,
         "location": location,
         "safety": safety,
         "days": days,
@@ -667,14 +704,27 @@ def main():
     # Load data with cache
     machine_df = _load_machine_df()
     acc_df = _load_acc_df()
-    schedule_df = _load_schedule_df(inputs["uploaded"], location=inputs["location"])
 
-    if schedule_df.empty:
-        st.error(
-            f"No schedule rows found for **{inputs['location']}**. "
-            "Upload a schedule CSV that contains this location, or select a different location."
+    if inputs.get("schedule_mode") == "✏️ Manual entry":
+        manual_entries = inputs.get("manual_entries")
+        if manual_entries is None or manual_entries.empty:
+            st.info("✏️ Manual entry mode — fill in FG SKU and Qty in the sidebar to begin.")
+            return
+        machine_skus = set(machine_df["SKU"])
+        schedule_df = build_manual_schedule(
+            manual_entries, location=inputs["location"], machine_skus=machine_skus,
         )
-        return
+        if schedule_df.empty:
+            st.info("✏️ Manual entry mode — fill in at least one row (FG SKU + Qty > 0) in the sidebar.")
+            return
+    else:
+        schedule_df = _load_schedule_df(inputs["uploaded"], location=inputs["location"])
+        if schedule_df.empty:
+            st.error(
+                f"No schedule rows found for **{inputs['location']}**. "
+                "Upload a schedule CSV that contains this location, or select a different location."
+            )
+            return
 
     # Compute everything
     units = expand_schedule(schedule_df, machine_df, acc_df)

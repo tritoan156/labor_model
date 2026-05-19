@@ -213,3 +213,54 @@ def load_schedule(
     # Sort: carryover first
     df = df.sort_values(by=["CARRYOVER"], ascending=False).reset_index(drop=True)
     return df
+
+
+def build_manual_schedule(
+    entries: pd.DataFrame,
+    location: str,
+    machine_skus: set | None = None,
+) -> pd.DataFrame:
+    """Build a schedule DataFrame from manual SKU entries (no CSV upload).
+
+    `entries` is a DataFrame with columns: FG SKU, Accessory SKU, Qty.
+    Returns the same schema as `load_schedule()` so the downstream pipeline
+    (`expand_schedule`, `build_capacity_table`, etc.) works unchanged.
+
+    Rows with empty FG SKU or Qty <= 0 are skipped.
+    """
+    rows = []
+    for _, r in entries.iterrows():
+        fg = str(r.get("FG SKU", "") or "").strip()
+        acc = str(r.get("Accessory SKU", "") or "").strip()
+        try:
+            qty = int(r.get("Qty", 0) or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if not fg or qty <= 0:
+            continue
+        rows.append({
+            "LOCATION": location.upper(),
+            "PRODUCTION MONTH": "Manual",
+            "FG SKU ID": fg,
+            "FG ACCRY SKU ID": acc,
+            "BUILD QTY": qty,
+            "LOC": location.upper(),
+            "FG_RAW": fg,
+            "ACC": acc,
+            "CARRYOVER": False,
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # Apply customer-suffix collapse to match the CSV pipeline
+    if machine_skus is not None:
+        decals = df["FG_RAW"].apply(lambda s: collapse_customer_suffix(s, machine_skus))
+        df["FG_BASE"] = decals.apply(lambda x: x[0])
+        df["DECAL"] = decals.apply(lambda x: x[1])
+    else:
+        df["FG_BASE"] = df["FG_RAW"]
+        df["DECAL"] = ""
+
+    return df.reset_index(drop=True)

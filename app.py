@@ -136,10 +136,24 @@ def render_sidebar() -> dict:
         num_rows="fixed",
         key="crew_editor",
         column_config={
-            "HC": st.column_config.NumberColumn("HC", min_value=1, step=1),
-            "Conc": st.column_config.NumberColumn("Conc", min_value=1, step=1),
+            "HC": st.column_config.NumberColumn(
+                "HC", min_value=0, step=1,
+                help="Set to 0 if this station does not exist at the selected facility.",
+            ),
+            "Conc": st.column_config.NumberColumn(
+                "Conc", min_value=0, step=1,
+                help="Set to 0 if this station does not exist at the selected facility.",
+            ),
             "Crew": st.column_config.NumberColumn("Crew", min_value=1, step=1),
         },
+    )
+
+    # Total headcount summary (live)
+    total_hc = int(edited["HC"].sum())
+    active_stations = int((edited["HC"] > 0).sum())
+    st.sidebar.markdown(
+        f"**👥 Total headcount:** {total_hc}  \n"
+        f"**🏭 Active stations:** {active_stations} / {len(edited)}"
     )
 
     return {
@@ -163,20 +177,30 @@ def tab_overview(units, capacity, batt_type, sched, inputs, schedule_month: str 
     total_units = len(units)
     total_labor = units["total_labor"].sum()
     total_batt = int(units["Bat"].where(units["Battery"] > 0, 0).sum())
+    total_hc = int(inputs["crew_config"]["HC"].sum())
+    active_stations = int((inputs["crew_config"]["HC"] > 0).sum())
 
     over_stations = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
     bottleneck = over_stations[0] if over_stations else "None"
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total units", f"{total_units:,}")
     c2.metric("Total labor (person-mins)", f"{int(total_labor):,}")
     c3.metric("Total batteries", f"{total_batt:,}")
-    c4.metric("Primary bottleneck", bottleneck)
+    c4.metric("Total HC", f"{total_hc}", help=f"{active_stations} active stations")
+    c5.metric("Primary bottleneck", bottleneck)
 
     st.markdown("---")
 
     # Bottom line
     st.subheader("🎯 Bottom Line")
+    no_station_list = capacity[capacity["overall_status"] == "🔴 NO STATION"].index.tolist()
+    if no_station_list:
+        st.error(
+            f"**{len(no_station_list)} station(s) NOT AVAILABLE at {inputs['location']}** "
+            f"but have demand: {', '.join(no_station_list)}.  \n"
+            f"Set HC > 0 in the sidebar or remove those units from the schedule."
+        )
     if "🔴 OVER" in capacity["overall_status"].values:
         over_list = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
         st.error(
@@ -387,6 +411,9 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
 
     idle_rows = []
     for disp, row in capacity.iterrows():
+        if row.get("station_missing", False):
+            # Station doesn't exist at this facility — skip from rotation candidates
+            continue
         util = row["labor_util_safe"]
         idle_pct = max(0, 1 - util)
         idle_hc_eq = idle_pct * row["HC"]

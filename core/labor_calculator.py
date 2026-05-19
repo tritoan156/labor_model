@@ -229,6 +229,10 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
         thru_util_safe = need_per_day / thru_cap_safe if thru_cap_safe > 0 else 0
         thru_util_raw = need_per_day / thru_cap_raw if thru_cap_raw > 0 else 0
 
+        # Status flags — distinguish "station doesn't exist here" from real status
+        station_missing = (hc == 0)
+        has_demand = labor_demand > 0
+
         rows.append({
             "station_display": st_disp,
             "station_key": st_key,
@@ -236,19 +240,20 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
             "labor_demand": labor_demand,
             "labor_cap_safe": labor_cap_safe,
             "labor_util_safe": labor_util_safe,
-            "labor_status_safe": _status_emoji(labor_util_safe),
+            "labor_status_safe": _status_emoji(labor_util_safe, station_missing, has_demand),
             "labor_cap_raw": labor_cap_raw,
             "labor_util_raw": labor_util_raw,
-            "labor_status_raw": _status_emoji(labor_util_raw),
+            "labor_status_raw": _status_emoji(labor_util_raw, station_missing, has_demand),
             "avg_cycle": avg_cycle,
             "units_or_batt": count_for_table,
             "need_per_day": need_per_day,
             "thru_cap_safe": thru_cap_safe,
             "thru_util_safe": thru_util_safe,
-            "thru_status_safe": _status_emoji(thru_util_safe),
+            "thru_status_safe": _status_emoji(thru_util_safe, station_missing, has_demand),
             "thru_cap_raw": thru_cap_raw,
             "thru_util_raw": thru_util_raw,
-            "thru_status_raw": _status_emoji(thru_util_raw),
+            "thru_status_raw": _status_emoji(thru_util_raw, station_missing, has_demand),
+            "station_missing": station_missing,
         })
 
     out = pd.DataFrame(rows).set_index("station_display")
@@ -257,8 +262,15 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
     return out
 
 
-def _status_emoji(util: float) -> str:
-    """Return emoji for a utilization fraction."""
+def _status_emoji(util: float, station_missing: bool = False, has_demand: bool = False) -> str:
+    """Return emoji for a utilization fraction.
+
+    Special cases:
+      - station_missing + no demand → "⚪" (N/A — station not at this facility)
+      - station_missing + has demand → "🔴" (NO CAPACITY — units need a station that doesn't exist)
+    """
+    if station_missing:
+        return "🔴" if has_demand else "⚪"
     if util > 1.0:
         return "🔴"
     if util > 0.9:
@@ -276,6 +288,8 @@ def _overall_status(row) -> str:
         row["thru_status_safe"],
         row["thru_status_raw"],
     ]
+    if row.get("station_missing", False):
+        return "🔴 NO STATION" if row.get("labor_demand", 0) > 0 else "⚪ N/A"
     if "🔴" in statuses:
         return "🔴 OVER"
     if "🟠" in statuses:

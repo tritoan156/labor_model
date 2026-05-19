@@ -32,6 +32,7 @@ from core.constants import (
 from core.facility_storage import (
     load_facility_crew_df, save_facility_crew_to_github,
 )
+from core.data_validator import validate_all
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -715,6 +716,57 @@ def tab_cycle_time(units, inputs):
     st.dataframe(df, use_container_width=True, height=600)
 
 
+def tab_data_validation(machine_df, acc_df):
+    st.header("🔍 Data Validation")
+    st.caption(
+        "Automatic checks over the Machine and Accessory catalogs. Re-runs every "
+        "time the app reloads — push updated CSVs to GitHub to clear any issues."
+    )
+
+    issues_df = validate_all(machine_df, acc_df)
+
+    if issues_df.empty:
+        st.success("✅ No issues found in either catalog.")
+        return
+
+    # Summary metrics
+    err_count = int((issues_df["Severity"] == "🔴 Error").sum())
+    warn_count = int((issues_df["Severity"] == "🟡 Warning").sum())
+    info_count = int((issues_df["Severity"] == "ℹ️ Info").sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🔴 Errors", err_count, help="Likely bugs — fix these first.")
+    c2.metric("🟡 Warnings", warn_count, help="Suspicious — review and confirm.")
+    c3.metric("ℹ️ Info", info_count, help="Flags or notes already known about.")
+
+    st.markdown("---")
+
+    # Filter
+    sev_filter = st.multiselect(
+        "Filter by severity",
+        options=["🔴 Error", "🟡 Warning", "ℹ️ Info"],
+        default=["🔴 Error", "🟡 Warning", "ℹ️ Info"],
+    )
+    cat_filter = st.multiselect(
+        "Filter by category",
+        options=sorted(issues_df["Category"].unique().tolist()),
+        default=sorted(issues_df["Category"].unique().tolist()),
+    )
+
+    filtered = issues_df[
+        issues_df["Severity"].isin(sev_filter) & issues_df["Category"].isin(cat_filter)
+    ]
+    st.dataframe(filtered, use_container_width=True, height=600, hide_index=True)
+
+    # Download
+    csv = filtered.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Download issues CSV",
+        csv,
+        "catalog_issues.csv",
+        "text/csv",
+    )
+
+
 def tab_source_data(machine_df, acc_df, schedule_df):
     st.header("📁 Source Data")
     st.caption("Raw inputs to the model. Filter and search to verify any specific SKU.")
@@ -793,6 +845,7 @@ def main():
         "🔧 Mitigation",
         "✅ Floor Verification",
         "⏱ Cycle Time",
+        "🔍 Data Validation",
         "📁 Source Data",
     ])
 
@@ -811,6 +864,8 @@ def main():
     with tabs[6]:
         tab_cycle_time(units, inputs)
     with tabs[7]:
+        tab_data_validation(machine_df, acc_df)
+    with tabs[8]:
         tab_source_data(machine_df, acc_df, schedule_df)
 
 

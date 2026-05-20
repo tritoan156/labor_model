@@ -1,9 +1,14 @@
 """Data loaders for Labor Capacity Model (Henderson, Spartanburg, Cypress).
 
 Reads CSV inputs and returns clean DataFrames:
-  - load_machine_labor() → machine SKU labor table
-  - load_acc_labor()     → accessory SKU labor table
-  - load_schedule()      → work order schedule (auto-detects month, any location)
+  - load_machine_labor()    → machine SKU labor table
+  - load_acc_labor()        → accessory SKU labor table
+  - load_schedule()         → work order schedule (auto-detects month, any location)
+  - load_item_master()      → reference items with per-side install times
+  - load_item_variants()    → family-specific time overrides for items
+  - load_item_packages()    → bundled packages (e.g. CWP, AWP)
+  - load_accessory_items()  → per-SKU item composition (analytical)
+  - resolve_item_time()     → variant-aware lookup for one (item, family, side)
 """
 from __future__ import annotations
 

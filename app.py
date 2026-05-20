@@ -31,7 +31,12 @@ from core.constants import (
 from core.facility_storage import (
     load_facility_crew_df, save_facility_crew_to_github,
 )
-from core.catalog_storage import save_catalog_to_github
+from core.catalog_storage import (
+    save_catalog_to_github,
+    fetch_catalog_csv_from_github,
+    latest_catalog_sha,
+    GitHubConflict,
+)
 from core.data_validator import validate_all
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -1137,6 +1142,11 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         "Catalog to edit", ["Machine (FG SKU)", "Accessory (Acc SKU)"], horizontal=True,
     )
 
+    # Stale-data banner — polls GitHub for the latest commit SHA of the chosen
+    # catalog and warns the user if someone else committed after they loaded.
+    active_file = "data/machine_clean.csv" if catalog == "Machine (FG SKU)" else "data/acc_clean.csv"
+    _render_stale_data_banner(active_file)
+
     if catalog == "Machine (FG SKU)":
         # Machine labor columns the user can edit
         editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "Bat"]
@@ -1404,69 +1414,137 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
             st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
             return
 
-        # Build the new row matching source_df's schema
         today = pd.Timestamp.today().strftime("%Y-%m-%d")
-        new_row = {col: "" for col in source_df.columns}
-        new_row["SKU"] = new_sku
-        new_row["Description"] = new_desc
-        for c, v in extra_text_values.items():
-            if c in new_row:
-                new_row[c] = v
-        for c, v in new_values.items():
-            if c in new_row:
-                new_row[c] = int(v)
-        if "Last Modified" in new_row:
-            new_row["Last Modified"] = today
+        new_sku_upper = new_sku.upper()
 
-        out = source_df.copy()
-        if "Last Modified" not in out.columns:
-            out["Last Modified"] = ""
-
-        # Append the new row. Drop the SKU column duplicate, then reset_index so
-        # the index "SKU" becomes a regular column, write CSV without the index.
-        new_df = pd.DataFrame([new_row])
-        merged = pd.concat(
-            [out.reset_index(drop=True), new_df],
-            ignore_index=True,
-        )
-        csv_text = merged.drop(columns=["SKU"], errors="ignore")
-        # Put SKU back at column 0 for readability
-        csv_text.insert(0, "SKU", merged["SKU"].values if "SKU" in merged.columns else "")
-        csv_text = csv_text.to_csv(index=False)
-
-        try:
-            with st.spinner(f"Adding {new_sku} to {file_path}..."):
-                response = save_catalog_to_github(
-                    csv_text, file_path, token,
-                    message=f"Add new {label} SKU {new_sku} via app",
-                )
-            commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
-            commit_url = (response or {}).get("commit", {}).get("html_url", "")
+        # Fetch + append + push, with one retry on SHA conflict.
+        response = None
+        for attempt in (1, 2):
             try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-            st.success(
-                f"✅ Added `{new_sku}` to `{file_path}` "
-                + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
-                + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
-            )
-        except Exception as e:
-            st.error(f"❌ Save failed: {e}")
+                with st.spinner(
+                    f"Adding {new_sku} to {file_path}"
+                    + (" — retrying" if attempt == 2 else "") + "..."
+                ):
+                    fresh_df, fresh_sha = _read_fresh_csv(file_path, token)
+                    if fresh_df.empty:
+                        st.error("Could not fetch the current catalog from GitHub.")
+                        return
+
+                    # Concurrent-safety check: did someone else just add this SKU?
+                    fresh_skus_upper = set(
+                        fresh_df["SKU"].astype(str).str.strip().str.upper()
+                    ) if "SKU" in fresh_df.columns else set()
+                    if new_sku_upper in fresh_skus_upper:
+                        st.error(
+                            f"`{new_sku}` was just added by another user. "
+                            "Refresh the page to see it, then edit the existing row instead."
+                        )
+                        return
+
+                    if "Last Modified" not in fresh_df.columns:
+                        fresh_df["Last Modified"] = ""
+
+                    # Build the new row matching fresh_df's schema
+                    new_row = {col: "" for col in fresh_df.columns}
+                    new_row["SKU"] = new_sku
+                    if "Description" in new_row:
+                        new_row["Description"] = new_desc
+                    for c, v in extra_text_values.items():
+                        if c in new_row:
+                            new_row[c] = v
+                    for c, v in new_values.items():
+                        if c in new_row:
+                            new_row[c] = int(v)
+                    new_row["Last Modified"] = today
+
+                    merged = pd.concat(
+                        [fresh_df, pd.DataFrame([new_row])],
+                        ignore_index=True,
+                    )
+                    csv_text = merged.to_csv(index=False)
+
+                    response = save_catalog_to_github(
+                        csv_text, file_path, token,
+                        message=f"Add new {label} SKU {new_sku} via app",
+                        sha=fresh_sha,
+                    )
+                break  # success
+            except GitHubConflict:
+                if attempt == 2:
+                    st.error(
+                        "❌ Save failed: another user committed concurrently. "
+                        "Please refresh the page and try again."
+                    )
+                    return
+                continue
+            except Exception as e:
+                st.error(f"❌ Save failed: {e}")
+                return
+
+        commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+        commit_url = (response or {}).get("commit", {}).get("html_url", "")
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.success(
+            f"✅ Added `{new_sku}` to `{file_path}` "
+            + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
+            + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
+        )
 
 
-def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
-    """Merge the edited values into the source DataFrame and push to GitHub."""
+@st.cache_data(ttl=30, show_spinner=False)
+def _latest_sha_cached(file_path: str, token: str) -> "str | None":
+    """Cache the GitHub SHA lookup for 30 seconds to avoid hammering the API."""
+    return latest_catalog_sha(file_path, token)
+
+
+def _render_stale_data_banner(file_path: str) -> None:
+    """Show a yellow banner if another user committed to `file_path` after
+    we recorded our 'loaded' SHA. The user can click 🔄 to refresh."""
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
-        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return  # No token → can't poll; silently skip the banner
+
+    state_key = f"loaded_sha::{file_path}"
+    # On the first render for this file in this session, record the current SHA
+    # as "what the user loaded" — anything newer is stale relative to them.
+    if state_key not in st.session_state:
+        st.session_state[state_key] = _latest_sha_cached(file_path, token)
         return
 
-    # Drop UI-only / derived columns before merging — these are computed in the
-    # display layer and must never be written back to the CSV. We exclude any
-    # name that is also in `editable_cols` so we don't accidentally strip a
-    # real editable column (e.g. "Bat" is a derived column in the accessory
-    # editor but a real editable column in the machine editor).
+    loaded_sha = st.session_state[state_key]
+    latest = _latest_sha_cached(file_path, token)
+    if latest is None or loaded_sha is None:
+        return  # File missing or transient API error — silently skip
+    if latest != loaded_sha:
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            st.warning(
+                f"⚠️ **`{file_path}` was just updated by another user.** "
+                "Your view is stale — refresh before saving so you don't lose their changes."
+            )
+        with c2:
+            if st.button("🔄 Refresh", key=f"stale_refresh_{file_path}"):
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.session_state[state_key] = latest
+                st.rerun()
+
+
+def _compute_cell_diffs(edited, source_df, editable_cols):
+    """Return a list of (sku, col, new_value) tuples for cells the user changed.
+
+    Compares `edited` (user's data_editor output) against `source_df` (the
+    in-memory catalog loaded at session start).
+    """
+    # Drop UI-only / derived columns first. We exclude any name that is also in
+    # `editable_cols` so we don't accidentally strip a real editable column
+    # (e.g. "Bat" is a derived column in the accessory editor but a real
+    # editable column in the machine editor).
     candidate_drops = [
         "Bat", "Total per unit (p-min)",
         "Total (1 batt)", "Total (3 batt)", "Total (5 batt)",
@@ -1475,73 +1553,154 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
     ]
     drop_cols = [c for c in candidate_drops
                  if c in edited.columns and c not in editable_cols]
-    edited = edited.drop(columns=drop_cols)
+    work = edited.drop(columns=drop_cols)
+    if "SKU" not in work.columns:
+        return []
+    ei = work.set_index("SKU")
 
-    # Reset edited to be keyed by SKU; pull labor edits
-    edited_indexed = edited.set_index("SKU")
-    out = source_df.copy()
-    today = pd.Timestamp.today().strftime("%Y-%m-%d")
-    # Make sure the Last Modified column exists in `out` so we can stamp it.
-    if "Last Modified" not in out.columns:
-        out["Last Modified"] = ""
-    changed_rows = 0
-    changed_skus = set()
-    for sku in edited_indexed.index:
-        if sku not in out.index:
+    diffs = []
+    for sku in ei.index:
+        if sku not in source_df.index:
             continue
         for col in editable_cols:
-            new_val = edited_indexed.loc[sku, col]
-            old_val = out.loc[sku, col]
-            if pd.notna(new_val) and float(new_val) != float(old_val):
-                out.loc[sku, col] = new_val
-                changed_rows += 1
-                changed_skus.add(sku)
+            if col not in ei.columns or col not in source_df.columns:
+                continue
+            new_val = ei.loc[sku, col]
+            old_val = source_df.loc[sku, col]
+            try:
+                if pd.notna(new_val) and float(new_val) != float(old_val):
+                    diffs.append((sku, col, new_val))
+            except (TypeError, ValueError):
+                continue
+    return diffs
 
-    # Stamp Last Modified = today for every row that had any cell change
+
+def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols):
+    """Apply the cell-level diffs on top of `fresh_df` (from GitHub) and return CSV text.
+
+    Stamps Last Modified for any row that had a change.
+    """
+    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    if "Last Modified" not in fresh_df.columns:
+        fresh_df["Last Modified"] = ""
+
+    # Build an index lookup. The CSV from GitHub doesn't have SKU as index;
+    # we need to find each SKU by its column value.
+    if "SKU" not in fresh_df.columns:
+        raise RuntimeError("Catalog CSV is missing the SKU column.")
+    fresh_df = fresh_df.copy()
+    fresh_df["__sku_norm"] = fresh_df["SKU"].astype(str).str.strip()
+
+    changed_skus = set()
+    for sku, col, new_val in diffs:
+        mask = fresh_df["__sku_norm"] == str(sku).strip()
+        if not mask.any():
+            continue
+        # Ensure the column exists in the fresh file (e.g. column renames)
+        if col not in fresh_df.columns:
+            fresh_df[col] = 0
+        idx = fresh_df.index[mask][0]
+        fresh_df.at[idx, col] = new_val
+        changed_skus.add(sku)
+
     for sku in changed_skus:
-        out.at[sku, "Last Modified"] = today
+        mask = fresh_df["__sku_norm"] == str(sku).strip()
+        if mask.any():
+            idx = fresh_df.index[mask][0]
+            fresh_df.at[idx, "Last Modified"] = today
 
-    if changed_rows == 0:
+    fresh_df = fresh_df.drop(columns=["__sku_norm"])
+    return fresh_df.to_csv(index=False), len(changed_skus)
+
+
+def _read_fresh_csv(file_path: str, token: str) -> "tuple[pd.DataFrame, str | None]":
+    """Fetch the latest CSV from GitHub and parse it. Returns (df, sha)."""
+    csv_bytes, sha = fetch_catalog_csv_from_github(file_path, token)
+    if not csv_bytes:
+        # First-time write — empty DataFrame is fine (caller will populate)
+        return pd.DataFrame(), sha
+    # Some CSVs are latin-1 encoded; try utf-8 first, fall back to latin-1
+    try:
+        df = pd.read_csv(io.BytesIO(csv_bytes))
+    except UnicodeDecodeError:
+        df = pd.read_csv(io.BytesIO(csv_bytes), encoding="latin-1")
+    return df, sha
+
+
+def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
+    """Cell-level merge: compute the user's diff, fetch the latest file from
+    GitHub, apply only those cells on top, and push back. Retries once on a
+    409 SHA conflict (the narrow race window where someone else committed
+    between our fetch and our PUT).
+    """
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return
+
+    diffs = _compute_cell_diffs(edited, source_df, editable_cols)
+    if not diffs:
         st.info("No changes detected.")
         return
 
-    # Write to CSV string (friendly column names — data_loader handles both formats)
-    csv_text = out.drop(columns=["SKU"], errors="ignore").reset_index().to_csv(index=False)
+    n_diffs = len(diffs)
+    commit_message = f"Update {label} catalog labor values via app ({n_diffs} cells)"
 
-    try:
-        with st.spinner(f"Saving {label} catalog to GitHub ({changed_rows} cells changed)..."):
-            response = save_catalog_to_github(
-                csv_text, file_path, token,
-                message=f"Update {label} catalog labor values via app ({changed_rows} cells)",
-            )
-        commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
-        commit_url = (response or {}).get("commit", {}).get("html_url", "")
-        # Mark the cache dirty so the loaders re-read after the redeploy completes.
-        # (Same-session reload still sees the OLD file because the on-disk copy
-        # on Streamlit Cloud hasn't updated yet — that happens during redeploy.)
+    response = None
+    for attempt in (1, 2):
         try:
-            st.cache_data.clear()
-        except Exception:
-            pass
+            with st.spinner(
+                f"Saving {label} catalog to GitHub "
+                f"({n_diffs} cell change(s){' — retrying' if attempt == 2 else ''})..."
+            ):
+                fresh_df, fresh_sha = _read_fresh_csv(file_path, token)
+                if fresh_df.empty:
+                    st.error("Could not fetch the current catalog from GitHub.")
+                    return
+                csv_text, changed_skus_count = _apply_diffs_and_serialize(
+                    fresh_df, diffs, editable_cols,
+                )
+                response = save_catalog_to_github(
+                    csv_text, file_path, token,
+                    message=commit_message,
+                    sha=fresh_sha,
+                )
+            break  # success — exit retry loop
+        except GitHubConflict:
+            if attempt == 2:
+                st.error(
+                    "❌ Save failed: another user committed concurrently. "
+                    "Please refresh the page (your edits are not lost — re-enter them) and try again."
+                )
+                return
+            # else: loop will retry with a fresh fetch
+            continue
+        except Exception as e:
+            st.error(
+                f"❌ Save failed: {e}\n\n"
+                "Common causes: GitHub token missing the `repo` scope, token expired, "
+                "or the repo path in `core/catalog_storage.py` is wrong."
+            )
+            return
 
-        st.success(
-            f"✅ Saved {changed_rows} cell(s) to `{file_path}` "
-            + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
-        )
-        st.info(
-            "⏳ **Streamlit Cloud is now redeploying** with the new values. "
-            "This takes ~1–2 minutes. After the redeploy completes, refresh the "
-            "browser (Ctrl+F5) to see updates reflected in **Cycle Time**, "
-            "**Capacity**, and the **Accessory catalog** Total column."
-        )
-        if st.button("🔄 I waited — try reloading now", key=f"reload_after_save_{label}"):
-            st.rerun()
-    except Exception as e:
-        st.error(
-            f"❌ Save failed: {e}\n\n"
-            "Common causes: GitHub token missing the `repo` scope, token expired, "
-            "or the repo path in `core/catalog_storage.py` is wrong."
-        )
+    commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+    commit_url = (response or {}).get("commit", {}).get("html_url", "")
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+    st.success(
+        f"✅ Saved {n_diffs} cell change(s) to `{file_path}` "
+        + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
+    )
+    st.info(
+        "⏳ **Streamlit Cloud is now redeploying** with the new values "
+        "(~1–2 minutes). The Refresh banner at the top of this tab will let "
+        "you reload once it's ready."
+    )
+    if st.button("🔄 I waited — try reloading now", key=f"reload_after_save_{label}"):
+        st.rerun()
 
 
 def tab_cycle_time(units, inputs):

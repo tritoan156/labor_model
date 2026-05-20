@@ -3,12 +3,20 @@
 Used by the Floor Verification tab so the floor team can update labor times
 through the UI and have all users see the new values after redeploy.
 
+Concurrency model:
+  • Saves always start by **fetching the current file from GitHub** so
+    concurrent users editing different cells don't overwrite each other.
+  • The PUT uses the GitHub SHA as an optimistic lock — if another commit
+    landed between our fetch and our PUT, the API returns 409 and the caller
+    can refetch + retry.
+
 Requires a GitHub Personal Access Token in `st.secrets["github_token"]`
 (same token used for facility_storage).
 """
 from __future__ import annotations
 
 import base64
+from typing import Optional, Tuple
 
 import requests
 
@@ -16,29 +24,98 @@ GITHUB_REPO = "tritoan156/labor_model"
 GITHUB_BRANCH = "main"
 
 
+def _api_url(file_path: str) -> str:
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
+
+
+def _headers(token: str) -> dict:
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+    }
+
+
+def fetch_catalog_csv_from_github(
+    file_path: str, token: str,
+) -> Tuple[bytes, Optional[str]]:
+    """Fetch the current CSV from GitHub for `file_path`.
+
+    Returns `(csv_bytes, sha)`. If the file doesn't exist yet (404),
+    returns `(b"", None)` so the caller can treat it as an empty starting point.
+    Other HTTP errors raise.
+    """
+    r = requests.get(
+        _api_url(file_path),
+        headers=_headers(token),
+        params={"ref": GITHUB_BRANCH},
+        timeout=15,
+    )
+    if r.status_code == 404:
+        return b"", None
+    r.raise_for_status()
+    payload = r.json()
+    sha = payload.get("sha")
+    content_b64 = payload.get("content", "")
+    try:
+        content_bytes = base64.b64decode(content_b64) if content_b64 else b""
+    except Exception:
+        content_bytes = b""
+    return content_bytes, sha
+
+
+def latest_catalog_sha(file_path: str, token: str) -> Optional[str]:
+    """Lightweight call: return just the latest SHA for `file_path`, or None on 404.
+
+    Used by the stale-data banner so we can compare against the SHA the user
+    loaded their view from.
+    """
+    try:
+        r = requests.get(
+            _api_url(file_path),
+            headers=_headers(token),
+            params={"ref": GITHUB_BRANCH},
+            timeout=10,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json().get("sha")
+    except requests.RequestException:
+        return None
+
+
+class GitHubConflict(Exception):
+    """Raised when the PUT fails because the SHA was stale (HTTP 409 or 422)."""
+
+
 def save_catalog_to_github(
     csv_text: str,
     file_path: str,
     token: str,
     message: str,
+    sha: Optional[str] = None,
 ) -> dict:
-    """Upload a CSV string to GitHub at `file_path` (e.g. "data/machine_clean.csv").
+    """Upload a CSV string to GitHub at `file_path`.
 
-    Returns the GitHub API response JSON. Raises on HTTP error.
+    If `sha` is provided, it's used directly (callers that already fetched the
+    file can reuse it to avoid a second GET). If `sha` is None, we fetch it now.
+
+    Returns the GitHub API response JSON.
+    Raises `GitHubConflict` on 409/422 SHA mismatch so callers can retry.
+    Other HTTP errors raise normally.
     """
-    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-    }
-
-    # Fetch current file SHA (required to update)
-    sha = None
-    r = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=15)
-    if r.status_code == 200:
-        sha = r.json().get("sha")
-    elif r.status_code != 404:
-        r.raise_for_status()
+    if sha is None:
+        # Backwards-compatible path: fetch SHA ourselves
+        r = requests.get(
+            _api_url(file_path),
+            headers=_headers(token),
+            params={"ref": GITHUB_BRANCH},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        elif r.status_code != 404:
+            r.raise_for_status()
 
     payload = {
         "message": message,
@@ -48,6 +125,17 @@ def save_catalog_to_github(
     if sha:
         payload["sha"] = sha
 
-    put_r = requests.put(api_url, headers=headers, json=payload, timeout=15)
+    put_r = requests.put(
+        _api_url(file_path),
+        headers=_headers(token),
+        json=payload,
+        timeout=15,
+    )
+    if put_r.status_code in (409, 422):
+        # 409 = SHA conflict; 422 = sometimes returned when SHA missing/wrong
+        raise GitHubConflict(
+            f"GitHub returned {put_r.status_code} (SHA conflict). "
+            f"Body: {put_r.text[:200]}"
+        )
     put_r.raise_for_status()
     return put_r.json()

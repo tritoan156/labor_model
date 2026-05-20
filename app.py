@@ -119,6 +119,132 @@ def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.Dat
 
 
 # =============================================================
+# SKU browser — supports the manual-entry "Browse catalog" panel
+# =============================================================
+def _render_sku_browser(machine_df, acc_df, location: str, seed_key: str, rev_key: str) -> None:
+    """Sidebar expander that lets the user filter the machine catalog by
+    family + class and add a chosen FG SKU + accessory + qty into the
+    manual entries table (via session_state[seed_key])."""
+    # Build a working frame with classification columns we can filter on
+    work = machine_df.copy()
+    work["__family"] = work["SKU"].astype(str).apply(_machine_family)
+    work["__class"] = work.apply(
+        lambda r: _machine_class(r["SKU"], r.get("Description", "")), axis=1,
+    )
+
+    with st.sidebar.expander("📚 Browse catalog & add SKU", expanded=False):
+        # --- Family selector -------------------------------------------------
+        family_counts = work["__family"].value_counts()
+        # Show only families that actually have rows; order by KNOWN_FAMILIES
+        ordered_families = [f for f in KNOWN_FAMILIES if f in family_counts.index]
+        if "OTHER" in family_counts.index:
+            ordered_families.append("OTHER")
+        family_labels = [f"{f} ({family_counts[f]})" for f in ordered_families]
+        family_choice = st.selectbox(
+            "Family",
+            options=ordered_families,
+            format_func=lambda f: f"{f} ({family_counts.get(f, 0)})",
+            key=f"browse_family_{location}",
+        )
+
+        # --- Class selector --------------------------------------------------
+        in_family = work[work["__family"] == family_choice]
+        class_counts = in_family["__class"].value_counts()
+        # Stable class order
+        class_order_pref = ["Standard Trailer", "Hybrid", "Power Module",
+                            "Head Trailer", "Standard", "⚠ Placeholder"]
+        ordered_classes = [c for c in class_order_pref if c in class_counts.index]
+        # Append any unexpected class types at the end
+        for c in class_counts.index:
+            if c not in ordered_classes:
+                ordered_classes.append(c)
+        class_choices = ["All classes"] + ordered_classes
+        class_choice = st.selectbox(
+            "Class",
+            options=class_choices,
+            key=f"browse_class_{location}",
+        )
+
+        # --- FG SKU selector -------------------------------------------------
+        if class_choice == "All classes":
+            sku_rows = in_family
+        else:
+            sku_rows = in_family[in_family["__class"] == class_choice]
+        sku_rows = sku_rows.sort_values(by="SKU")
+        sku_options = sku_rows["SKU"].astype(str).tolist()
+
+        if not sku_options:
+            st.info("No SKUs match this family + class combination.")
+            return
+
+        def _fg_label(sku):
+            row = sku_rows[sku_rows["SKU"] == sku].iloc[0]
+            bat = int(row.get("Bat", 0) or 0)
+            cls = row["__class"]
+            bat_part = f" · {bat} batt" if bat > 0 else ""
+            placeholder = " ⚠" if cls == "⚠ Placeholder" else ""
+            return f"{sku} — {cls}{bat_part}{placeholder}"
+
+        fg_choice = st.selectbox(
+            "FG SKU",
+            options=sku_options,
+            format_func=_fg_label,
+            key=f"browse_fg_{location}",
+        )
+
+        # --- Accessory selector (matching FG family) -------------------------
+        acc_options = ["(none)"]
+        if acc_df is not None and not acc_df.empty:
+            acc_skus = acc_df["SKU"].astype(str)
+            # Match accessories whose family hint == chosen family
+            acc_mask = acc_skus.apply(_accessory_family_hint).str.upper() == family_choice.upper()
+            acc_subset = acc_df[acc_mask].copy()
+            acc_subset = acc_subset.sort_values(by="SKU")
+            acc_options.extend(acc_subset["SKU"].astype(str).tolist())
+
+        def _acc_label(sku):
+            if sku == "(none)":
+                return "(no accessory)"
+            placeholder = " ⚠ family placeholder" if "999" in sku or "XXX" in sku.upper() else ""
+            return f"{sku}{placeholder}"
+
+        acc_choice = st.selectbox(
+            "Accessory",
+            options=acc_options,
+            format_func=_acc_label,
+            key=f"browse_acc_{location}",
+        )
+
+        # --- Quantity + Add --------------------------------------------------
+        qty = st.number_input(
+            "Qty",
+            min_value=1, max_value=999, value=1, step=1,
+            key=f"browse_qty_{location}",
+        )
+
+        if st.button("➕ Add to manual entries", use_container_width=True,
+                     key=f"browse_add_{location}"):
+            # Merge in-flight data_editor edits, append the new row, bump rev
+            editor_key = f"manual_entries_{location}_v{st.session_state.get(rev_key, 0)}"
+            latest = st.session_state.get(editor_key)
+            if isinstance(latest, pd.DataFrame):
+                current = latest.copy()
+            else:
+                current = st.session_state.get(seed_key, pd.DataFrame(columns=["FG SKU", "Accessory SKU", "Qty"])).copy()
+
+            new_row = {
+                "FG SKU": fg_choice,
+                "Accessory SKU": "" if acc_choice == "(none)" else acc_choice,
+                "Qty": int(qty),
+            }
+            current = pd.concat([current, pd.DataFrame([new_row])], ignore_index=True)
+            st.session_state[seed_key] = current
+            st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
+            st.success(f"Added {fg_choice} × {int(qty)} to manual entries.")
+            st.rerun()
+
+
+# =============================================================
 # Sidebar — global inputs
 # =============================================================
 def render_sidebar() -> dict:
@@ -166,18 +292,37 @@ def render_sidebar() -> dict:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
     else:
         st.sidebar.caption(
-            "Enter FG SKU, Accessory SKU (optional), and Quantity for each row."
+            "Enter FG SKU, Accessory SKU (optional), and Quantity for each row. "
+            "Use **Browse catalog** below to pick from the known SKUs."
         )
+
+        # Cached loaders — same path as main(), no extra I/O
+        machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
+        acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"), _csv_mtime("accessory_items.csv"))
+
+        # Per-location state keys: a seed DataFrame and a revision counter
+        # that we bump every time we programmatically inject a row.
+        seed_key = f"manual_seed_{location}"
+        rev_key = f"manual_rev_{location}"
+
         default_entries = pd.DataFrame({
             "FG SKU": [""] * 8,
             "Accessory SKU": [""] * 8,
             "Qty": [0] * 8,
         })
+        st.session_state.setdefault(seed_key, default_entries)
+        st.session_state.setdefault(rev_key, 0)
+
+        # Render the Browse panel (it may bump rev_key + rerun on Add)
+        _render_sku_browser(machine_df, acc_df, location, seed_key, rev_key)
+
+        # Render the data_editor with a rev-suffixed key so a fresh seed
+        # is picked up after each programmatic add.
         manual_entries = st.sidebar.data_editor(
-            default_entries,
+            st.session_state[seed_key],
             use_container_width=True,
             num_rows="dynamic",
-            key=f"manual_entries_{location}",
+            key=f"manual_entries_{location}_v{st.session_state[rev_key]}",
             column_config={
                 "FG SKU": st.column_config.TextColumn("FG SKU", help="e.g. BOSS25-006"),
                 "Accessory SKU": st.column_config.TextColumn(
@@ -186,6 +331,9 @@ def render_sidebar() -> dict:
                 "Qty": st.column_config.NumberColumn("Qty", min_value=0, step=1),
             },
         )
+
+        # Persist the latest in-flight edits so the next Add appends on top
+        st.session_state[seed_key] = manual_entries
 
     st.sidebar.markdown("---")
 
@@ -1460,6 +1608,47 @@ def _accessory_family_hint(sku: str) -> str:
     import re
     s = str(sku).strip()
     return re.split(r"-A", s)[0]
+
+
+# Order matters: longest prefixes first so BOSS220HS-002 resolves to BOSS220
+# (not the non-existent BOSS2 or BOSS22).
+KNOWN_FAMILIES = ["BOSS400", "BOSS220", "BOSS125", "BOSS70", "BOSS25", "PDS", "SDG"]
+
+
+def _machine_family(sku: str) -> str:
+    """Map an FG SKU to a high-level product family (BOSS25 / BOSS70 / … / PDS / SDG)."""
+    s = str(sku or "").upper().strip()
+    if not s:
+        return "OTHER"
+    for fam in KNOWN_FAMILIES:
+        if s.startswith(fam):
+            return fam
+    return "OTHER"
+
+
+def _machine_class(sku: str, description: str) -> str:
+    """Classify a machine SKU into one of:
+       ⚠ Placeholder · Hybrid · Power Module · Head Trailer · Standard Trailer · Standard.
+
+    PDS/SDG always classify as 'Standard' (compressor/generator base units).
+    BOSS rules apply in this priority: Placeholder > Hybrid > Power Module > Head Trailer > Standard Trailer.
+    """
+    s = str(sku or "").upper().strip()
+    d = str(description or "").upper()
+    fam = _machine_family(s)
+    if "XXX" in s:
+        return "⚠ Placeholder"
+    if fam in ("PDS", "SDG"):
+        return "Standard"
+    if "HYBRID" in d:
+        return "Hybrid"
+    # "HS" or "PM SKID" / "SKID" indicates a Power Module (head-skid only)
+    if "HS" in s.replace(fam, "", 1) or "PM SKID" in d or " SKID " in f" {d} ":
+        return "Power Module"
+    # "HT" in the SKU after the family prefix indicates a Head + Trailer unit
+    if "HT" in s.replace(fam, "", 1):
+        return "Head Trailer"
+    return "Standard Trailer"
 
 
 def _family_battery_count(machine_df, family_prefix: str) -> int:

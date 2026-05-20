@@ -96,6 +96,59 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     return out
 
 
+def load_item_master(path: Path | str | None = None) -> pd.DataFrame:
+    """Load the reference table of installable items (abbreviations + times).
+
+    Returns columns: Abbr, Description, Time on Compressor (min),
+    Time on Generator (min), Notes.
+    """
+    if path is None:
+        path = DATA_DIR / "item_master.csv"
+    if not Path(path).exists():
+        return pd.DataFrame(columns=[
+            "Abbr", "Description",
+            "Time on Compressor (min)", "Time on Generator (min)", "Notes",
+        ])
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=[
+            "Abbr", "Description",
+            "Time on Compressor (min)", "Time on Generator (min)", "Notes",
+        ])
+    for c in df.select_dtypes(include="object").columns:
+        df[c] = df[c].astype(str).str.strip()
+    for c in ("Time on Compressor (min)", "Time on Generator (min)"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    return df.reset_index(drop=True)
+
+
+def load_item_packages(path: Path | str | None = None) -> pd.DataFrame:
+    """Load the reference table of installable packages (item bundles).
+
+    Returns columns: Package, Description, Total Time (min), Components, Notes.
+    Components is a comma-separated list of item abbreviations.
+    """
+    if path is None:
+        path = DATA_DIR / "item_packages.csv"
+    if not Path(path).exists():
+        return pd.DataFrame(columns=[
+            "Package", "Description", "Total Time (min)", "Components", "Notes",
+        ])
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=[
+            "Package", "Description", "Total Time (min)", "Components", "Notes",
+        ])
+    for c in df.select_dtypes(include="object").columns:
+        df[c] = df[c].astype(str).str.strip()
+    if "Total Time (min)" in df.columns:
+        df["Total Time (min)"] = pd.to_numeric(df["Total Time (min)"], errors="coerce").fillna(0)
+    return df.reset_index(drop=True)
+
+
 def load_accessory_items(path: Path | str | None = None) -> pd.DataFrame:
     """Load the optional per-item breakdown of accessory labor.
 

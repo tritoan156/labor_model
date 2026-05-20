@@ -17,7 +17,7 @@ import streamlit as st
 
 from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
-    load_accessory_items,
+    load_accessory_items, load_item_master, load_item_packages,
 )
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
@@ -90,6 +90,16 @@ def _load_acc_df(_mtime: float, _items_mtime: float = 0.0):
 @st.cache_data(show_spinner=False)
 def _load_accessory_items_df(_mtime: float):
     return load_accessory_items()
+
+
+@st.cache_data(show_spinner=False)
+def _load_item_master_df(_mtime: float):
+    return load_item_master()
+
+
+@st.cache_data(show_spinner=False)
+def _load_item_packages_df(_mtime: float):
+    return load_item_packages()
 
 
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
@@ -1238,7 +1248,120 @@ def tab_data_validation(machine_df, acc_df):
     )
 
 
-def _render_acc_items_view(acc_items_df, acc_df, used_acc):
+def _render_item_master_view(item_master_df):
+    """Master list of installable items (abbreviation, description, times)."""
+    st.subheader("📒 Item master")
+    st.markdown(
+        "**Reference table** of every installable item, with the typical install "
+        "time on a Compressor unit (rolls up to Compressor station) and on a "
+        "Generator unit (rolls up to GenAcc station). Edit values inline and "
+        "click Save to persist."
+    )
+    st.caption(
+        "Some items vary by FG family (e.g. `RHK`, `SL`, `LF`, `TB`) — those "
+        "are flagged in the Notes column. The simple times here apply to the "
+        "typical case; family-specific overrides should be entered in the "
+        "**Accessory item details** view for the specific accessory."
+    )
+
+    edited = st.data_editor(
+        item_master_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="item_master_editor",
+        height=560,
+        column_config={
+            "Abbr": st.column_config.TextColumn(
+                "Abbr", help="Short code used in accessory descriptions (e.g. EBH, BHW, TEL).",
+                width="small",
+            ),
+            "Description": st.column_config.TextColumn("Description", width="large"),
+            "Time on Compressor (min)": st.column_config.NumberColumn(
+                "Compressor min", min_value=0, step=1,
+                help="Install time when the item is on a Compressor product (PDS series).",
+            ),
+            "Time on Generator (min)": st.column_config.NumberColumn(
+                "Generator min", min_value=0, step=1,
+                help="Install time when the item is on a Generator product (SDG / BOSS series).",
+            ),
+            "Notes": st.column_config.TextColumn("Notes", width="large"),
+        },
+    )
+
+    if st.button("💾 Save item master to GitHub", use_container_width=True):
+        _save_simple_csv(edited, "data/item_master.csv", "item master")
+
+
+def _render_item_packages_view(packages_df, item_master_df):
+    """Reference table of cold-weather / accessory packages (item bundles)."""
+    st.subheader("📦 Item packages")
+    st.markdown(
+        "**Pre-defined bundles** of items often ordered together (e.g. "
+        "Cold Weather Package). Each bundle's Components is a comma-separated "
+        "list of item abbreviations from the Item master."
+    )
+
+    # Quick check: are all package components defined in the item master?
+    if not packages_df.empty and not item_master_df.empty:
+        all_abbrs = set(item_master_df["Abbr"].astype(str).str.strip())
+        problems = []
+        for _, row in packages_df.iterrows():
+            comps = [c.strip() for c in str(row.get("Components", "")).split(",") if c.strip()]
+            missing = [c for c in comps if c not in all_abbrs]
+            if missing:
+                problems.append(f"`{row['Package']}` references unknown item(s): {', '.join(missing)}")
+        if problems:
+            st.warning("⚠️ " + " · ".join(problems))
+
+    edited = st.data_editor(
+        packages_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="item_packages_editor",
+        height=400,
+        column_config={
+            "Package": st.column_config.TextColumn("Package code", width="small"),
+            "Description": st.column_config.TextColumn("Description", width="large"),
+            "Total Time (min)": st.column_config.NumberColumn(
+                "Total time (min)", min_value=0, step=1,
+                help="Total install time for the whole package.",
+            ),
+            "Components": st.column_config.TextColumn(
+                "Components",
+                help="Comma-separated abbreviations from the Item master.",
+                width="large",
+            ),
+            "Notes": st.column_config.TextColumn("Notes"),
+        },
+    )
+
+    if st.button("💾 Save item packages to GitHub", use_container_width=True):
+        _save_simple_csv(edited, "data/item_packages.csv", "item packages")
+
+
+def _save_simple_csv(df, file_path, label):
+    """Generic save helper — write a DataFrame as CSV to GitHub."""
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
+        return
+    try:
+        # Drop rows where every column is empty/NaN
+        clean = df.dropna(how="all").copy()
+        for c in clean.select_dtypes(include="object").columns:
+            clean[c] = clean[c].astype(str).str.strip()
+        csv_text = clean.to_csv(index=False)
+        with st.spinner(f"Saving {label} to GitHub..."):
+            save_catalog_to_github(
+                csv_text, file_path, token,
+                message=f"Update {label} via app",
+            )
+        st.success(f"✅ Saved {label}! New values apply after the app redeploys (~1 min).")
+    except Exception as e:
+        st.error(f"Save failed: {e}")
+
+
+def _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df):
     """Editable view of per-item accessory labor that rolls up into GenAcc/PMAcc/Compressor."""
     st.subheader("🧩 Individual accessory items")
     st.markdown(
@@ -1331,7 +1454,8 @@ def _render_acc_items_view(acc_items_df, acc_df, used_acc):
                 st.error(f"Save failed: {e}")
 
 
-def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df):
+def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
+                     item_master_df, item_packages_df):
     st.header("📁 Source Data")
     st.caption(
         "Raw inputs to the model. SKUs used in the current schedule/manual entry "
@@ -1346,12 +1470,25 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df):
 
     sub = st.radio(
         "Choose dataset",
-        ["Schedule", "Machine catalog", "Accessory catalog", "Accessory item details"],
+        [
+            "Schedule",
+            "Machine catalog",
+            "Accessory catalog",
+            "Item master",
+            "Item packages",
+            "Accessory item details",
+        ],
         horizontal=True,
     )
 
+    if sub == "Item master":
+        _render_item_master_view(item_master_df)
+        return
+    if sub == "Item packages":
+        _render_item_packages_view(item_packages_df, item_master_df)
+        return
     if sub == "Accessory item details":
-        _render_acc_items_view(acc_items_df, acc_df, used_acc)
+        _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df)
         return
 
     if sub == "Schedule":
@@ -1420,6 +1557,8 @@ def main():
     machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
     acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"), _csv_mtime("accessory_items.csv"))
     acc_items_df = _load_accessory_items_df(_csv_mtime("accessory_items.csv"))
+    item_master_df = _load_item_master_df(_csv_mtime("item_master.csv"))
+    item_packages_df = _load_item_packages_df(_csv_mtime("item_packages.csv"))
 
     if inputs.get("schedule_mode") == "✏️ Type a few SKUs":
         manual_entries = inputs.get("manual_entries")
@@ -1486,7 +1625,8 @@ def main():
     with tabs[6]:
         tab_data_validation(machine_df, acc_df)
     with tabs[7]:
-        tab_source_data(machine_df, acc_df, schedule_df, acc_items_df)
+        tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
+                         item_master_df, item_packages_df)
 
 
 if __name__ == "__main__":

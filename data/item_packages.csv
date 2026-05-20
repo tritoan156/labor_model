@@ -1,0 +1,4 @@
+Package,Description,Total Time (min),Components,Notes
+CWP,Cold Weather Package,230,"CCV,EH,EBH,BHW,HFF",
+NE,New England Cold Weather Package,135,"EBH,CCV,HFF,RHK",
+AWP,Arctic Cold Weather Package,275,"CCV,EH,EBH,BHW,HFF,LRH",

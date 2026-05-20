@@ -916,6 +916,9 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
             hide_index=True,
         )
 
+        # Pending-changes preview so the user can verify their edits before saving
+        _render_pending_changes(edited, machine_df, editable_cols)
+
         # Save button
         if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
             _save_catalog_csv(
@@ -988,6 +991,9 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
             "FG family. Family-mixed counts use the maximum (e.g. BOSS220 → 3)."
         )
 
+        # Pending-changes preview so the user can verify their edits before saving
+        _render_pending_changes(edited, acc_df, editable_cols)
+
         if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
             _save_catalog_csv(
                 edited=edited,
@@ -996,6 +1002,47 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
                 file_path="data/acc_clean.csv",
                 label="accessory",
             )
+
+
+def _render_pending_changes(edited, source_df, editable_cols):
+    """Show a small expander listing cells where the edited value differs from
+    the source. Helps the user confirm their edits are captured before clicking
+    Save (and helps debug 'nothing happens' cases)."""
+    if edited is None or len(edited) == 0:
+        return
+    if "SKU" not in edited.columns:
+        return
+    try:
+        ei = edited.set_index("SKU")
+    except Exception:
+        return
+
+    diffs = []
+    for sku in ei.index:
+        if sku not in source_df.index:
+            continue
+        for col in editable_cols:
+            if col not in ei.columns or col not in source_df.columns:
+                continue
+            new_val = ei.at[sku, col]
+            old_val = source_df.at[sku, col]
+            try:
+                if pd.notna(new_val) and float(new_val) != float(old_val):
+                    diffs.append({
+                        "SKU": sku, "Column": col,
+                        "Old": float(old_val), "New": float(new_val),
+                        "Δ": float(new_val) - float(old_val),
+                    })
+            except (TypeError, ValueError):
+                continue
+
+    if not diffs:
+        st.caption("ℹ️ No pending edits — make a change in the table above before saving.")
+        return
+
+    n = len(diffs)
+    with st.expander(f"📝 {n} pending change(s) — preview before saving", expanded=False):
+        st.dataframe(pd.DataFrame(diffs), use_container_width=True, hide_index=True)
 
 
 def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
@@ -1043,15 +1090,38 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
 
     try:
         with st.spinner(f"Saving {label} catalog to GitHub ({changed_rows} cells changed)..."):
-            save_catalog_to_github(
+            response = save_catalog_to_github(
                 csv_text, file_path, token,
                 message=f"Update {label} catalog labor values via app ({changed_rows} cells)",
             )
+        commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+        commit_url = (response or {}).get("commit", {}).get("html_url", "")
+        # Mark the cache dirty so the loaders re-read after the redeploy completes.
+        # (Same-session reload still sees the OLD file because the on-disk copy
+        # on Streamlit Cloud hasn't updated yet — that happens during redeploy.)
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+
         st.success(
-            f"✅ Saved! {changed_rows} cells updated. All users see new values after redeploy (~1 min)."
+            f"✅ Saved {changed_rows} cell(s) to `{file_path}` "
+            + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
         )
+        st.info(
+            "⏳ **Streamlit Cloud is now redeploying** with the new values. "
+            "This takes ~1–2 minutes. After the redeploy completes, refresh the "
+            "browser (Ctrl+F5) to see updates reflected in **Cycle Time**, "
+            "**Capacity**, and the **Accessory catalog** Total column."
+        )
+        if st.button("🔄 I waited — try reloading now", key=f"reload_after_save_{label}"):
+            st.rerun()
     except Exception as e:
-        st.error(f"Save failed: {e}")
+        st.error(
+            f"❌ Save failed: {e}\n\n"
+            "Common causes: GitHub token missing the `repo` scope, token expired, "
+            "or the repo path in `core/catalog_storage.py` is wrong."
+        )
 
 
 def tab_cycle_time(units, inputs):

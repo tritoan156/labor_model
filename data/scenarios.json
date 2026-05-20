@@ -1,5 +1,31 @@
 {
-  "Henderson": {},
+  "Henderson": {
+    "Hen 2026 June": {
+      "saved_at": "2026-05-20T22:56:05",
+      "entries": [
+        {
+          "FG SKU": "BOSS400HS-001",
+          "Accessory SKU": "",
+          "Qty": 5
+        },
+        {
+          "FG SKU": "BOSS220HS-002",
+          "Accessory SKU": "BOSS220-A001",
+          "Qty": 17
+        },
+        {
+          "FG SKU": "BOSS70HS-001",
+          "Accessory SKU": "BOSS70-A001",
+          "Qty": 77
+        },
+        {
+          "FG SKU": "BOSS70-40 XXX",
+          "Accessory SKU": "BOSS70-A013",
+          "Qty": 98
+        }
+      ]
+    }
+  },
   "Spartanburg": {},
   "Cypress": {}
 }

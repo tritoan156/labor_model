@@ -17,6 +17,7 @@ import streamlit as st
 
 from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
+    load_accessory_items,
 )
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
@@ -80,8 +81,15 @@ def _load_machine_df(_mtime: float):
 
 
 @st.cache_data(show_spinner=False)
-def _load_acc_df(_mtime: float):
+def _load_acc_df(_mtime: float, _items_mtime: float = 0.0):
+    """The acc DataFrame depends on BOTH acc_clean.csv and accessory_items.csv,
+    so we take both mtimes as cache keys."""
     return load_acc_labor()
+
+
+@st.cache_data(show_spinner=False)
+def _load_accessory_items_df(_mtime: float):
+    return load_accessory_items()
 
 
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
@@ -1230,7 +1238,100 @@ def tab_data_validation(machine_df, acc_df):
     )
 
 
-def tab_source_data(machine_df, acc_df, schedule_df):
+def _render_acc_items_view(acc_items_df, acc_df, used_acc):
+    """Editable view of per-item accessory labor that rolls up into GenAcc/PMAcc/Compressor."""
+    st.subheader("🧩 Individual accessory items")
+    st.markdown(
+        "Track each item that makes up an accessory (e.g. brake kit, decals, "
+        "filters). The **sum of items per category** replaces the aggregate "
+        "value in the accessory catalog when calculating labor."
+    )
+    st.caption(
+        "**Category** must be one of: `Gen` (rolls up to GenAcc) · "
+        "`PM` (rolls up to PMAcc) · `Compressor` (rolls up to Compressor station)."
+    )
+
+    # Helpful preview: per-SKU + Category sums vs the catalog aggregates
+    if not acc_items_df.empty:
+        roll = (
+            acc_items_df.groupby(["Accessory SKU", "Category"])["Time (min)"]
+            .sum().reset_index(name="Sum of items")
+        )
+        cat_to_col = {"Gen": "GenAcc", "PM": "PMAcc", "Compressor": "Compressor"}
+        roll["Catalog value"] = roll.apply(
+            lambda r: float(acc_df.at[r["Accessory SKU"], cat_to_col[r["Category"]]])
+                      if r["Accessory SKU"] in acc_df.index and r["Category"] in cat_to_col
+                      else 0.0,
+            axis=1,
+        )
+        roll["Used in schedule"] = roll["Accessory SKU"].map(lambda s: used_acc.get(s, 0) > 0)
+        roll = roll.sort_values(by=["Used in schedule", "Accessory SKU", "Category"],
+                                 ascending=[False, True, True]).reset_index(drop=True)
+
+        with st.expander("📊 Roll-up preview — sum of items per accessory & category", expanded=False):
+            st.caption(
+                "Items override the catalog aggregate when present. Mismatch is OK if you "
+                "have not yet entered every item for a given accessory."
+            )
+            st.dataframe(roll, use_container_width=True, hide_index=True, height=320)
+
+    st.markdown("#### ✏️ Item rows")
+    st.caption("Add, edit, or remove rows. Click **Save** to push changes to GitHub.")
+
+    # Editable table
+    editor_seed = acc_items_df.copy() if not acc_items_df.empty else pd.DataFrame(
+        columns=["Accessory SKU", "Category", "Item", "Time (min)", "Notes"]
+    )
+
+    edited = st.data_editor(
+        editor_seed,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="acc_items_editor",
+        height=520,
+        column_config={
+            "Accessory SKU": st.column_config.TextColumn(
+                "Accessory SKU", help="e.g. BOSS25-A016",
+            ),
+            "Category": st.column_config.SelectboxColumn(
+                "Category",
+                options=["Gen", "PM", "Compressor"],
+                help="Which station this item rolls up to.",
+                required=True,
+            ),
+            "Item": st.column_config.TextColumn("Item", help="e.g. Brake kit, Decals, Air filter"),
+            "Time (min)": st.column_config.NumberColumn(
+                "Time (min)", min_value=0, step=1,
+                help="Labor time for this single item (person-minutes).",
+            ),
+            "Notes": st.column_config.TextColumn("Notes", help="Optional notes."),
+        },
+    )
+
+    if st.button("💾 Save accessory items to GitHub", use_container_width=True):
+        token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+        if not token:
+            st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
+        else:
+            try:
+                # Clean up: drop empty rows
+                clean = edited.copy()
+                clean["Accessory SKU"] = clean["Accessory SKU"].astype(str).str.strip()
+                clean["Category"] = clean["Category"].astype(str).str.strip()
+                clean = clean[(clean["Accessory SKU"] != "") & (clean["Category"] != "")
+                              & (clean["Accessory SKU"] != "nan")]
+                csv_text = clean.to_csv(index=False)
+                with st.spinner("Saving accessory items to GitHub..."):
+                    save_catalog_to_github(
+                        csv_text, "data/accessory_items.csv", token,
+                        message=f"Update accessory items via app ({len(clean)} rows)",
+                    )
+                st.success("✅ Saved! New values apply after the app redeploys (~1 min).")
+            except Exception as e:
+                st.error(f"Save failed: {e}")
+
+
+def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df):
     st.header("📁 Source Data")
     st.caption(
         "Raw inputs to the model. SKUs used in the current schedule/manual entry "
@@ -1245,13 +1346,17 @@ def tab_source_data(machine_df, acc_df, schedule_df):
 
     sub = st.radio(
         "Choose dataset",
-        ["Schedule", "Machine_Clean", "Acc_Clean"],
+        ["Schedule", "Machine catalog", "Accessory catalog", "Accessory item details"],
         horizontal=True,
     )
 
+    if sub == "Accessory item details":
+        _render_acc_items_view(acc_items_df, acc_df, used_acc)
+        return
+
     if sub == "Schedule":
         st.dataframe(schedule_df, use_container_width=True, height=600)
-    elif sub == "Machine_Clean":
+    elif sub == "Machine catalog":
         only_used = st.checkbox(
             "Show only SKUs used in current schedule", value=False, key="m_only_used"
         )
@@ -1273,7 +1378,7 @@ def tab_source_data(machine_df, acc_df, schedule_df):
             use_container_width=True, height=600,
         )
         st.caption(f"🟡 highlighted = used in current schedule ({sum(m_disp['In schedule'])} of {len(m_disp)} shown)")
-    else:  # Acc_Clean
+    else:  # Accessory catalog
         only_used = st.checkbox(
             "Show only SKUs used in current schedule", value=False, key="a_only_used"
         )
@@ -1313,7 +1418,8 @@ def main():
 
     # Load data with cache
     machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
-    acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"))
+    acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"), _csv_mtime("accessory_items.csv"))
+    acc_items_df = _load_accessory_items_df(_csv_mtime("accessory_items.csv"))
 
     if inputs.get("schedule_mode") == "✏️ Type a few SKUs":
         manual_entries = inputs.get("manual_entries")
@@ -1380,7 +1486,7 @@ def main():
     with tabs[6]:
         tab_data_validation(machine_df, acc_df)
     with tabs[7]:
-        tab_source_data(machine_df, acc_df, schedule_df)
+        tab_source_data(machine_df, acc_df, schedule_df, acc_items_df)
 
 
 if __name__ == "__main__":

@@ -1006,12 +1006,18 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
         return
 
     # Drop UI-only / derived columns before merging — these are computed in the
-    # display layer and must never be written back to acc_clean.csv. The legacy
-    # "Total (N batt)" names are kept for backward compatibility with old state.
-    drop_cols = [c for c in ["Bat", "Total per unit (p-min)",
-                              "Total (1 batt)", "Total (3 batt)", "Total (5 batt)",
-                              "Used (qty)", "In schedule"]
-                 if c in edited.columns]
+    # display layer and must never be written back to the CSV. We exclude any
+    # name that is also in `editable_cols` so we don't accidentally strip a
+    # real editable column (e.g. "Bat" is a derived column in the accessory
+    # editor but a real editable column in the machine editor).
+    candidate_drops = [
+        "Bat", "Total per unit (p-min)",
+        "Total (1 batt)", "Total (3 batt)", "Total (5 batt)",
+        "Total labor (p-min)",
+        "Used (qty)", "In schedule",
+    ]
+    drop_cols = [c for c in candidate_drops
+                 if c in edited.columns and c not in editable_cols]
     edited = edited.drop(columns=drop_cols)
 
     # Reset edited to be keyed by SKU; pull labor edits

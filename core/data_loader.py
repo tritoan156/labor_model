@@ -72,7 +72,7 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["PDI"] = pd.to_numeric(df[pdi_col], errors="coerce").fillna(0) if pdi_col else 0
     out["QC"] = pd.to_numeric(df[qc_col], errors="coerce").fillna(0) if qc_col else 0
     out["Ship"] = pd.to_numeric(df[ship_col], errors="coerce").fillna(0) if ship_col else 0
-    out["Bat"] = pd.to_numeric(df[bat_col], errors="coerce").fillna(1).astype(int) if bat_col else 1
+    out["Bat"] = pd.to_numeric(df[bat_col], errors="coerce").fillna(0).astype(int) if bat_col else 0
 
     # Apply battery-count overrides
     for sku, count in BATTERY_COUNT_OVERRIDES.items():

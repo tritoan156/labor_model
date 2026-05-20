@@ -59,15 +59,25 @@ st.markdown(
 
 
 # =============================================================
-# Data loading (cached)
+# Data loading (cached, with file-mtime invalidation)
 # =============================================================
+def _csv_mtime(filename: str) -> float:
+    """Return the mtime of a CSV under data/, or 0 if missing.
+
+    Including this value as a cache argument makes Streamlit invalidate the
+    cached DataFrame whenever the CSV file is updated (e.g. via git push).
+    """
+    p = DATA_DIR / filename
+    return p.stat().st_mtime if p.exists() else 0.0
+
+
 @st.cache_data(show_spinner=False)
-def _load_machine_df():
+def _load_machine_df(_mtime: float):
     return load_machine_labor()
 
 
 @st.cache_data(show_spinner=False)
-def _load_acc_df():
+def _load_acc_df(_mtime: float):
     return load_acc_labor()
 
 
@@ -77,7 +87,7 @@ def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.Dat
     Passes the file as a BytesIO object so no temp file is written to disk,
     which prevents race conditions when multiple users upload simultaneously.
     """
-    machine_skus = set(_load_machine_df()["SKU"])
+    machine_skus = set(_load_machine_df(_csv_mtime("machine_clean.csv"))["SKU"])
     if uploaded_file is not None:
         buf = io.BytesIO(uploaded_file.getvalue())
         return load_schedule(buf, location=location, machine_skus=machine_skus)
@@ -841,8 +851,8 @@ def main():
     inputs = render_sidebar()
 
     # Load data with cache
-    machine_df = _load_machine_df()
-    acc_df = _load_acc_df()
+    machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
+    acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"))
 
     if inputs.get("schedule_mode") == "✏️ Manual entry":
         manual_entries = inputs.get("manual_entries")

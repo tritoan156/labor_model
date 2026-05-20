@@ -105,6 +105,9 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["QC"] = pd.to_numeric(df[qc_col], errors="coerce").fillna(0) if qc_col else zeros
     out["Ship"] = pd.to_numeric(df[ship_col], errors="coerce").fillna(0) if ship_col else zeros
     out["Bat"] = pd.to_numeric(df[bat_col], errors="coerce").fillna(0).astype(int) if bat_col else int_zeros
+    # Last-modified date — empty for rows never edited through the app.
+    mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
+    out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * n, index=df.index, dtype=object)
 
     # Apply battery-count overrides
     for sku, count in BATTERY_COUNT_OVERRIDES.items():
@@ -382,6 +385,9 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["PMAcc"] = pd.to_numeric(df[pm_col], errors="coerce").fillna(0) if pm_col else zeros
     out["GenAcc"] = pd.to_numeric(df[gen_col], errors="coerce").fillna(0) if gen_col else zeros
     out["Compressor"] = pd.to_numeric(df[com_col], errors="coerce").fillna(0) if com_col else zeros
+    # Last-modified date — empty for rows never edited through the app.
+    mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
+    out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * len(df), index=df.index, dtype=object)
 
     out = out[out["SKU"].notna() & (out["SKU"] != "")]
     out = out.set_index("SKU", drop=False)

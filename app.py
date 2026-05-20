@@ -1147,12 +1147,16 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
             by=["In schedule", "Used (qty)"], ascending=[False, False]
         ).reset_index(drop=True)
 
-        # Column config: read-only for SKU/Description, editable for labor
+        # Column config: read-only for SKU/Description/Last Modified, editable for labor
         col_cfg = {
             "SKU": st.column_config.TextColumn("SKU", disabled=True),
             "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
             "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
             "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
+            "Last Modified": st.column_config.TextColumn(
+                "Last Modified", disabled=True,
+                help="Date this row was last updated through the app. Blank = never edited.",
+            ),
         }
         for c in editable_cols:
             col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
@@ -1179,6 +1183,14 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
                 file_path="data/machine_clean.csv",
                 label="machine",
             )
+
+        # New-SKU form below the editor
+        _render_add_new_sku(
+            source_df=machine_df,
+            editable_cols=editable_cols,
+            file_path="data/machine_clean.csv",
+            label="machine",
+        )
 
     else:  # Accessory
         editable_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
@@ -1222,6 +1234,10 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
                 "Total per unit (p-min)", disabled=True,
                 help="Non-battery labor + BattSubRaw × Bat. Bat comes from the machine catalog for the accessory's family.",
             ),
+            "Last Modified": st.column_config.TextColumn(
+                "Last Modified", disabled=True,
+                help="Date this row was last updated through the app. Blank = never edited.",
+            ),
         }
         for c in editable_cols:
             col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
@@ -1253,6 +1269,14 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
                 file_path="data/acc_clean.csv",
                 label="accessory",
             )
+
+        # New-SKU form below the editor
+        _render_add_new_sku(
+            source_df=acc_df,
+            editable_cols=editable_cols,
+            file_path="data/acc_clean.csv",
+            label="accessory",
+        )
 
 
 def _render_pending_changes(edited, source_df, editable_cols):
@@ -1296,6 +1320,121 @@ def _render_pending_changes(edited, source_df, editable_cols):
         st.dataframe(pd.DataFrame(diffs), use_container_width=True, hide_index=True)
 
 
+def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_cols=None):
+    """Form to add a brand-new SKU to a catalog and immediately push to GitHub.
+
+    Args:
+      source_df:     The loaded catalog DataFrame (machine_df or acc_df).
+      editable_cols: Labor columns the user can fill in (numbers).
+      file_path:     Path in the repo (e.g. "data/machine_clean.csv").
+      label:         Display label for messages ("machine" or "accessory").
+      extra_text_cols: Optional extra text columns to capture (defaults to none).
+    """
+    extra_text_cols = extra_text_cols or []
+    with st.expander(f"➕ Add a new {label} SKU", expanded=False):
+        st.caption(
+            f"Use this to add a brand-new {label} SKU that isn't in the catalog "
+            "yet. The new row is committed to GitHub immediately along with today's "
+            "date in **Last Modified**."
+        )
+        with st.form(f"add_new_{label}", clear_on_submit=True):
+            new_sku = st.text_input(
+                "SKU", help="Must be unique — case-insensitive check against the catalog.",
+                key=f"new_sku_{label}",
+            ).strip()
+            new_desc = st.text_input(
+                "Description", help="Short, descriptive text shown in catalog views.",
+                key=f"new_desc_{label}",
+            ).strip()
+
+            extra_text_values = {}
+            for c in extra_text_cols:
+                extra_text_values[c] = st.text_input(
+                    c, key=f"new_text_{label}_{c}",
+                ).strip()
+
+            cols_per_row = 4
+            new_values = {}
+            for i in range(0, len(editable_cols), cols_per_row):
+                row_cols = st.columns(cols_per_row)
+                for j, c in enumerate(editable_cols[i:i + cols_per_row]):
+                    new_values[c] = row_cols[j].number_input(
+                        c, min_value=0, step=1, value=0,
+                        key=f"new_num_{label}_{c}",
+                    )
+
+            submitted = st.form_submit_button(
+                f"💾 Add {label} SKU and save to GitHub", use_container_width=True,
+            )
+
+        if not submitted:
+            return
+
+        if not new_sku:
+            st.error("SKU cannot be empty.")
+            return
+        existing = {str(s).upper() for s in source_df["SKU"].astype(str)}
+        if new_sku.upper() in existing:
+            st.error(f"`{new_sku}` is already in the {label} catalog. "
+                     "Edit the existing row in the table above instead.")
+            return
+
+        token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+        if not token:
+            st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+            return
+
+        # Build the new row matching source_df's schema
+        today = pd.Timestamp.today().strftime("%Y-%m-%d")
+        new_row = {col: "" for col in source_df.columns}
+        new_row["SKU"] = new_sku
+        new_row["Description"] = new_desc
+        for c, v in extra_text_values.items():
+            if c in new_row:
+                new_row[c] = v
+        for c, v in new_values.items():
+            if c in new_row:
+                new_row[c] = int(v)
+        if "Last Modified" in new_row:
+            new_row["Last Modified"] = today
+
+        out = source_df.copy()
+        if "Last Modified" not in out.columns:
+            out["Last Modified"] = ""
+
+        # Append the new row. Drop the SKU column duplicate, then reset_index so
+        # the index "SKU" becomes a regular column, write CSV without the index.
+        new_df = pd.DataFrame([new_row])
+        merged = pd.concat(
+            [out.reset_index(drop=True), new_df],
+            ignore_index=True,
+        )
+        csv_text = merged.drop(columns=["SKU"], errors="ignore")
+        # Put SKU back at column 0 for readability
+        csv_text.insert(0, "SKU", merged["SKU"].values if "SKU" in merged.columns else "")
+        csv_text = csv_text.to_csv(index=False)
+
+        try:
+            with st.spinner(f"Adding {new_sku} to {file_path}..."):
+                response = save_catalog_to_github(
+                    csv_text, file_path, token,
+                    message=f"Add new {label} SKU {new_sku} via app",
+                )
+            commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+            commit_url = (response or {}).get("commit", {}).get("html_url", "")
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.success(
+                f"✅ Added `{new_sku}` to `{file_path}` "
+                + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
+                + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
+            )
+        except Exception as e:
+            st.error(f"❌ Save failed: {e}")
+
+
 def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
     """Merge the edited values into the source DataFrame and push to GitHub."""
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
@@ -1321,7 +1460,12 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
     # Reset edited to be keyed by SKU; pull labor edits
     edited_indexed = edited.set_index("SKU")
     out = source_df.copy()
+    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    # Make sure the Last Modified column exists in `out` so we can stamp it.
+    if "Last Modified" not in out.columns:
+        out["Last Modified"] = ""
     changed_rows = 0
+    changed_skus = set()
     for sku in edited_indexed.index:
         if sku not in out.index:
             continue
@@ -1331,6 +1475,11 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
             if pd.notna(new_val) and float(new_val) != float(old_val):
                 out.loc[sku, col] = new_val
                 changed_rows += 1
+                changed_skus.add(sku)
+
+    # Stamp Last Modified = today for every row that had any cell change
+    for sku in changed_skus:
+        out.at[sku, "Last Modified"] = today
 
     if changed_rows == 0:
         st.info("No changes detected.")

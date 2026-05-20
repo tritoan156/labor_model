@@ -623,11 +623,19 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
             by=["In schedule", "Used (qty)"], ascending=[False, False]
         ).reset_index(drop=True)
 
+        # Add a live total — sum of all labor columns (per accessory, 1 battery basis)
+        display_df["Total (1 batt)"] = display_df[editable_cols].fillna(0).sum(axis=1).astype(int)
+
         col_cfg = {
             "SKU": st.column_config.TextColumn("SKU", disabled=True),
             "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
             "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
             "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
+            "Total (1 batt)": st.column_config.NumberColumn(
+                "Total (1 batt)", disabled=True,
+                help="Sum of all labor columns for this accessory assuming 1 battery. "
+                     "Multi-battery units scale the BattSubRaw portion accordingly.",
+            ),
         }
         for c in editable_cols:
             col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
@@ -640,6 +648,12 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
             height=600,
             column_config=col_cfg,
             hide_index=True,
+        )
+
+        st.caption(
+            "💡 The **Total (1 batt)** column is the sum of all labor for one accessory, "
+            "assuming 1 battery. For BOSS220 (3 batt) or BOSS400 (5 batt), the "
+            "`BattSubRaw` portion is multiplied by the actual battery count."
         )
 
         if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
@@ -659,7 +673,12 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
 
-    # Reset edited to be keyed by SKU; pull labor edits, drop UI-only columns
+    # Drop UI-only / derived columns before merging (Total (1 batt), Used (qty), In schedule)
+    drop_cols = [c for c in ["Total (1 batt)", "Used (qty)", "In schedule"]
+                 if c in edited.columns]
+    edited = edited.drop(columns=drop_cols)
+
+    # Reset edited to be keyed by SKU; pull labor edits
     edited_indexed = edited.set_index("SKU")
     out = source_df.copy()
     changed_rows = 0
@@ -829,6 +848,10 @@ def tab_source_data(machine_df, acc_df, schedule_df):
         a_disp = acc_df.copy()
         a_disp.insert(0, "Used (qty)", a_disp.index.map(lambda s: used_acc.get(s, 0)))
         a_disp.insert(1, "In schedule", a_disp["Used (qty)"] > 0)
+        # Per-accessory total time (sum of all labor columns, 1-battery basis)
+        acc_labor_cols = ["Warehouse", "AccKIT", "BattPrep", "BattSubRaw",
+                          "PMAcc", "GenAcc", "Compressor"]
+        a_disp["Total (1 batt)"] = a_disp[acc_labor_cols].fillna(0).sum(axis=1).astype(int)
         if only_used:
             a_disp = a_disp[a_disp["In schedule"]]
         a_disp = a_disp.sort_values(

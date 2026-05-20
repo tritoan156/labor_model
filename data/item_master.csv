@@ -1,35 +1,35 @@
-Abbr,Description,Time on Compressor (min),Time on Generator (min),Notes
-EBH,Engine Block Heater,45,30,
-ECH,Engine Coolant Heater,45,30,
-EFT,Extended Fuel Tank,0,90,
-EH,Enclosure Heater,45,45,
-FH,Fuel Filter Heater,75,60,
-GH,Generator Heater,0,0,We have no idea what this is
-LRH,Lower Radiator Heater,60,45,
-OES,Oil Evacuation System,45,30,
-PK,Parallel Kit,0,0,Not done in SC
-RH,Ring Hitch,0,0,
-RHK,Regulator Heater Kit / Reg. Heater,0,0,"Depends on FG family. 185EZ=30; 375DP=90"
-SBC,Solar Battery Charger,0,30,
-SL,Smart Load,0,0,"Depends on FG family. SDG25=40; SDG45=60; SDG65=60; SDG125=90; SDG150=150; SDG220=180; SDG400=240"
-STK,Spare Tire Kit,15,45,
-CL,Cam Locks,0,30,
-TCL,Triple Cam Locks,0,45,
-Tel,Telematics,53,53,UR = 60 min for large units and gens; 45 for ES on all
-VC,Vent Cover (EBOSS),0,0,Need times
-CLNT,Coolant,10,10,
-RJS,Rear Jack Stand,60,60,Very rarely used — requires drilling and mounting
-ES Decal,Decal Kit (Equipment Share),20,20,
-UR Decal,Decal Kit (United Rentals),20,20,
-CCV,Crank Case Vent,90,60,****CT study
-BHW,Battery Heater Wrap,20,20,
-BC,Battery Charger,20,20,
-BD,Battery Disconnect,15,15,
-DCL,Dual Camlock,0,45,
-DHR,Dual Hose Reel,180,0,
-SHR,Single Hose Reel,150,0,
-CSA,Canadian Unit Testing,0,0,
-CDB,Canadian Distribution Box,0,15,
-LF,Low Fuel Light?,0,180,Only for SDG 13–25
-TB,600V Transformer Box,0,120,Only for SDG13
-HFF,Heated Fuel Filter,0,0,Used in cold-weather packages; needs verified time
+Abbr,Description,Time on Compressor (min),Time on Generator (min),Time on PM (min),Notes
+EBH,Engine Block Heater,45,30,0,
+ECH,Engine Coolant Heater,45,30,0,
+EFT,Extended Fuel Tank,0,90,0,
+EH,Enclosure Heater,45,45,0,
+FH,Fuel Filter Heater,75,60,0,
+GH,Generator Heater,0,0,0,We have no idea what this is
+LRH,Lower Radiator Heater,60,45,0,
+OES,Oil Evacuation System,45,30,0,
+PK,Parallel Kit,0,0,0,Not done in SC
+RH,Ring Hitch,0,0,0,
+RHK,Regulator Heater Kit / Reg. Heater,0,0,0,"Depends on FG family. 185EZ=30; 375DP=90 (see item_variants.csv)"
+SBC,Solar Battery Charger,0,30,0,
+SL,Smart Load,0,0,0,"Depends on FG family. SDG25=40; SDG45=60; SDG65=60; SDG125=90; SDG150=150; SDG220=180; SDG400=240 (see item_variants.csv)"
+STK,Spare Tire Kit,15,45,0,
+CL,Cam Locks,0,30,0,
+TCL,Triple Cam Locks,0,45,0,
+Tel,Telematics,53,53,0,UR = 60 min for large units and gens; 45 for ES on all
+VC,Vent Cover (EBOSS),0,0,0,Need times
+CLNT,Coolant,10,10,0,
+RJS,Rear Jack Stand,60,60,0,Very rarely used — requires drilling and mounting
+ES Decal,Decal Kit (Equipment Share),20,20,0,
+UR Decal,Decal Kit (United Rentals),20,20,0,
+CCV,Crank Case Vent,90,60,0,****CT study
+BHW,Battery Heater Wrap,20,20,0,
+BC,Battery Charger,20,20,0,
+BD,Battery Disconnect,15,15,0,
+DCL,Dual Camlock,0,45,0,
+DHR,Dual Hose Reel,180,0,0,
+SHR,Single Hose Reel,150,0,0,
+CSA,Canadian Unit Testing,0,0,0,
+CDB,Canadian Distribution Box,0,15,0,
+LF,Low Fuel Light,0,0,0,"Only for SDG 13-25 (see item_variants.csv)"
+TB,600V Transformer Box,0,0,0,"Only for SDG13 (see item_variants.csv)"
+HFF,Heated Fuel Filter,0,0,0,Used in cold-weather packages; needs verified time

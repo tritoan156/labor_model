@@ -18,6 +18,7 @@ import streamlit as st
 from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
     load_accessory_items, load_item_master, load_item_packages,
+    load_item_variants, resolve_item_time,
 )
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
@@ -100,6 +101,11 @@ def _load_item_master_df(_mtime: float):
 @st.cache_data(show_spinner=False)
 def _load_item_packages_df(_mtime: float):
     return load_item_packages()
+
+
+@st.cache_data(show_spinner=False)
+def _load_item_variants_df(_mtime: float):
+    return load_item_variants()
 
 
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
@@ -1248,25 +1254,96 @@ def tab_data_validation(machine_df, acc_df):
     )
 
 
-def _detect_items_in_description(description: str, item_master_df) -> list:
-    """Find which item abbreviations are mentioned in an accessory description.
-
-    Matches whole-word tokens against the Abbr column. Case-insensitive.
-    Returns the list of abbreviations found.
-    """
+def _tokenize_description(description: str) -> set:
+    """Split an accessory description into uppercase tokens (word boundaries)."""
     import re
-    if not description or item_master_df.empty:
-        return []
+    if not description:
+        return set()
     desc_up = str(description).upper()
-    # Split on non-word chars so "BHW," and "BHW " both yield "BHW"
     tokens = set(re.split(r"[^A-Z0-9]+", desc_up))
     tokens.discard("")
-    found = []
-    for abbr in item_master_df["Abbr"]:
-        a = str(abbr).strip().upper()
-        if a and a in tokens:
-            found.append(str(abbr).strip())
-    return found
+    return tokens
+
+
+def _detect_items_in_description(description: str, item_master_df) -> list:
+    """Items from item master whose Abbr appears as a whole token in the description."""
+    if item_master_df is None or item_master_df.empty:
+        return []
+    tokens = _tokenize_description(description)
+    return [
+        str(a).strip()
+        for a in item_master_df["Abbr"]
+        if str(a).strip() and str(a).strip().upper() in tokens
+    ]
+
+
+def _detect_packages_in_description(description: str, packages_df) -> list:
+    """Packages whose code appears as a whole token in the description (e.g. CWP, AWP)."""
+    if packages_df is None or packages_df.empty:
+        return []
+    tokens = _tokenize_description(description)
+    return [
+        str(p).strip()
+        for p in packages_df["Package"]
+        if str(p).strip() and str(p).strip().upper() in tokens
+    ]
+
+
+def _expand_and_dedupe(items_found, packages_found, packages_df) -> list:
+    """Expand each detected package into its components, union with standalone
+    items, and dedupe. Preserves first-seen ordering for readable output.
+
+    Example: items=["EBH"], packages=["AWP"] (AWP = CCV,EH,EBH,BHW,HFF,LRH)
+    -> ["CCV", "EH", "EBH", "BHW", "HFF", "LRH"]  (EBH counted once)
+    """
+    seen = set()
+    ordered = []
+
+    def _add(abbr):
+        a = str(abbr).strip()
+        if not a:
+            return
+        key = a.upper()
+        if key not in seen:
+            seen.add(key)
+            ordered.append(a)
+
+    # Expand packages first so component ordering reflects the package definition
+    if packages_df is not None and not packages_df.empty:
+        pkg_lookup = {
+            str(r["Package"]).strip().upper(): str(r.get("Components", "") or "")
+            for _, r in packages_df.iterrows()
+        }
+    else:
+        pkg_lookup = {}
+
+    for pkg in packages_found or []:
+        comps = pkg_lookup.get(str(pkg).strip().upper(), "")
+        for comp in [c.strip() for c in comps.split(",") if c.strip()]:
+            _add(comp)
+
+    # Then standalone items (deduped against package components)
+    for it in items_found or []:
+        _add(it)
+
+    return ordered
+
+
+def _accessory_sides(family_hint: str, sku: str) -> list:
+    """Which station side(s) this accessory feeds into.
+
+    - PDS family -> ["Compressor"]
+    - SDG / BOSS non-HS -> ["Generator"]
+    - HS variants (BOSSxxHS / -HS- in family) -> ["Generator", "PM"] so HS units
+      with PM-only accessories still get the PM side.
+    """
+    fam = str(family_hint or "").upper()
+    if fam.startswith("PDS"):
+        return ["Compressor"]
+    sides = ["Generator"]
+    if "HS" in fam or "HS" in str(sku or "").upper():
+        sides.append("PM")
+    return sides
 
 
 def _is_compressor_family(fg_family_hint: str) -> bool:
@@ -1286,76 +1363,106 @@ def _accessory_family_hint(sku: str) -> str:
     return re.split(r"-A", s)[0]
 
 
-def _render_reconciliation_view(acc_df, item_master_df, used_acc):
-    """Analytic comparison: aggregate from acc_clean vs sum-of-items by description."""
-    st.subheader("🔬 Reconciliation analysis")
+def _render_reconciliation_view(acc_df, item_master_df, item_packages_df,
+                                 item_variants_df, used_acc):
+    """Reconciliation & Apply — packages expanded, variants honored, PM included.
+
+    For each accessory:
+      1. Detect item abbrevs + package codes in the description
+      2. Expand packages -> components, dedupe with standalone items
+      3. For each side this accessory feeds, resolve each item's time via variants
+         then master, sum, and compare against the aggregate in acc_clean.csv
+      4. Let the user select rows to push back into acc_clean.csv (one button =
+         one commit covering all selected SKUs).
+    """
+    st.subheader("🔬 Reconciliation & Apply")
     st.markdown(
-        "**Cross-check the accessory aggregate against the item master.** "
-        "For each accessory we auto-detect item codes mentioned in its description "
-        "(e.g. BHW, EBH, TEL), look up their times in the master, and compare the "
-        "sum to the GenAcc/Compressor value in `acc_clean.csv`. Use the differences "
-        "to decide which side needs correcting."
+        "**Cross-check the catalog aggregate against the item master + packages + variants.**  \n"
+        "Packages auto-expand into their components (no double-counting). "
+        "Family-specific time variants override the master defaults. "
+        "When the math looks right, tick rows in the **Apply** column and click "
+        "**Apply selected updates** to write the new value back to `acc_clean.csv`."
     )
     st.caption(
-        "Compressor side = PDS family · Generator side = SDG / BOSS family. "
-        "Only auto-detected items are summed — items that aren't in the master or "
-        "not mentioned in the description won't be counted."
+        "Side mapping: PDS family → **Compressor** · SDG/BOSS → **Generator** "
+        "(plus **PM** for HS-derived accessories). One review row per (SKU, side)."
     )
 
-    only_used = st.checkbox(
-        "Show only accessories used in current schedule", value=True,
-        key="recon_only_used",
-    )
+    cc1, cc2 = st.columns([2, 1])
+    with cc1:
+        only_used = st.checkbox(
+            "Show only accessories used in current schedule", value=True,
+            key="recon_only_used",
+        )
+    with cc2:
+        side_filter = st.multiselect(
+            "Sides", ["Compressor", "Generator", "PM"],
+            default=["Compressor", "Generator", "PM"],
+            key="recon_side_filter",
+        )
+
+    side_to_agg_col = {"Compressor": "Compressor", "Generator": "GenAcc", "PM": "PMAcc"}
 
     rows = []
-    item_master_indexed = item_master_df.set_index(item_master_df["Abbr"].astype(str).str.strip())
     for sku in acc_df.index:
         if only_used and used_acc.get(sku, 0) == 0:
             continue
-        row = acc_df.loc[sku]
-        desc = str(row.get("Description", ""))
+        ar = acc_df.loc[sku]
+        desc = str(ar.get("Description", ""))
         family_hint = _accessory_family_hint(sku)
-        is_compressor = _is_compressor_family(family_hint)
+
         items_found = _detect_items_in_description(desc, item_master_df)
+        pkgs_found = _detect_packages_in_description(desc, item_packages_df)
+        expanded = _expand_and_dedupe(items_found, pkgs_found, item_packages_df)
 
-        # Sum of item times based on family type
-        time_col = "Time on Compressor (min)" if is_compressor else "Time on Generator (min)"
-        item_times = []
-        for abbr in items_found:
-            if abbr in item_master_indexed.index:
-                item_times.append((abbr, float(item_master_indexed.at[abbr, time_col])))
-        items_sum = sum(t for _, t in item_times)
-        breakdown = ", ".join(f"{a}={t:.0f}" for a, t in item_times) or "—"
+        sides = _accessory_sides(family_hint, sku)
+        for side in sides:
+            if side not in side_filter:
+                continue
+            agg_col = side_to_agg_col[side]
+            try:
+                agg_value = float(ar[agg_col]) if agg_col in acc_df.columns else 0.0
+            except (TypeError, ValueError):
+                agg_value = 0.0
 
-        # The aggregate to compare against (which station does this product feed)
-        agg_value = float(row["Compressor"]) if is_compressor else float(row["GenAcc"])
-        diff = items_sum - agg_value
-        if abs(diff) < 0.5:
-            status = "✅ Match"
-        elif items_sum == 0 and agg_value > 0:
-            status = "⚪ No items detected"
-        elif items_sum > 0 and agg_value == 0:
-            status = "⚠️ Items but no aggregate"
-        elif diff > 0:
-            status = f"🔺 Items higher (+{diff:.0f})"
-        else:
-            status = f"🔻 Aggregate higher ({diff:.0f})"
+            item_times = []
+            for abbr in expanded:
+                t = resolve_item_time(abbr, family_hint, side, item_master_df, item_variants_df)
+                if t > 0:
+                    item_times.append((abbr, t))
+            items_sum = sum(t for _, t in item_times)
+            breakdown = ", ".join(f"{a}={t:.0f}" for a, t in item_times) or "—"
+            pkg_label = ", ".join(pkgs_found) if pkgs_found else ""
 
-        rows.append({
-            "SKU": sku,
-            "Family": family_hint,
-            "Side": "Compressor" if is_compressor else "Generator",
-            "Aggregate (catalog)": int(agg_value),
-            "Sum of items (master)": int(items_sum),
-            "Difference": int(diff),
-            "Status": status,
-            "Items detected": breakdown,
-            "Description": desc,
-            "Used in schedule": used_acc.get(sku, 0),
-        })
+            diff = items_sum - agg_value
+            if abs(diff) < 0.5:
+                status = "✅ Match"
+            elif items_sum == 0 and agg_value > 0:
+                status = "⚪ No items detected"
+            elif items_sum > 0 and agg_value == 0:
+                status = "⚠️ Items but no aggregate"
+            elif diff > 0:
+                status = f"🔺 Items higher (+{diff:.0f})"
+            else:
+                status = f"🔻 Aggregate higher ({diff:.0f})"
+
+            rows.append({
+                "Apply": False,
+                "SKU": sku,
+                "Family": family_hint,
+                "Side": side,
+                "Aggregate (catalog)": int(round(agg_value)),
+                "Sum of items": int(round(items_sum)),
+                "Difference": int(round(diff)),
+                "Status": status,
+                "Packages": pkg_label,
+                "Items detected": breakdown,
+                "Description": desc,
+                "Used in schedule": used_acc.get(sku, 0),
+            })
 
     if not rows:
-        st.info("No accessories to show. Uncheck the filter to see all.")
+        st.info("No accessories to show. Uncheck the filter or widen the side selection.")
         return
 
     rec_df = pd.DataFrame(rows).sort_values(
@@ -1368,34 +1475,106 @@ def _render_reconciliation_view(acc_df, item_master_df, used_acc):
     mismatches = len(rec_df) - matched - no_items
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Accessories reviewed", len(rec_df))
+    c1.metric("Review rows", len(rec_df))
     c2.metric("Matches", matched)
     c3.metric("Mismatches", mismatches)
     c4.metric("No items detected", no_items)
 
-    st.dataframe(
-        rec_df, use_container_width=True, height=520, hide_index=True,
+    edited = st.data_editor(
+        rec_df,
+        use_container_width=True, height=520, hide_index=True,
+        num_rows="fixed",
+        key="recon_editor",
         column_config={
+            "Apply": st.column_config.CheckboxColumn(
+                "Apply",
+                help="Tick rows whose 'Sum of items' you want to write back as the new aggregate.",
+            ),
+            "SKU": st.column_config.TextColumn("SKU", disabled=True),
+            "Family": st.column_config.TextColumn("Family", disabled=True),
+            "Side": st.column_config.TextColumn("Side", disabled=True),
             "Aggregate (catalog)": st.column_config.NumberColumn(
-                "Aggregate (catalog)",
-                help="The value from acc_clean.csv at the Compressor or GenAcc station.",
+                "Aggregate (catalog)", disabled=True,
+                help="Current value in acc_clean.csv.",
             ),
-            "Sum of items (master)": st.column_config.NumberColumn(
-                "Sum of items (master)",
-                help="Sum of times from item_master.csv for the item codes detected in this accessory's description.",
+            "Sum of items": st.column_config.NumberColumn(
+                "Sum of items", disabled=True,
+                help="Sum of resolved item times (variants > master), with packages expanded.",
             ),
-            "Difference": st.column_config.NumberColumn(
-                "Difference",
-                help="Sum of items minus Aggregate. Positive = items higher; Negative = aggregate higher.",
+            "Difference": st.column_config.NumberColumn("Difference", disabled=True),
+            "Status": st.column_config.TextColumn("Status", disabled=True),
+            "Packages": st.column_config.TextColumn(
+                "Packages", disabled=True,
+                help="Package codes detected in the description, before expansion.",
             ),
-            "Description": st.column_config.TextColumn("Description", width="large"),
+            "Items detected": st.column_config.TextColumn(
+                "Items detected (after expansion)", width="large", disabled=True,
+            ),
+            "Description": st.column_config.TextColumn("Description", width="large", disabled=True),
         },
     )
 
-    csv = rec_df.to_csv(index=False).encode("utf-8")
+    # Apply button
+    selected = edited[edited["Apply"] == True]  # noqa: E712
+    n_sel = len(selected)
+    btn_label = f"💾 Apply {n_sel} selected update(s) to SKU aggregate" if n_sel \
+                else "💾 Apply selected updates to SKU aggregate"
+    if st.button(btn_label, use_container_width=True, disabled=(n_sel == 0)):
+        _apply_recon_to_acc_csv(selected, acc_df)
+
+    # Download for offline review
+    csv = edited.drop(columns=["Apply"]).to_csv(index=False).encode("utf-8")
     st.download_button(
         "📥 Download reconciliation CSV", csv, "accessory_reconciliation.csv", "text/csv",
     )
+
+
+def _apply_recon_to_acc_csv(selected_df, acc_df):
+    """Take the user's selected reconciliation rows and write updated values
+    into acc_clean.csv via the existing GitHub-API save path."""
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
+        return
+
+    side_to_agg_col = {"Compressor": "Compressor", "Generator": "GenAcc", "PM": "PMAcc"}
+
+    # Start from the current acc_df (excluding the index 'SKU' duplicate column noise)
+    out = acc_df.copy()
+    changed = 0
+    for _, sel in selected_df.iterrows():
+        sku = sel["SKU"]
+        side = sel["Side"]
+        new_val = float(sel["Sum of items"])
+        col = side_to_agg_col.get(side)
+        if not col or sku not in out.index or col not in out.columns:
+            continue
+        old_val = float(out.at[sku, col]) if pd.notna(out.at[sku, col]) else 0.0
+        if abs(new_val - old_val) < 0.5:
+            continue
+        out.at[sku, col] = new_val
+        changed += 1
+
+    if changed == 0:
+        st.info("No actual changes detected (selected rows already match the catalog).")
+        return
+
+    # The SKU index and 'SKU' column are duplicates from set_index(..., drop=False);
+    # drop the column before writing so to_csv emits SKU once via reset_index.
+    csv_text = out.drop(columns=["SKU"], errors="ignore").reset_index().to_csv(index=False)
+
+    try:
+        with st.spinner(f"Saving {changed} updated cell(s) to acc_clean.csv..."):
+            save_catalog_to_github(
+                csv_text, "data/acc_clean.csv", token,
+                message=f"Apply reconciliation: update {changed} accessory cell(s)",
+            )
+        st.success(
+            f"✅ Wrote {changed} updated cell(s) to acc_clean.csv. "
+            "New values apply after the app redeploys (~1 min)."
+        )
+    except Exception as e:
+        st.error(f"Save failed: {e}")
 
 
 def _render_item_master_view(item_master_df):
@@ -1409,9 +1588,8 @@ def _render_item_master_view(item_master_df):
     )
     st.caption(
         "Some items vary by FG family (e.g. `RHK`, `SL`, `LF`, `TB`) — those "
-        "are flagged in the Notes column. The simple times here apply to the "
-        "typical case; family-specific overrides should be entered in the "
-        "**Accessory item details** view for the specific accessory."
+        "live in the **Item variants** view. The simple times here are the typical "
+        "case used when no variant matches."
     )
 
     edited = st.data_editor(
@@ -1428,11 +1606,16 @@ def _render_item_master_view(item_master_df):
             "Description": st.column_config.TextColumn("Description", width="large"),
             "Time on Compressor (min)": st.column_config.NumberColumn(
                 "Compressor min", min_value=0, step=1,
-                help="Install time when the item is on a Compressor product (PDS series).",
+                help="Install time on a Compressor product (PDS series).",
             ),
             "Time on Generator (min)": st.column_config.NumberColumn(
                 "Generator min", min_value=0, step=1,
-                help="Install time when the item is on a Generator product (SDG / BOSS series).",
+                help="Install time on a Generator product (SDG / BOSS series).",
+            ),
+            "Time on PM (min)": st.column_config.NumberColumn(
+                "PM min", min_value=0, step=1,
+                help="Install time on a PM (head-skid / HS) unit. Used when the "
+                     "accessory feeds the PM Acc station.",
             ),
             "Notes": st.column_config.TextColumn("Notes", width="large"),
         },
@@ -1440,6 +1623,64 @@ def _render_item_master_view(item_master_df):
 
     if st.button("💾 Save item master to GitHub", use_container_width=True):
         _save_simple_csv(edited, "data/item_master.csv", "item master")
+
+
+def _render_item_variants_view(variants_df, item_master_df):
+    """Family-specific overrides for items like RHK, SL, LF, TB."""
+    st.subheader("🎚️ Item variants (family-specific times)")
+    st.markdown(
+        "**Family-specific time overrides.** Some items take different time "
+        "depending on which product family they're installed on. Each row says: "
+        "*item X, when installed on a unit whose family starts with Y, takes Z minutes "
+        "on side S.* Variants take precedence over the master default."
+    )
+    st.caption(
+        "**FG family** matches via prefix — `SDG13` matches `SDG13`, `SDG13S-U`, `SDG13-001`. "
+        "**Side** is one of `Compressor`, `Generator`, or `PM`."
+    )
+
+    # Warn if a variant references an unknown item
+    if not variants_df.empty and not item_master_df.empty:
+        known = {str(a).strip().upper() for a in item_master_df["Abbr"]}
+        unknown = sorted({
+            str(it).strip()
+            for it in variants_df["Item"]
+            if str(it).strip().upper() not in known
+        })
+        if unknown:
+            st.warning(f"⚠️ Variants reference unknown items not in the master: {', '.join(unknown)}")
+
+    edited = st.data_editor(
+        variants_df,
+        use_container_width=True,
+        num_rows="dynamic",
+        key="item_variants_editor",
+        height=440,
+        column_config={
+            "Item": st.column_config.TextColumn(
+                "Item", help="Abbreviation from the Item master (e.g. RHK, SL).",
+                width="small",
+            ),
+            "FG family": st.column_config.TextColumn(
+                "FG family",
+                help="Prefix to match the FG family (e.g. SDG13, PDS185EZ, BOSS25).",
+            ),
+            "Side": st.column_config.SelectboxColumn(
+                "Side",
+                options=["Compressor", "Generator", "PM"],
+                required=True,
+                help="Which station the time rolls up to.",
+            ),
+            "Time (min)": st.column_config.NumberColumn(
+                "Time (min)", min_value=0, step=1,
+                help="Install time for this item on this family at this side.",
+            ),
+            "Notes": st.column_config.TextColumn("Notes"),
+        },
+    )
+
+    if st.button("💾 Save item variants to GitHub", use_container_width=True):
+        _save_simple_csv(edited, "data/item_variants.csv", "item variants")
 
 
 def _render_item_packages_view(packages_df, item_master_df):
@@ -1605,7 +1846,7 @@ def _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df):
 
 
 def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
-                     item_master_df, item_packages_df):
+                     item_master_df, item_packages_df, item_variants_df):
     st.header("📁 Source Data")
     st.caption(
         "Raw inputs to the model. SKUs used in the current schedule/manual entry "
@@ -1625,8 +1866,9 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
             "Machine catalog",
             "Accessory catalog",
             "Item master",
+            "Item variants",
             "Item packages",
-            "Reconciliation",
+            "Reconciliation & Apply",
             "Accessory item details",
         ],
         horizontal=True,
@@ -1635,11 +1877,15 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
     if sub == "Item master":
         _render_item_master_view(item_master_df)
         return
+    if sub == "Item variants":
+        _render_item_variants_view(item_variants_df, item_master_df)
+        return
     if sub == "Item packages":
         _render_item_packages_view(item_packages_df, item_master_df)
         return
-    if sub == "Reconciliation":
-        _render_reconciliation_view(acc_df, item_master_df, used_acc)
+    if sub == "Reconciliation & Apply":
+        _render_reconciliation_view(acc_df, item_master_df, item_packages_df,
+                                    item_variants_df, used_acc)
         return
     if sub == "Accessory item details":
         _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df)
@@ -1713,6 +1959,7 @@ def main():
     acc_items_df = _load_accessory_items_df(_csv_mtime("accessory_items.csv"))
     item_master_df = _load_item_master_df(_csv_mtime("item_master.csv"))
     item_packages_df = _load_item_packages_df(_csv_mtime("item_packages.csv"))
+    item_variants_df = _load_item_variants_df(_csv_mtime("item_variants.csv"))
 
     if inputs.get("schedule_mode") == "✏️ Type a few SKUs":
         manual_entries = inputs.get("manual_entries")
@@ -1780,7 +2027,7 @@ def main():
         tab_data_validation(machine_df, acc_df)
     with tabs[7]:
         tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
-                         item_master_df, item_packages_df)
+                         item_master_df, item_packages_df, item_variants_df)
 
 
 if __name__ == "__main__":

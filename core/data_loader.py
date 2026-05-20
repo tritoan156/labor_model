@@ -96,32 +96,114 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     return out
 
 
+ITEM_MASTER_COLUMNS = [
+    "Abbr", "Description",
+    "Time on Compressor (min)", "Time on Generator (min)", "Time on PM (min)",
+    "Notes",
+]
+
+
 def load_item_master(path: Path | str | None = None) -> pd.DataFrame:
     """Load the reference table of installable items (abbreviations + times).
 
     Returns columns: Abbr, Description, Time on Compressor (min),
-    Time on Generator (min), Notes.
+    Time on Generator (min), Time on PM (min), Notes.
     """
     if path is None:
         path = DATA_DIR / "item_master.csv"
     if not Path(path).exists():
-        return pd.DataFrame(columns=[
-            "Abbr", "Description",
-            "Time on Compressor (min)", "Time on Generator (min)", "Notes",
-        ])
+        return pd.DataFrame(columns=ITEM_MASTER_COLUMNS)
     try:
         df = pd.read_csv(path)
     except pd.errors.EmptyDataError:
-        return pd.DataFrame(columns=[
-            "Abbr", "Description",
-            "Time on Compressor (min)", "Time on Generator (min)", "Notes",
-        ])
+        return pd.DataFrame(columns=ITEM_MASTER_COLUMNS)
     for c in df.select_dtypes(include="object").columns:
         df[c] = df[c].astype(str).str.strip()
-    for c in ("Time on Compressor (min)", "Time on Generator (min)"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
-    return df.reset_index(drop=True)
+    # Backfill columns that may be missing from older CSV versions
+    for c in ITEM_MASTER_COLUMNS:
+        if c not in df.columns:
+            df[c] = 0 if "Time" in c else ""
+    for c in ("Time on Compressor (min)", "Time on Generator (min)", "Time on PM (min)"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    return df[ITEM_MASTER_COLUMNS].reset_index(drop=True)
+
+
+def load_item_variants(path: Path | str | None = None) -> pd.DataFrame:
+    """Load the family-specific time overrides for items.
+
+    Columns: Item, FG family, Side, Time (min), Notes.
+    Side is one of "Compressor", "Generator", "PM".
+    FG family is matched via startswith — "SDG13" matches "SDG13-001", "SDG13S-U".
+    """
+    cols = ["Item", "FG family", "Side", "Time (min)", "Notes"]
+    if path is None:
+        path = DATA_DIR / "item_variants.csv"
+    if not Path(path).exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=cols)
+    for c in df.select_dtypes(include="object").columns:
+        df[c] = df[c].astype(str).str.strip()
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0 if c == "Time (min)" else ""
+    df["Time (min)"] = pd.to_numeric(df["Time (min)"], errors="coerce").fillna(0)
+    df = df[df["Item"].notna() & (df["Item"] != "")]
+    return df[cols].reset_index(drop=True)
+
+
+def resolve_item_time(abbr: str, family: str, side: str,
+                       master_df: pd.DataFrame, variants_df: pd.DataFrame) -> float:
+    """Return the install time for one item on one accessory.
+
+    Lookup precedence:
+      1. Variants table — match (Item == abbr) AND (family starts with FG family) AND (Side == side)
+      2. Item master — `Time on <side> (min)` column for the row with Abbr == abbr
+
+    Both lookups are case-insensitive on Abbr / Item / Side.
+    Returns 0.0 if nothing matches.
+    """
+    if not abbr:
+        return 0.0
+    abbr_norm = str(abbr).strip().upper()
+    family_norm = str(family or "").strip().upper()
+    side_norm = str(side or "").strip().capitalize()
+
+    # 1) Variants override
+    if variants_df is not None and not variants_df.empty:
+        v = variants_df.copy()
+        v["__item"] = v["Item"].astype(str).str.strip().str.upper()
+        v["__side"] = v["Side"].astype(str).str.strip().str.capitalize()
+        v["__family"] = v["FG family"].astype(str).str.strip().str.upper()
+        candidates = v[(v["__item"] == abbr_norm) & (v["__side"] == side_norm)]
+        for _, row in candidates.iterrows():
+            fam = row["__family"]
+            if fam and family_norm.startswith(fam):
+                try:
+                    return float(row["Time (min)"])
+                except (TypeError, ValueError):
+                    return 0.0
+
+    # 2) Master default
+    col_map = {
+        "Compressor": "Time on Compressor (min)",
+        "Generator": "Time on Generator (min)",
+        "Pm": "Time on PM (min)",
+    }
+    col = col_map.get(side_norm)
+    if col is None or master_df is None or master_df.empty:
+        return 0.0
+    m = master_df.copy()
+    m["__abbr"] = m["Abbr"].astype(str).str.strip().str.upper()
+    match = m[m["__abbr"] == abbr_norm]
+    if match.empty:
+        return 0.0
+    try:
+        return float(match.iloc[0][col])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
 
 
 def load_item_packages(path: Path | str | None = None) -> pd.DataFrame:

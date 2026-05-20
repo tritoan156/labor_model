@@ -185,44 +185,34 @@ def load_accessory_items(path: Path | str | None = None) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _apply_accessory_item_overrides(acc_df: pd.DataFrame, items_df: pd.DataFrame) -> pd.DataFrame:
-    """If items_df has entries for an accessory, override aggregate columns with sums.
+def accessory_item_rollup(items_df: pd.DataFrame) -> pd.DataFrame:
+    """Sum item times per (Accessory SKU, Category). Pure computation — no override.
 
-    PMAcc <- sum of Time where Category == "PM"
-    GenAcc <- sum of Time where Category == "Gen"
-    Compressor <- sum of Time where Category == "Compressor"
-
-    Only accessories that have at least one item row are touched; everything else
-    keeps the existing acc_df aggregate value.
+    Returns a wide DataFrame indexed by Accessory SKU with columns:
+      `items_sum_Gen`, `items_sum_PM`, `items_sum_Compressor`.
+    Missing categories are 0. Used for comparison against the aggregate in
+    acc_clean.csv (we do NOT override the aggregate — analysis only).
     """
     if items_df is None or items_df.empty:
-        return acc_df
-
-    out = acc_df.copy()
-    category_to_col = {"PM": "PMAcc", "Gen": "GenAcc", "Compressor": "Compressor"}
-
-    # Sum per (SKU, Category)
-    grouped = items_df.groupby(["Accessory SKU", "Category"])["Time (min)"].sum()
-
-    for (sku, cat), total in grouped.items():
-        col = category_to_col.get(str(cat).strip())
-        if col is None:
-            continue
-        if sku in out.index:
-            out.at[sku, col] = float(total)
-    return out
+        return pd.DataFrame(columns=[
+            "items_sum_Gen", "items_sum_PM", "items_sum_Compressor",
+        ])
+    grouped = items_df.groupby(["Accessory SKU", "Category"])["Time (min)"].sum().unstack(fill_value=0)
+    rename = {"Gen": "items_sum_Gen", "PM": "items_sum_PM", "Compressor": "items_sum_Compressor"}
+    grouped = grouped.rename(columns=rename)
+    for col in ("items_sum_Gen", "items_sum_PM", "items_sum_Compressor"):
+        if col not in grouped.columns:
+            grouped[col] = 0.0
+    return grouped[["items_sum_Gen", "items_sum_PM", "items_sum_Compressor"]]
 
 
-def load_acc_labor(path: Path | str | None = None,
-                    items_path: Path | str | None = None) -> pd.DataFrame:
+def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     """Load Acc_Clean CSV → DataFrame indexed by SKU.
 
     Returns columns: Warehouse, AccKIT, Nameplate Prep, BattSubRaw, PMAcc, GenAcc,
-    Compressor, Description.
-
-    When `items_path` (or the default `data/accessory_items.csv`) has rows,
-    PMAcc/GenAcc/Compressor for those accessories are replaced by the sum
-    of their item rows.
+    Compressor, Description. These aggregates are the source of truth for
+    capacity calculations — the per-item breakdown (accessory_items.csv) is
+    used only for analysis and reconciliation.
     """
     if path is None:
         path = DATA_DIR / "acc_clean.csv"
@@ -271,10 +261,9 @@ def load_acc_labor(path: Path | str | None = None,
 
     out = out[out["SKU"].notna() & (out["SKU"] != "")]
     out = out.set_index("SKU", drop=False)
-
-    # Apply per-item overrides if accessory_items.csv has entries
-    items_df = load_accessory_items(items_path)
-    out = _apply_accessory_item_overrides(out, items_df)
+    # NOTE: We intentionally do NOT override the aggregate values with the
+    # item-level sums. The acc_clean.csv aggregate is the source of truth for
+    # calculations; the items file is used purely for analysis / reconciliation.
     return out
 
 

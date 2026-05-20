@@ -32,4 +32,4 @@ CSA,Canadian Unit Testing,0,0,
 CDB,Canadian Distribution Box,0,15,
 LF,Low Fuel Light?,0,180,Only for SDG 13–25
 TB,600V Transformer Box,0,120,Only for SDG13
-HFF,Hot Fuel Fire (heater coil),0,0,Used in cold-weather packages; needs verified time
+HFF,Heated Fuel Filter,0,0,Used in cold-weather packages; needs verified time

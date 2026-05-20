@@ -1248,6 +1248,156 @@ def tab_data_validation(machine_df, acc_df):
     )
 
 
+def _detect_items_in_description(description: str, item_master_df) -> list:
+    """Find which item abbreviations are mentioned in an accessory description.
+
+    Matches whole-word tokens against the Abbr column. Case-insensitive.
+    Returns the list of abbreviations found.
+    """
+    import re
+    if not description or item_master_df.empty:
+        return []
+    desc_up = str(description).upper()
+    # Split on non-word chars so "BHW," and "BHW " both yield "BHW"
+    tokens = set(re.split(r"[^A-Z0-9]+", desc_up))
+    tokens.discard("")
+    found = []
+    for abbr in item_master_df["Abbr"]:
+        a = str(abbr).strip().upper()
+        if a and a in tokens:
+            found.append(str(abbr).strip())
+    return found
+
+
+def _is_compressor_family(fg_family_hint: str) -> bool:
+    """A FG family is a Compressor if it starts with PDS (portable diesel
+    compressor). Generators (SDG) and BOSS are not."""
+    s = str(fg_family_hint).upper().strip()
+    return s.startswith("PDS")
+
+
+def _accessory_family_hint(sku: str) -> str:
+    """Strip the trailing -A### / -AXXX from an accessory SKU to get the FG family.
+
+    e.g. BOSS25-A016 -> BOSS25;  PDS185EZ-A001 -> PDS185EZ.
+    """
+    import re
+    s = str(sku).strip()
+    return re.split(r"-A", s)[0]
+
+
+def _render_reconciliation_view(acc_df, item_master_df, used_acc):
+    """Analytic comparison: aggregate from acc_clean vs sum-of-items by description."""
+    st.subheader("🔬 Reconciliation analysis")
+    st.markdown(
+        "**Cross-check the accessory aggregate against the item master.** "
+        "For each accessory we auto-detect item codes mentioned in its description "
+        "(e.g. BHW, EBH, TEL), look up their times in the master, and compare the "
+        "sum to the GenAcc/Compressor value in `acc_clean.csv`. Use the differences "
+        "to decide which side needs correcting."
+    )
+    st.caption(
+        "Compressor side = PDS family · Generator side = SDG / BOSS family. "
+        "Only auto-detected items are summed — items that aren't in the master or "
+        "not mentioned in the description won't be counted."
+    )
+
+    only_used = st.checkbox(
+        "Show only accessories used in current schedule", value=True,
+        key="recon_only_used",
+    )
+
+    rows = []
+    item_master_indexed = item_master_df.set_index(item_master_df["Abbr"].astype(str).str.strip())
+    for sku in acc_df.index:
+        if only_used and used_acc.get(sku, 0) == 0:
+            continue
+        row = acc_df.loc[sku]
+        desc = str(row.get("Description", ""))
+        family_hint = _accessory_family_hint(sku)
+        is_compressor = _is_compressor_family(family_hint)
+        items_found = _detect_items_in_description(desc, item_master_df)
+
+        # Sum of item times based on family type
+        time_col = "Time on Compressor (min)" if is_compressor else "Time on Generator (min)"
+        item_times = []
+        for abbr in items_found:
+            if abbr in item_master_indexed.index:
+                item_times.append((abbr, float(item_master_indexed.at[abbr, time_col])))
+        items_sum = sum(t for _, t in item_times)
+        breakdown = ", ".join(f"{a}={t:.0f}" for a, t in item_times) or "—"
+
+        # The aggregate to compare against (which station does this product feed)
+        agg_value = float(row["Compressor"]) if is_compressor else float(row["GenAcc"])
+        diff = items_sum - agg_value
+        if abs(diff) < 0.5:
+            status = "✅ Match"
+        elif items_sum == 0 and agg_value > 0:
+            status = "⚪ No items detected"
+        elif items_sum > 0 and agg_value == 0:
+            status = "⚠️ Items but no aggregate"
+        elif diff > 0:
+            status = f"🔺 Items higher (+{diff:.0f})"
+        else:
+            status = f"🔻 Aggregate higher ({diff:.0f})"
+
+        rows.append({
+            "SKU": sku,
+            "Family": family_hint,
+            "Side": "Compressor" if is_compressor else "Generator",
+            "Aggregate (catalog)": int(agg_value),
+            "Sum of items (master)": int(items_sum),
+            "Difference": int(diff),
+            "Status": status,
+            "Items detected": breakdown,
+            "Description": desc,
+            "Used in schedule": used_acc.get(sku, 0),
+        })
+
+    if not rows:
+        st.info("No accessories to show. Uncheck the filter to see all.")
+        return
+
+    rec_df = pd.DataFrame(rows).sort_values(
+        by=["Used in schedule", "Difference"], ascending=[False, True],
+    ).reset_index(drop=True)
+
+    # Top metrics
+    matched = int((rec_df["Status"] == "✅ Match").sum())
+    no_items = int((rec_df["Status"] == "⚪ No items detected").sum())
+    mismatches = len(rec_df) - matched - no_items
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Accessories reviewed", len(rec_df))
+    c2.metric("Matches", matched)
+    c3.metric("Mismatches", mismatches)
+    c4.metric("No items detected", no_items)
+
+    st.dataframe(
+        rec_df, use_container_width=True, height=520, hide_index=True,
+        column_config={
+            "Aggregate (catalog)": st.column_config.NumberColumn(
+                "Aggregate (catalog)",
+                help="The value from acc_clean.csv at the Compressor or GenAcc station.",
+            ),
+            "Sum of items (master)": st.column_config.NumberColumn(
+                "Sum of items (master)",
+                help="Sum of times from item_master.csv for the item codes detected in this accessory's description.",
+            ),
+            "Difference": st.column_config.NumberColumn(
+                "Difference",
+                help="Sum of items minus Aggregate. Positive = items higher; Negative = aggregate higher.",
+            ),
+            "Description": st.column_config.TextColumn("Description", width="large"),
+        },
+    )
+
+    csv = rec_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "📥 Download reconciliation CSV", csv, "accessory_reconciliation.csv", "text/csv",
+    )
+
+
 def _render_item_master_view(item_master_df):
     """Master list of installable items (abbreviation, description, times)."""
     st.subheader("📒 Item master")
@@ -1476,6 +1626,7 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
             "Accessory catalog",
             "Item master",
             "Item packages",
+            "Reconciliation",
             "Accessory item details",
         ],
         horizontal=True,
@@ -1486,6 +1637,9 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
         return
     if sub == "Item packages":
         _render_item_packages_view(item_packages_df, item_master_df)
+        return
+    if sub == "Reconciliation":
+        _render_reconciliation_view(acc_df, item_master_df, used_acc)
         return
     if sub == "Accessory item details":
         _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df)

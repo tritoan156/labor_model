@@ -89,6 +89,20 @@ def _fetch_existing_from_github(token: str) -> "tuple[dict, str | None]":
         return load_all_scenarios(), None
 
 
+def _write_local_scenarios(content: str) -> None:
+    """Mirror the latest scenarios JSON to the local data/ folder so subsequent
+    reads in the same Streamlit Cloud container see the change immediately —
+    without waiting for the GitHub redeploy."""
+    try:
+        SCENARIOS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(SCENARIOS_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception:
+        # Filesystem might be read-only on some hosts — that's OK; the file on
+        # GitHub is still updated. Other sessions just wait for the redeploy.
+        pass
+
+
 def save_scenario_to_github(
     location: str, name: str, entries_df: pd.DataFrame, token: str,
 ) -> dict:
@@ -97,6 +111,10 @@ def save_scenario_to_github(
     Cleans empty rows out of `entries_df` before saving. Retries once on
     ``GitHubConflict`` (the narrow race where two users push within the same
     second). Last writer wins for the SAME (location, name) key.
+
+    Side effect: mirrors the latest JSON content to the local data/ folder so
+    the saving user sees the new scenario immediately (without waiting for the
+    Streamlit Cloud redeploy).
 
     Returns the GitHub commit payload.
     """
@@ -134,11 +152,13 @@ def save_scenario_to_github(
         existing[location][name] = new_block
         new_content = json.dumps(existing, indent=2)
         try:
-            return save_catalog_to_github(
+            response = save_catalog_to_github(
                 new_content, GITHUB_FILE_PATH, token,
                 message=f"Save scenario '{name}' for {location} via app",
                 sha=sha,
             )
+            _write_local_scenarios(new_content)
+            return response
         except GitHubConflict:
             if attempt == 2:
                 raise
@@ -162,11 +182,13 @@ def delete_scenario_on_github(
             existing[location] = block
         new_content = json.dumps(existing, indent=2)
         try:
-            return save_catalog_to_github(
+            response = save_catalog_to_github(
                 new_content, GITHUB_FILE_PATH, token,
                 message=f"Delete scenario '{name}' for {location} via app",
                 sha=sha,
             )
+            _write_local_scenarios(new_content)
+            return response
         except GitHubConflict:
             if attempt == 2:
                 raise

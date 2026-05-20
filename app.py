@@ -155,6 +155,18 @@ def _render_scenarios_panel(location: str, seed_key: str, rev_key: str) -> None:
     scenario_names = sorted(scenarios.keys()) if isinstance(scenarios, dict) else []
 
     with st.sidebar.expander("📂 Save / load scenarios", expanded=False):
+        # Replay any one-shot success / info / error message stashed before rerun
+        toast_key = f"_scenario_toast_{location}"
+        toast = st.session_state.pop(toast_key, None)
+        if toast:
+            level, msg = toast
+            if level == "success":
+                st.success(msg)
+            elif level == "info":
+                st.info(msg)
+            else:
+                st.error(msg)
+
         st.caption(
             f"Scenarios for **{location}** only. "
             "Saved to `data/scenarios.json` on GitHub — shared across all users."
@@ -271,10 +283,13 @@ def _scenario_save(location: str, name: str, seed_key: str, existing_names: list
             st.cache_data.clear()
         except Exception:
             pass
-        st.success(
+        # Stash a one-shot success message that survives the upcoming rerun
+        st.session_state[f"_scenario_toast_{location}"] = (
+            "success",
             f"✅ Saved scenario **{name}** for {location}"
-            + (f" (commit [`{commit_sha}`]({commit_url}))." if commit_url else ".")
+            + (f" (commit [`{commit_sha}`]({commit_url}))." if commit_url else "."),
         )
+        st.rerun()
     except Exception as e:
         st.error(f"❌ Save failed: {e}")
 
@@ -309,7 +324,9 @@ def _scenario_delete(location: str, name: str) -> None:
             st.cache_data.clear()
         except Exception:
             pass
-        st.success(f"🗑 Deleted scenario **{name}** for {location}.")
+        st.session_state[f"_scenario_toast_{location}"] = (
+            "success", f"🗑 Deleted scenario **{name}** for {location}.",
+        )
         st.rerun()
     except Exception as e:
         st.error(f"❌ Delete failed: {e}")

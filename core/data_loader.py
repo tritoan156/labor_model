@@ -54,25 +54,38 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     desc_col = _safe_get(df, ["Description"])
     bat_col = _safe_get(df, ["🔋Bat", "Bat", "Battery"])
 
-    pick_col = next((c for c in df.columns if "PICK" in str(c).upper() or c.startswith("Warehouse")), None)
-    wire_col = next((c for c in df.columns if "PREP-WH" in str(c).upper() or "Wire" in str(c)), None)
-    trl_col  = next((c for c in df.columns if "SUB-TRL" in str(c).upper() or "Trl" in str(c) or "Trailer" in str(c)), None)
-    fn_col   = next((c for c in df.columns if "FN-ASSY" in str(c).upper() or "Final" in str(c)), None)
-    pdi_col  = next((c for c in df.columns if "TEST-PDI" in str(c).upper() or c.startswith("PDI")), None)
-    qc_col   = next((c for c in df.columns if "FN-QC" in str(c).upper() or c.startswith("QC")), None)
-    ship_col = next((c for c in df.columns if "SHIP" in str(c).upper()), None)
+    # Robust detection — match original verbose headers OR friendly names
+    # written back by the catalog save (e.g. "Wire", "Trailer", "FN_Assy_old").
+    def _find(df_cols, *patterns):
+        for c in df_cols:
+            s = str(c).upper()
+            for p in patterns:
+                if p.upper() in s:
+                    return c
+        return None
+
+    pick_col = _find(df.columns, "PICK", "Warehouse")
+    wire_col = _find(df.columns, "PREP-WH", "Wire")
+    trl_col  = _find(df.columns, "SUB-TRL", "Trl", "Trailer")
+    fn_col   = _find(df.columns, "FN-ASSY", "Final", "FN_Assy", "FNAssy")
+    pdi_col  = _find(df.columns, "TEST-PDI", "PDI")
+    qc_col   = _find(df.columns, "FN-QC", "QC")
+    ship_col = _find(df.columns, "SHIP")
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
     out["Description"] = df[desc_col].fillna("") if desc_col else ""
-    out["Warehouse"] = pd.to_numeric(df[pick_col], errors="coerce").fillna(0) if pick_col else 0
-    out["Wire"] = pd.to_numeric(df[wire_col], errors="coerce").fillna(0) if wire_col else 0
-    out["Trailer"] = pd.to_numeric(df[trl_col], errors="coerce").fillna(0) if trl_col else 0
-    out["FN_Assy_old"] = pd.to_numeric(df[fn_col], errors="coerce").fillna(0) if fn_col else 0
-    out["PDI"] = pd.to_numeric(df[pdi_col], errors="coerce").fillna(0) if pdi_col else 0
-    out["QC"] = pd.to_numeric(df[qc_col], errors="coerce").fillna(0) if qc_col else 0
-    out["Ship"] = pd.to_numeric(df[ship_col], errors="coerce").fillna(0) if ship_col else 0
-    out["Bat"] = pd.to_numeric(df[bat_col], errors="coerce").fillna(0).astype(int) if bat_col else 0
+    n = len(df)
+    zeros = pd.Series([0.0] * n, index=df.index, dtype=float)
+    int_zeros = pd.Series([0] * n, index=df.index, dtype=int)
+    out["Warehouse"] = pd.to_numeric(df[pick_col], errors="coerce").fillna(0) if pick_col else zeros
+    out["Wire"] = pd.to_numeric(df[wire_col], errors="coerce").fillna(0) if wire_col else zeros
+    out["Trailer"] = pd.to_numeric(df[trl_col], errors="coerce").fillna(0) if trl_col else zeros
+    out["FN_Assy_old"] = pd.to_numeric(df[fn_col], errors="coerce").fillna(0) if fn_col else zeros
+    out["PDI"] = pd.to_numeric(df[pdi_col], errors="coerce").fillna(0) if pdi_col else zeros
+    out["QC"] = pd.to_numeric(df[qc_col], errors="coerce").fillna(0) if qc_col else zeros
+    out["Ship"] = pd.to_numeric(df[ship_col], errors="coerce").fillna(0) if ship_col else zeros
+    out["Bat"] = pd.to_numeric(df[bat_col], errors="coerce").fillna(0).astype(int) if bat_col else int_zeros
 
     # Apply battery-count overrides
     for sku, count in BATTERY_COUNT_OVERRIDES.items():
@@ -99,24 +112,40 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
 
     sku_col = _safe_get(df, ["SKU ID", "SKU"])
     desc_col = _safe_get(df, ["Description"])
-    pick_col = next((c for c in df.columns if "PICK" in str(c).upper() or c.startswith("Warehouse")), None)
-    kit_col = next((c for c in df.columns if "PREP-ACC" in str(c).upper() or "Acc KIT" in str(c)), None)
-    prep_col = next((c for c in df.columns if "PREP-NP" in str(c).upper() or "Battery Assy" in str(c)), None)
-    btr_col = next((c for c in df.columns if "SUB-BTR raw" in str(c) or "SUB-BTR)" in str(c) or "Battery Sub raw" in str(c)), None)
-    pm_col = next((c for c in df.columns if "SUB-PM" in str(c).upper() or c.startswith("PM ")), None)
-    gen_col = next((c for c in df.columns if "SUB-GEN" in str(c).upper() or "Gen Sub" in str(c)), None)
-    com_col = next((c for c in df.columns if "SUB-COM" in str(c).upper() or "Compressor" in str(c)), None)
+
+    # Column detection recognises BOTH the original CSV header format
+    # (e.g. "Acc KIT (PREP-ACC)") AND the friendly internal name written
+    # back by the catalog save (e.g. "AccKIT", "Nameplate Prep"). This keeps
+    # the loader robust whether the CSV was hand-authored or app-saved.
+    def _find(df_cols, *patterns):
+        for c in df_cols:
+            s = str(c).upper()
+            for p in patterns:
+                if p.upper() in s:
+                    return c
+        return None
+
+    pick_col = _find(df.columns, "PICK", "Warehouse")
+    kit_col  = _find(df.columns, "PREP-ACC", "Acc KIT", "AccKIT")
+    prep_col = _find(df.columns, "PREP-NP", "Battery Assy", "Nameplate Prep", "Nameplate")
+    btr_col  = _find(df.columns, "SUB-BTR raw", "SUB-BTR)", "Battery Sub raw", "BattSubRaw", "SubRaw")
+    pm_col   = _find(df.columns, "SUB-PM", "PMAcc", "PM Acc", "PM ")
+    gen_col  = _find(df.columns, "SUB-GEN", "Gen Sub", "GenAcc", "Gen Acc")
+    com_col  = _find(df.columns, "SUB-COM", "Compressor")
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
     out["Description"] = df[desc_col].fillna("") if desc_col else ""
-    out["Warehouse"] = pd.to_numeric(df[pick_col], errors="coerce").fillna(0) if pick_col else 0
-    out["AccKIT"] = pd.to_numeric(df[kit_col], errors="coerce").fillna(0) if kit_col else 0
-    out["Nameplate Prep"] = pd.to_numeric(df[prep_col], errors="coerce").fillna(0) if prep_col else 0
-    out["BattSubRaw"] = pd.to_numeric(df[btr_col], errors="coerce").fillna(0) if btr_col else 0
-    out["PMAcc"] = pd.to_numeric(df[pm_col], errors="coerce").fillna(0) if pm_col else 0
-    out["GenAcc"] = pd.to_numeric(df[gen_col], errors="coerce").fillna(0) if gen_col else 0
-    out["Compressor"] = pd.to_numeric(df[com_col], errors="coerce").fillna(0) if com_col else 0
+    # Use Series (not scalar) so columns always exist even if no rows
+    n = len(df)
+    zeros = pd.Series([0] * n, index=df.index, dtype=float)
+    out["Warehouse"] = pd.to_numeric(df[pick_col], errors="coerce").fillna(0) if pick_col else zeros
+    out["AccKIT"] = pd.to_numeric(df[kit_col], errors="coerce").fillna(0) if kit_col else zeros
+    out["Nameplate Prep"] = pd.to_numeric(df[prep_col], errors="coerce").fillna(0) if prep_col else zeros
+    out["BattSubRaw"] = pd.to_numeric(df[btr_col], errors="coerce").fillna(0) if btr_col else zeros
+    out["PMAcc"] = pd.to_numeric(df[pm_col], errors="coerce").fillna(0) if pm_col else zeros
+    out["GenAcc"] = pd.to_numeric(df[gen_col], errors="coerce").fillna(0) if gen_col else zeros
+    out["Compressor"] = pd.to_numeric(df[com_col], errors="coerce").fillna(0) if com_col else zeros
 
     out = out[out["SKU"].notna() & (out["SKU"] != "")]
     out = out.set_index("SKU", drop=False)

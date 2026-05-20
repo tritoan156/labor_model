@@ -944,29 +944,29 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         ).reset_index(drop=True)
 
         # Live totals — non-battery labor + BattSubRaw × N for N = 1, 3, 5
+        # Per-accessory battery count comes from the machine catalog (max Bat for
+        # the family). PDS / SDG accessories yield 0 (no battery multiplier).
+        bat_counts = display_df["SKU"].astype(str).apply(
+            lambda s: _family_battery_count(machine_df, _accessory_family_hint(s))
+        )
         non_batt_cols = [c for c in editable_cols if c != "BattSubRaw"]
         base = display_df[non_batt_cols].fillna(0).sum(axis=1)
         per_batt = display_df["BattSubRaw"].fillna(0)
-        display_df["Total (1 batt)"] = (base + per_batt * 1).astype(int)
-        display_df["Total (3 batt)"] = (base + per_batt * 3).astype(int)
-        display_df["Total (5 batt)"] = (base + per_batt * 5).astype(int)
+        display_df["Bat"] = bat_counts.astype(int)
+        display_df["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
 
         col_cfg = {
             "SKU": st.column_config.TextColumn("SKU", disabled=True),
             "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
             "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
             "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
-            "Total (1 batt)": st.column_config.NumberColumn(
-                "Total (1 batt)", disabled=True,
-                help="Per-unit labor when paired with a 1-battery FG (most BOSS25 / BOSS70 / BOSS125).",
+            "Bat": st.column_config.NumberColumn(
+                "Bat", disabled=True,
+                help="Battery count for this accessory's FG family — sourced from machine_clean.csv.",
             ),
-            "Total (3 batt)": st.column_config.NumberColumn(
-                "Total (3 batt)", disabled=True,
-                help="Per-unit labor when paired with a 3-battery FG (BOSS220HS-002).",
-            ),
-            "Total (5 batt)": st.column_config.NumberColumn(
-                "Total (5 batt)", disabled=True,
-                help="Per-unit labor when paired with a 5-battery FG (BOSS400 family).",
+            "Total per unit (p-min)": st.column_config.NumberColumn(
+                "Total per unit (p-min)", disabled=True,
+                help="Non-battery labor + BattSubRaw × Bat. Bat comes from the machine catalog for the accessory's family.",
             ),
         }
         for c in editable_cols:
@@ -983,11 +983,9 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         )
 
         st.caption(
-            "💡 The three Total columns show per-unit labor at different battery counts:  \n"
-            "• **Total (1 batt)** — most BOSS25 / BOSS70 / BOSS125  \n"
-            "• **Total (3 batt)** — BOSS220HS-002  \n"
-            "• **Total (5 batt)** — BOSS400 family  \n"
-            "Formula: `non-battery labor + BattSubRaw × battery count`."
+            "💡 **Total per unit** = non-battery labor + `BattSubRaw × Bat`, where "
+            "`Bat` is the exact count from the machine catalog for each accessory's "
+            "FG family. Family-mixed counts use the maximum (e.g. BOSS220 → 3)."
         )
 
         if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
@@ -1007,8 +1005,11 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
 
-    # Drop UI-only / derived columns before merging (Total (1 batt), Used (qty), In schedule)
-    drop_cols = [c for c in ["Total (1 batt)", "Total (3 batt)", "Total (5 batt)",
+    # Drop UI-only / derived columns before merging — these are computed in the
+    # display layer and must never be written back to acc_clean.csv. The legacy
+    # "Total (N batt)" names are kept for backward compatibility with old state.
+    drop_cols = [c for c in ["Bat", "Total per unit (p-min)",
+                              "Total (1 batt)", "Total (3 batt)", "Total (5 batt)",
                               "Used (qty)", "In schedule"]
                  if c in edited.columns]
     edited = edited.drop(columns=drop_cols)
@@ -1383,6 +1384,31 @@ def _accessory_family_hint(sku: str) -> str:
     import re
     s = str(sku).strip()
     return re.split(r"-A", s)[0]
+
+
+def _family_battery_count(machine_df, family_prefix: str) -> int:
+    """Max `Bat` among machine rows whose SKU starts with `family_prefix`.
+
+    Returns 0 when nothing matches (e.g. PDS / SDG / unknown family) — those
+    accessories simply skip the battery multiplier in the Total column.
+
+    The machine catalog is the authoritative source for battery counts;
+    `BATTERY_COUNT_OVERRIDES` from `core/constants.py` is already baked into
+    the loaded `machine_df["Bat"]` by `load_machine_labor()`.
+    """
+    if not family_prefix or machine_df is None or len(machine_df) == 0:
+        return 0
+    pf = str(family_prefix).strip().upper()
+    if not pf:
+        return 0
+    skus = machine_df["SKU"].astype(str).str.upper()
+    mask = skus.str.startswith(pf)
+    if not mask.any():
+        return 0
+    try:
+        return int(machine_df.loc[mask, "Bat"].fillna(0).max())
+    except (TypeError, ValueError):
+        return 0
 
 
 def _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_acc):
@@ -1913,15 +1939,18 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
         a_disp = acc_df.copy()
         a_disp.insert(0, "Used (qty)", a_disp.index.map(lambda s: used_acc.get(s, 0)))
         a_disp.insert(1, "In schedule", a_disp["Used (qty)"] > 0)
-        # Per-accessory totals at 1 / 3 / 5 battery counts
+        # Per-accessory total uses the EXACT battery count from machine_clean.csv
+        # for the family. PDS / SDG accessories → 0 (no battery multiplier).
         acc_labor_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
                           "PMAcc", "GenAcc", "Compressor"]
         non_batt_cols = [c for c in acc_labor_cols if c != "BattSubRaw"]
+        bat_counts = a_disp.index.to_series().astype(str).apply(
+            lambda s: _family_battery_count(machine_df, _accessory_family_hint(s))
+        )
         base = a_disp[non_batt_cols].fillna(0).sum(axis=1)
         per_batt = a_disp["BattSubRaw"].fillna(0)
-        a_disp["Total (1 batt)"] = (base + per_batt * 1).astype(int)
-        a_disp["Total (3 batt)"] = (base + per_batt * 3).astype(int)
-        a_disp["Total (5 batt)"] = (base + per_batt * 5).astype(int)
+        a_disp["Bat"] = bat_counts.astype(int)
+        a_disp["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
         if only_used:
             a_disp = a_disp[a_disp["In schedule"]]
         a_disp = a_disp.sort_values(
@@ -1937,8 +1966,8 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
         st.caption(
             f"🟡 highlighted = used in current schedule "
             f"({sum(a_disp['In schedule'])} of {len(a_disp)} shown). "
-            "**Total (N batt)** = per-unit labor including `BattSubRaw × N`. "
-            "Use 1 for typical BOSS25/70/125, 3 for BOSS220HS-002, 5 for BOSS400."
+            "**Total per unit** = non-battery labor + `BattSubRaw × Bat`. "
+            "`Bat` is the exact count from the machine catalog for the accessory's FG family."
         )
 
 

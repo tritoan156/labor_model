@@ -1650,8 +1650,17 @@ def _render_item_variants_view(variants_df, item_master_df):
         if unknown:
             st.warning(f"⚠️ Variants reference unknown items not in the master: {', '.join(unknown)}")
 
+    # Normalize column dtypes so st.data_editor's type checker is happy:
+    # cast text columns to plain strings (no NaN), Time (min) to float.
+    seed = variants_df.copy()
+    for c in ("Item", "FG family", "Side", "Notes"):
+        if c in seed.columns:
+            seed[c] = seed[c].astype(str).replace({"nan": "", "None": ""})
+    if "Time (min)" in seed.columns:
+        seed["Time (min)"] = pd.to_numeric(seed["Time (min)"], errors="coerce").fillna(0).astype(float)
+
     edited = st.data_editor(
-        variants_df,
+        seed,
         use_container_width=True,
         num_rows="dynamic",
         key="item_variants_editor",
@@ -1665,11 +1674,10 @@ def _render_item_variants_view(variants_df, item_master_df):
                 "FG family",
                 help="Prefix to match the FG family (e.g. SDG13, PDS185EZ, BOSS25).",
             ),
-            "Side": st.column_config.SelectboxColumn(
+            "Side": st.column_config.TextColumn(
                 "Side",
-                options=["Compressor", "Generator", "PM"],
-                required=True,
-                help="Which station the time rolls up to.",
+                help="Which station the time rolls up to: Compressor, Generator, or PM.",
+                width="small",
             ),
             "Time (min)": st.column_config.NumberColumn(
                 "Time (min)", min_value=0, step=1,
@@ -1807,11 +1815,9 @@ def _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df):
             "Accessory SKU": st.column_config.TextColumn(
                 "Accessory SKU", help="e.g. BOSS25-A016",
             ),
-            "Category": st.column_config.SelectboxColumn(
+            "Category": st.column_config.TextColumn(
                 "Category",
-                options=["Gen", "PM", "Compressor"],
-                help="Which station this item rolls up to.",
-                required=True,
+                help="Which station this item rolls up to: Gen, PM, or Compressor.",
             ),
             "Item": st.column_config.TextColumn("Item", help="e.g. Brake kit, Decals, Air filter"),
             "Time (min)": st.column_config.NumberColumn(

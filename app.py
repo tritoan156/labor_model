@@ -713,38 +713,171 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
 
 
 def tab_cycle_time(units, inputs):
-    st.header("⏱ Cycle Time per Unit")
-    st.caption("Per finished unit (FG + ACC pairing): Total Labor and Cycle Time at each station.")
-
-    # Build per-pairing table
     from core.constants import STATION_KEY_TO_DISPLAY, STATION_KEYS, HS_FINAL_CREW
-    rows = []
+
+    st.header("⏱ Build Time per Unit")
+    st.markdown(
+        "**How long does it take to build one of each unit?**  \n"
+        "• **Total Labor** — sum of person-minutes across every station the unit touches.  \n"
+        "• **Lead Time (days)** — wall-clock days if **one person** built the whole unit "
+        f"(`Total Labor ÷ {inputs['shift']} min × efficiency`).  \n"
+        "• **Sum of Cycles** — wall-clock minutes if every station was done sequentially "
+        "with your current Crew settings (upper bound — real flow has parallel sub-assembly)."
+    )
+
+    shift = inputs["shift"]
+    efficiency = max(inputs["efficiency"], 0.01)  # avoid div-by-zero
+
+    # ---- Build the per-pairing summary ----
+    summary_rows = []
+    detail_rows = []
     for (fg, acc, cls, bat), grp in units.groupby(["fg_base", "acc", "Class", "Bat"]):
         sample = grp.iloc[0]
-        row = {
-            "FG Base": fg,
-            "ACC": acc or "—",
-            "Class": cls,
-            "Bat": int(bat),
-            "Qty in May": len(grp),
-        }
+        total_labor = 0
+        sum_cycles = 0.0
+        longest_st = None
+        longest_cycle = 0.0
+        per_station = {}
+
         for st_key in STATION_KEYS:
-            total_lbr = sample[st_key]
-            if total_lbr == 0:
+            lbr = sample[st_key]
+            if lbr == 0:
                 continue
             crew = inputs["crew_config"].loc[STATION_KEY_TO_DISPLAY[st_key], "Crew"]
             if st_key == "Final" and cls == "HS":
-                cycle = total_lbr / HS_FINAL_CREW
+                cycle = lbr / HS_FINAL_CREW
             else:
-                cycle = total_lbr / crew if crew else 0
-            row[f"{st_key} Total"] = int(total_lbr)
-            row[f"{st_key} Cycle"] = round(cycle, 1)
-        rows.append(row)
+                cycle = lbr / crew if crew else 0
+            total_labor += lbr
+            sum_cycles += cycle
+            if cycle > longest_cycle:
+                longest_cycle = cycle
+                longest_st = STATION_KEY_TO_DISPLAY[st_key]
+            per_station[st_key] = (int(lbr), round(cycle, 1))
 
-    df = pd.DataFrame(rows)
-    # Sort May SKUs by qty desc
-    df = df.sort_values(by="Qty in May", ascending=False).reset_index(drop=True)
-    st.dataframe(df, use_container_width=True, height=600)
+        # Lead time (days) — assumes 1 person, shift × efficiency productive minutes/day
+        lead_days = total_labor / (shift * efficiency) if shift > 0 else 0
+
+        summary_rows.append({
+            "FG SKU": fg,
+            "ACC SKU": acc or "—",
+            "Class": cls,
+            "Bat": int(bat),
+            "Qty in schedule": len(grp),
+            "Total Labor (p-min)": int(total_labor),
+            "Lead Time (days)": round(lead_days, 2),
+            "Sum of Cycles (min)": round(sum_cycles, 1),
+            "Longest Station": longest_st or "—",
+            "Longest Cycle (min)": round(longest_cycle, 1),
+        })
+        detail_rows.append({"key": f"{fg} + {acc or '—'}", "per_station": per_station, "cls": cls, "bat": int(bat)})
+
+    summary_df = pd.DataFrame(summary_rows).sort_values(
+        by="Total Labor (p-min)", ascending=False,
+    ).reset_index(drop=True)
+
+    # ---- Top metrics (across all unit pairings) ----
+    if not summary_df.empty:
+        avg_labor = summary_df["Total Labor (p-min)"].mean()
+        avg_lead = summary_df["Lead Time (days)"].mean()
+        slowest = summary_df.iloc[0]
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Unique unit pairings", f"{len(summary_df)}")
+        c2.metric("Avg labor / unit", f"{int(avg_labor):,} p-min")
+        c3.metric("Avg lead time / unit", f"{avg_lead:.1f} days")
+        c4.metric(
+            "Slowest unit", f"{slowest['FG SKU']}",
+            help=f"{int(slowest['Total Labor (p-min)']):,} p-min · {slowest['Lead Time (days)']} days",
+        )
+
+    st.markdown("---")
+    st.subheader("📋 Summary — one row per unit pairing")
+    st.caption("Sorted by Total Labor descending. Each row = one unique FG + Accessory pairing in the current schedule.")
+    st.dataframe(
+        summary_df,
+        use_container_width=True,
+        height=380,
+        hide_index=True,
+        column_config={
+            "Total Labor (p-min)": st.column_config.NumberColumn(
+                "Total Labor (p-min)",
+                help="Person-minutes summed across all stations.",
+                format="%d",
+            ),
+            "Lead Time (days)": st.column_config.NumberColumn(
+                "Lead Time (days)",
+                help=f"Total Labor ÷ ({shift} min × {efficiency:.3f} efficiency). "
+                     f"How long for one person to build the unit alone.",
+                format="%.2f",
+            ),
+            "Sum of Cycles (min)": st.column_config.NumberColumn(
+                "Sum of Cycles (min)",
+                help="Sum of cycle times across stations (assumes purely sequential — upper bound).",
+                format="%.1f",
+            ),
+            "Longest Cycle (min)": st.column_config.NumberColumn(
+                "Longest Cycle (min)",
+                help="Cycle time at the bottleneck station for this unit.",
+                format="%.1f",
+            ),
+        },
+    )
+
+    # ---- Per-station drill-down ----
+    st.markdown("---")
+    st.subheader("🔎 Drill down: per-station breakdown")
+    st.caption("Pick a unit pairing to see its labor and cycle time at each station.")
+
+    pairing_choices = [r["key"] for r in detail_rows]
+    if pairing_choices:
+        chosen = st.selectbox(
+            "Unit pairing",
+            options=pairing_choices,
+            index=0,
+        )
+        chosen_detail = next(r for r in detail_rows if r["key"] == chosen)
+
+        breakdown_rows = []
+        for st_key, (lbr, cycle) in chosen_detail["per_station"].items():
+            crew = int(inputs["crew_config"].loc[STATION_KEY_TO_DISPLAY[st_key], "Crew"])
+            hc_used = HS_FINAL_CREW if (st_key == "Final" and chosen_detail["cls"] == "HS") else crew
+            breakdown_rows.append({
+                "Station": STATION_KEY_TO_DISPLAY[st_key],
+                "Total Labor (p-min)": lbr,
+                "Crew working in parallel": hc_used,
+                "Cycle Time (min)": cycle,
+            })
+        breakdown_df = pd.DataFrame(breakdown_rows)
+        # Add a TOTAL row
+        total_lbr = int(breakdown_df["Total Labor (p-min)"].sum())
+        total_cycle = round(breakdown_df["Cycle Time (min)"].sum(), 1)
+        total_row = pd.DataFrame([{
+            "Station": "🟦 TOTAL",
+            "Total Labor (p-min)": total_lbr,
+            "Crew working in parallel": "—",
+            "Cycle Time (min)": total_cycle,
+        }])
+        breakdown_df = pd.concat([breakdown_df, total_row], ignore_index=True)
+
+        st.dataframe(
+            breakdown_df, use_container_width=True, hide_index=True, height=460,
+            column_config={
+                "Total Labor (p-min)": st.column_config.NumberColumn(format="%d"),
+                "Cycle Time (min)": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+
+        # Quick read-out for this unit
+        lead_days = total_lbr / (shift * efficiency) if shift > 0 else 0
+        st.info(
+            f"**Build summary for {chosen}:**  \n"
+            f"• Total work: **{total_lbr:,} person-minutes** "
+            f"(= {total_lbr/60:.1f} person-hours)  \n"
+            f"• Lead time (1 person, fully utilized): **{lead_days:.2f} days**  \n"
+            f"• Sequential build cycle (with current Crew): **{total_cycle:.0f} cal-min** "
+            f"(= {total_cycle/60:.1f} hours, ~{total_cycle/shift:.2f} shifts)"
+        )
 
 
 def tab_data_validation(machine_df, acc_df):

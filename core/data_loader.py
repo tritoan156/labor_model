@@ -8,6 +8,7 @@ Reads CSV inputs and returns clean DataFrames:
   - load_item_packages()    → bundled packages (e.g. CWP, AWP)
   - load_accessory_items()  → per-SKU item composition (analytical)
   - resolve_item_time()     → family-aware lookup for one (item, family, side)
+  - unique_abbrs()          → unique item abbreviations from the master
 """
 from __future__ import annotations
 
@@ -18,6 +19,20 @@ from typing import Union
 import pandas as pd
 
 from .constants import CUSTOMER_SUFFIXES, BATTERY_COUNT_OVERRIDES
+
+__all__ = [
+    "load_machine_labor",
+    "load_acc_labor",
+    "load_schedule",
+    "build_manual_schedule",
+    "load_accessory_items",
+    "load_item_master",
+    "load_item_packages",
+    "resolve_item_time",
+    "unique_abbrs",
+    "accessory_item_rollup",
+    "collapse_customer_suffix",
+]
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 

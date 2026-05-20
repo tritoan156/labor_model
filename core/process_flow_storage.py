@@ -37,9 +37,12 @@ GITHUB_FILE_PATH = "data/process_flow.json"
 
 VALID_CLASSES = ("All", "STD", "HT", "HS")
 
-# Conservative defaults — match the old hardcoded shape. The user will edit
-# these to reflect the real manufacturing flow.
+# Default edges — reflect the real manufacturing flow as authored by the
+# user in the Process Flow tab. Edit `data/process_flow.json` via the in-app
+# editor to update at runtime; mirror those changes back here whenever you
+# want the new flow to become the persistent default.
 DEFAULT_EDGES: List[dict] = [
+    # Pick → all sub-assemblies
     {"From": "Warehouse", "To": "Wire",    "Class": "All"},
     {"From": "Warehouse", "To": "Battery", "Class": "All"},
     {"From": "Warehouse", "To": "PMAcc",   "Class": "All"},
@@ -48,14 +51,25 @@ DEFAULT_EDGES: List[dict] = [
     {"From": "Warehouse", "To": "AccKIT",  "Class": "All"},
     {"From": "Warehouse", "To": "Trailer", "Class": "All"},
     {"From": "Warehouse", "To": "ETO",     "Class": "All"},
-    {"From": "Wire",      "To": "Final",   "Class": "All"},
-    {"From": "Battery",   "To": "Final",   "Class": "All"},
+
+    # Sub-assembly dependencies (Wire feeds Battery / Trailer / ETO / AccKIT;
+    # Battery feeds PMAcc + ETO; AccKIT feeds GenAcc)
+    {"From": "Wire",      "To": "Battery", "Class": "All"},
+    {"From": "Wire",      "To": "Trailer", "Class": "All"},
+    {"From": "Wire",      "To": "ETO",     "Class": "All"},
+    {"From": "Wire",      "To": "AccKIT",  "Class": "All"},
+    {"From": "Battery",   "To": "PMAcc",   "Class": "All"},
+    {"From": "Battery",   "To": "ETO",     "Class": "All"},
+    {"From": "AccKIT",    "To": "GenAcc",  "Class": "All"},
+
+    # Sub-assemblies → Final
     {"From": "PMAcc",     "To": "Final",   "Class": "All"},
     {"From": "GenAcc",    "To": "Final",   "Class": "All"},
     {"From": "ComAcc",    "To": "Final",   "Class": "All"},
-    {"From": "AccKIT",    "To": "Final",   "Class": "All"},
     {"From": "Trailer",   "To": "Final",   "Class": "All"},
     {"From": "ETO",       "To": "Final",   "Class": "All"},
+
+    # Post-line (sequential)
     {"From": "Final",     "To": "PDI",     "Class": "All"},
     {"From": "PDI",       "To": "QC",      "Class": "All"},
     {"From": "QC",        "To": "Ship",    "Class": "All"},

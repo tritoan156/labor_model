@@ -125,8 +125,10 @@ def _render_sku_browser(machine_df, acc_df, location: str, seed_key: str, rev_ke
     """Sidebar expander that lets the user filter the machine catalog by
     family + class and add a chosen FG SKU + accessory + qty into the
     manual entries table (via session_state[seed_key])."""
-    # Build a working frame with classification columns we can filter on
-    work = machine_df.copy()
+    # Build a working frame with classification columns we can filter on.
+    # reset_index(drop=True) avoids the SKU index/column ambiguity that
+    # bites sort_values later.
+    work = machine_df.reset_index(drop=True).copy()
     work["__family"] = work["SKU"].astype(str).apply(_machine_family)
     work["__class"] = work.apply(
         lambda r: _machine_class(r["SKU"], r.get("Description", "")), axis=1,
@@ -195,10 +197,11 @@ def _render_sku_browser(machine_df, acc_df, location: str, seed_key: str, rev_ke
         # --- Accessory selector (matching FG family) -------------------------
         acc_options = ["(none)"]
         if acc_df is not None and not acc_df.empty:
-            acc_skus = acc_df["SKU"].astype(str)
+            acc_work = acc_df.reset_index(drop=True).copy()
+            acc_skus = acc_work["SKU"].astype(str)
             # Match accessories whose family hint == chosen family
             acc_mask = acc_skus.apply(_accessory_family_hint).str.upper() == family_choice.upper()
-            acc_subset = acc_df[acc_mask].copy()
+            acc_subset = acc_work[acc_mask].copy()
             acc_subset = acc_subset.sort_values(by="SKU")
             acc_options.extend(acc_subset["SKU"].astype(str).tolist())
 

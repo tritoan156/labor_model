@@ -67,11 +67,28 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     bat_in_catalog = int(m["Bat"]) if m["Bat"] else 0
     bat = bat_in_catalog if is_boss else 0
 
+    # Defensive helper — read a labor column from the accessory row,
+    # returning 0 if the column is missing (handles legacy CSVs that
+    # were saved before a column rename, etc.)
+    def _acc(col: str) -> float:
+        if a is None:
+            return 0.0
+        try:
+            v = a[col]
+        except KeyError:
+            return 0.0
+        try:
+            return float(v) if pd.notna(v) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     # Battery total
+    btr = _acc("BattSubRaw")
+    nameplate = _acc("Nameplate Prep")
     if not is_boss:
         batt_total = 0
-    elif a is not None and (a["BattSubRaw"] > 0 or a["Nameplate Prep"] > 0):
-        batt_total = a["BattSubRaw"] * bat + a["Nameplate Prep"]
+    elif a is not None and (btr > 0 or nameplate > 0):
+        batt_total = btr * bat + nameplate
     elif bat > 0:
         batt_total = DEFAULT_BATT_RAW * bat + DEFAULT_NAMEPLATE_PREP
     else:
@@ -85,13 +102,13 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     return {
         "Class": cls,
         "Bat": bat,
-        "Warehouse": m["Warehouse"] + (a["Warehouse"] if a is not None else 0),
+        "Warehouse": m["Warehouse"] + _acc("Warehouse"),
         "Wire": m["Wire"],
         "Battery": batt_total,
-        "PMAcc": a["PMAcc"] if a is not None else 0,
-        "GenAcc": a["GenAcc"] if a is not None else 0,
+        "PMAcc": _acc("PMAcc"),
+        "GenAcc": _acc("GenAcc"),
         "Trailer": m["Trailer"],
-        "AccKIT": a["AccKIT"] if a is not None else 0,
+        "AccKIT": _acc("AccKIT"),
         "Final": FINAL_LABOR[cls],
         "PDI": m["PDI"],
         "QC": m["QC"],

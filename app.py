@@ -76,15 +76,23 @@ def _csv_mtime(filename: str) -> float:
     return p.stat().st_mtime if p.exists() else 0.0
 
 
+# Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
+# renames, new columns, etc.) so the cache invalidates even if the underlying
+# CSV file's mtime hasn't changed.
+_LOADER_SCHEMA_VERSION = 3
+
+
 @st.cache_data(show_spinner=False)
-def _load_machine_df(_mtime: float):
+def _load_machine_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
     return load_machine_labor()
 
 
 @st.cache_data(show_spinner=False)
-def _load_acc_df(_mtime: float, _items_mtime: float = 0.0):
+def _load_acc_df(_mtime: float, _items_mtime: float = 0.0,
+                 _schema_ver: int = _LOADER_SCHEMA_VERSION):
     """The acc DataFrame depends on BOTH acc_clean.csv and accessory_items.csv,
-    so we take both mtimes as cache keys."""
+    so we take both mtimes as cache keys. `_schema_ver` lets us force a
+    refresh after a column rename even when the file mtime is unchanged."""
     return load_acc_labor()
 
 
@@ -2427,6 +2435,9 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
             "Show only SKUs used in current schedule", value=False, key="m_only_used"
         )
         m_disp = machine_df.copy()
+        # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
+        if "FN_Assy_old" in m_disp.columns and "FN_Assy" not in m_disp.columns:
+            m_disp = m_disp.rename(columns={"FN_Assy_old": "FN_Assy"})
         # Per-machine total labor across the assembly stations.
         # Bat is a COUNT (not labor) so it's excluded from the sum.
         machine_labor_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy",

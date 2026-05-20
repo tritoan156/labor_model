@@ -1133,6 +1133,9 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         # Machine labor columns the user can edit
         editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "Bat"]
         display_df = machine_df.reset_index(drop=True).copy()
+        # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
+        if "FN_Assy_old" in display_df.columns and "FN_Assy" not in display_df.columns:
+            display_df = display_df.rename(columns={"FN_Assy_old": "FN_Assy"})
         display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_fg.get(s, 0)))
         display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
 
@@ -1196,6 +1199,9 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         editable_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
                          "PMAcc", "GenAcc", "ComAcc"]
         display_df = acc_df.reset_index(drop=True).copy()
+        # Backward-compat: alias "Compressor" → "ComAcc" if cache is stale
+        if "Compressor" in display_df.columns and "ComAcc" not in display_df.columns:
+            display_df = display_df.rename(columns={"Compressor": "ComAcc"})
         display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_acc.get(s, 0)))
         display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
 
@@ -2454,18 +2460,24 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
             "Show only SKUs used in current schedule", value=False, key="a_only_used"
         )
         a_disp = acc_df.copy()
+        # Backward-compat: if the loaded DataFrame has the old "Compressor"
+        # column (because cache hasn't refreshed), alias it to "ComAcc".
+        if "Compressor" in a_disp.columns and "ComAcc" not in a_disp.columns:
+            a_disp = a_disp.rename(columns={"Compressor": "ComAcc"})
         a_disp.insert(0, "Used (qty)", a_disp.index.map(lambda s: used_acc.get(s, 0)))
         a_disp.insert(1, "In schedule", a_disp["Used (qty)"] > 0)
         # Per-accessory total uses the EXACT battery count from machine_clean.csv
         # for the family. PDS / SDG accessories → 0 (no battery multiplier).
         acc_labor_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
                           "PMAcc", "GenAcc", "ComAcc"]
-        non_batt_cols = [c for c in acc_labor_cols if c != "BattSubRaw"]
+        # Only sum columns that actually exist (defensive against stale cache)
+        present_labor_cols = [c for c in acc_labor_cols if c in a_disp.columns]
+        non_batt_cols = [c for c in present_labor_cols if c != "BattSubRaw"]
         bat_counts = a_disp.index.to_series().astype(str).apply(
             lambda s: _family_battery_count(machine_df, _accessory_family_hint(s))
         )
         base = a_disp[non_batt_cols].fillna(0).sum(axis=1)
-        per_batt = a_disp["BattSubRaw"].fillna(0)
+        per_batt = a_disp["BattSubRaw"].fillna(0) if "BattSubRaw" in a_disp.columns else pd.Series(0, index=a_disp.index)
         a_disp["Bat"] = bat_counts.astype(int)
         a_disp["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
         if only_used:

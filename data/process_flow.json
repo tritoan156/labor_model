@@ -1,0 +1,23 @@
+{
+  "edges": [
+    {"From": "Warehouse", "To": "Wire",    "Class": "All"},
+    {"From": "Warehouse", "To": "Battery", "Class": "All"},
+    {"From": "Warehouse", "To": "PMAcc",   "Class": "All"},
+    {"From": "Warehouse", "To": "GenAcc",  "Class": "All"},
+    {"From": "Warehouse", "To": "ComAcc",  "Class": "All"},
+    {"From": "Warehouse", "To": "AccKIT",  "Class": "All"},
+    {"From": "Warehouse", "To": "Trailer", "Class": "All"},
+    {"From": "Warehouse", "To": "ETO",     "Class": "All"},
+    {"From": "Wire",      "To": "Final",   "Class": "All"},
+    {"From": "Battery",   "To": "Final",   "Class": "All"},
+    {"From": "PMAcc",     "To": "Final",   "Class": "All"},
+    {"From": "GenAcc",    "To": "Final",   "Class": "All"},
+    {"From": "ComAcc",    "To": "Final",   "Class": "All"},
+    {"From": "AccKIT",    "To": "Final",   "Class": "All"},
+    {"From": "Trailer",   "To": "Final",   "Class": "All"},
+    {"From": "ETO",       "To": "Final",   "Class": "All"},
+    {"From": "Final",     "To": "PDI",     "Class": "All"},
+    {"From": "PDI",       "To": "QC",      "Class": "All"},
+    {"From": "QC",        "To": "Ship",    "Class": "All"}
+  ]
+}

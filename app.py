@@ -44,6 +44,13 @@ from core.scenario_storage import (
     save_scenario_to_github,
     delete_scenario_on_github,
 )
+from core.process_flow_storage import (
+    load_process_flow,
+    save_process_flow_to_github,
+    reset_process_flow_to_default,
+    DEFAULT_EDGES as PROCESS_FLOW_DEFAULTS,
+    VALID_CLASSES as PROCESS_FLOW_VALID_CLASSES,
+)
 from core.data_validator import validate_all
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -127,6 +134,12 @@ def _load_item_packages_df(_mtime: float):
 def _load_scenarios_dict(_mtime: float):
     """Load data/scenarios.json. Cached per file mtime."""
     return load_all_scenarios()
+
+
+@st.cache_data(show_spinner=False)
+def _load_process_flow_edges(_mtime: float):
+    """Load data/process_flow.json. Cached per file mtime."""
+    return load_process_flow()
 
 
 
@@ -2227,13 +2240,48 @@ def tab_cycle_time(units, inputs):
         )
 
 
+def _compute_station_depths(nodes, edges):
+    """Topological depth per node — used to lay out stages in Graphviz.
+
+    `nodes` = set of station keys that the unit visits.
+    `edges` = list of dicts with `From`/`To` keys (already filtered to visited nodes).
+    Returns {node: depth}, with depth=0 for nodes that have no incoming edges.
+    Nodes in a cycle or unreachable fall back to depth=0 to avoid hanging the layout.
+    """
+    incoming = {n: [] for n in nodes}
+    outgoing = {n: [] for n in nodes}
+    for e in edges:
+        f, t = e["From"], e["To"]
+        if f in nodes and t in nodes:
+            incoming[t].append(f)
+            outgoing[f].append(t)
+
+    depth = {n: 0 for n in nodes}
+    # Topological sort via Kahn's algorithm
+    indeg = {n: len(incoming[n]) for n in nodes}
+    queue = [n for n in nodes if indeg[n] == 0]
+    visited = set()
+    while queue:
+        n = queue.pop(0)
+        if n in visited:
+            continue
+        visited.add(n)
+        for t in outgoing[n]:
+            if depth[t] < depth[n] + 1:
+                depth[t] = depth[n] + 1
+            indeg[t] -= 1
+            if indeg[t] == 0:
+                queue.append(t)
+    return depth
+
+
 def tab_process_flow(units_df, machine_df, acc_df, inputs):
     """Visual flow chart of a single unit's path through the workstations.
 
-    User picks an FG SKU and (optional) Accessory SKU, the tab renders a
-    Graphviz diagram with one box per station the unit touches, colored by
-    parallel sub-assembly vs sequential stages, plus a per-station table
-    below.
+    The graph is built from edges in `data/process_flow.json`, which the user
+    can edit through the panel below the diagram. Edges are filtered per unit
+    class (HS / HT / STD) so different products can have different shapes.
+    Nodes are auto-layered by topological depth — no hardcoded stages.
     """
     from core.labor_calculator import compute_unit_labor, classify_unit
     from core.constants import STATION_KEY_TO_DISPLAY, STATION_KEYS, HS_FINAL_CREW
@@ -2241,11 +2289,14 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
     st.header("🔀 Process Flow")
     st.markdown(
         "**Where does this unit go on the floor?** Pick an FG SKU "
-        "(+ optional Accessory) below to see the route from Warehouse pick "
-        "through sub-assembly to ship-out. Boxes are colored by stage: "
-        "🟧 **sequential** stations everyone goes through; "
-        "🟦 **parallel sub-assembly** stations that run side-by-side."
+        "(+ optional Accessory) to see the route. The graph is built from "
+        "**editable per-class edges** stored in `data/process_flow.json` — use "
+        "the **🔧 Edit process flow** panel below to correct the manufacturing "
+        "precedence for your facility."
     )
+
+    # ---- Load edges from JSON -------------------------------------------
+    all_edges = _load_process_flow_edges(_csv_mtime("process_flow.json"))
 
     # ---- SKU selectors ---------------------------------------------------
     fg_options = sorted(machine_df["SKU"].astype(str).unique().tolist())
@@ -2253,17 +2304,13 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
         st.info("No machine SKUs loaded.")
         return
 
-    # If we have units in the current schedule, default to the first one
     default_fg = None
     if units_df is not None and not units_df.empty:
         try:
             default_fg = str(units_df.iloc[0]["fg_base"])
         except Exception:
             default_fg = None
-    if default_fg and default_fg in fg_options:
-        fg_default_idx = fg_options.index(default_fg)
-    else:
-        fg_default_idx = 0
+    fg_default_idx = fg_options.index(default_fg) if default_fg in fg_options else 0
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2271,7 +2318,6 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
             "FG SKU", fg_options, index=fg_default_idx, key="flow_fg",
         )
     with c2:
-        # Accessory options: "(none)" + all accessories whose family matches the FG
         family = _machine_family(fg_choice)
         acc_subset = acc_df[
             acc_df["SKU"].astype(str).apply(_accessory_family_hint).str.upper()
@@ -2287,18 +2333,23 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
     if labor is None:
         st.error(f"`{fg_choice}` not found in the machine catalog.")
         return
-    cls = labor["Class"]
+    cls = labor["Class"]   # "HS" / "HT" / "STD"
     bat = int(labor["Bat"])
 
-    # ---- Build the per-station summary ----------------------------------
-    crew_config = inputs["crew_config"]
-    station_visits = []  # list of (key, display_name, labor, cycle, is_parallel)
+    # ---- Filter edges to this unit's class + visited stations ---------
+    visited = {k for k in STATION_KEYS if float(labor.get(k, 0) or 0) > 0}
+    filtered_edges = [
+        e for e in all_edges
+        if e.get("Class") in ("All", cls)
+        and e.get("From") in visited and e.get("To") in visited
+    ]
 
-    # Stage definitions (key sets) — used for layout + color
-    sequential_pre = ["Warehouse"]
-    parallel_subasm = ["Wire", "Battery", "PMAcc", "GenAcc", "ComAcc",
-                       "AccKIT", "Trailer", "ETO"]
-    sequential_post = ["Final", "PDI", "QC", "Ship"]
+    if not visited:
+        st.warning("This unit has no labor at any station — check the catalog.")
+        return
+
+    # ---- Per-station summary ---------------------------------------------
+    crew_config = inputs["crew_config"]
 
     def _crew_for(st_key):
         disp = STATION_KEY_TO_DISPLAY.get(st_key, st_key)
@@ -2317,25 +2368,30 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
         crew = _crew_for(st_key)
         return lbr / crew if crew else 0.0
 
+    station_visits = []
     for st_key in STATION_KEYS:
         lbr = float(labor.get(st_key, 0) or 0)
         if lbr <= 0:
             continue
-        is_parallel = st_key in parallel_subasm
         station_visits.append({
             "key": st_key,
             "name": STATION_KEY_TO_DISPLAY.get(st_key, st_key),
             "labor": int(round(lbr)),
             "cycle": round(_cycle(st_key, lbr), 1),
-            "is_parallel": is_parallel,
         })
 
-    if not station_visits:
-        st.warning("This unit has no labor at any station — check the catalog.")
-        return
+    # ---- Topological-depth layout ---------------------------------------
+    depths = _compute_station_depths(visited, filtered_edges)
+    # Group by depth
+    by_depth = {}
+    for sv in station_visits:
+        d = depths.get(sv["key"], 0)
+        by_depth.setdefault(d, []).append(sv)
+    max_depth = max(by_depth.keys()) if by_depth else 0
 
-    # ---- Build the Graphviz DOT string ----------------------------------
-    visited_keys = {sv["key"] for sv in station_visits}
+    # Color: orange if alone at its depth (sequential); blue if has siblings (parallel)
+    SEQ_COLOR = "#FFE4B5"   # light orange
+    PAR_COLOR = "#BCD6F2"   # light blue
 
     def _node_id(st_key: str) -> str:
         return f"n_{st_key}"
@@ -2343,60 +2399,37 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
     def _node_label(sv) -> str:
         return f"{sv['name']}\\n{sv['labor']} p-min · {sv['cycle']:.0f} cal-min"
 
-    dot_lines = ["digraph G {",
-                 '  rankdir=TB;',
-                 '  node [shape=box, style="rounded,filled", fontname="Helvetica", margin="0.18,0.10"];',
-                 '  edge [color="#666"];']
+    # ---- Build the Graphviz DOT -----------------------------------------
+    dot_lines = [
+        "digraph G {",
+        '  rankdir=TB;',
+        '  node [shape=box, style="rounded,filled", fontname="Helvetica", margin="0.18,0.10"];',
+        '  edge [color="#666"];',
+    ]
 
-    # Visited stations indexed by stage
-    pre_stations = [sv for sv in station_visits if sv["key"] in sequential_pre]
-    parallel_stations = [sv for sv in station_visits if sv["key"] in parallel_subasm]
-    post_stations = [sv for sv in station_visits if sv["key"] in sequential_post]
-
-    # Colors
-    SEQ_COLOR = "#FFE4B5"    # light orange
-    PAR_COLOR = "#BCD6F2"    # light blue
-
-    # Sequential pre-stations
-    for sv in pre_stations:
-        dot_lines.append(
-            f'  {_node_id(sv["key"])} [label="{_node_label(sv)}", fillcolor="{SEQ_COLOR}"];'
-        )
-    # Parallel sub-assembly stations — grouped in a same-rank subgraph
-    if parallel_stations:
-        dot_lines.append("  { rank=same;")
-        for sv in parallel_stations:
+    for d in sorted(by_depth.keys()):
+        group = by_depth[d]
+        color = PAR_COLOR if len(group) > 1 else SEQ_COLOR
+        if len(group) > 1:
+            dot_lines.append(f"  {{ rank=same; // depth {d}")
+            for sv in group:
+                dot_lines.append(
+                    f'    {_node_id(sv["key"])} [label="{_node_label(sv)}", fillcolor="{color}"];'
+                )
+            dot_lines.append("  }")
+        else:
+            sv = group[0]
             dot_lines.append(
-                f'    {_node_id(sv["key"])} [label="{_node_label(sv)}", fillcolor="{PAR_COLOR}"];'
+                f'  {_node_id(sv["key"])} [label="{_node_label(sv)}", fillcolor="{color}"];'
             )
-        dot_lines.append("  }")
-    # Sequential post-stations
-    for sv in post_stations:
-        dot_lines.append(
-            f'  {_node_id(sv["key"])} [label="{_node_label(sv)}", fillcolor="{SEQ_COLOR}"];'
-        )
 
-    # Edges: pre → each parallel; each parallel → first post; post chain
-    last_pre = pre_stations[-1]["key"] if pre_stations else None
-    first_post = post_stations[0]["key"] if post_stations else None
-
-    if last_pre and parallel_stations:
-        for sv in parallel_stations:
-            dot_lines.append(f'  {_node_id(last_pre)} -> {_node_id(sv["key"])};')
-    if parallel_stations and first_post:
-        for sv in parallel_stations:
-            dot_lines.append(f'  {_node_id(sv["key"])} -> {_node_id(first_post)};')
-    elif last_pre and first_post and not parallel_stations:
-        dot_lines.append(f'  {_node_id(last_pre)} -> {_node_id(first_post)};')
-
-    # Chain post-stations sequentially
-    for a, b in zip(post_stations, post_stations[1:]):
-        dot_lines.append(f'  {_node_id(a["key"])} -> {_node_id(b["key"])};')
+    for e in filtered_edges:
+        dot_lines.append(f'  {_node_id(e["From"])} -> {_node_id(e["To"])};')
 
     dot_lines.append("}")
     dot = "\n".join(dot_lines)
 
-    # ---- Render ----------------------------------------------------------
+    # ---- Headline metrics + render --------------------------------------
     total_labor = sum(sv["labor"] for sv in station_visits)
     sum_cycles = sum(sv["cycle"] for sv in station_visits)
 
@@ -2407,14 +2440,24 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
     c3.metric("Total labor", f"{total_labor:,} p-min")
     c4.metric("Stations visited", len(station_visits))
 
-    st.graphviz_chart(dot, use_container_width=True)
+    if filtered_edges:
+        st.graphviz_chart(dot, use_container_width=True)
+    else:
+        st.info(
+            "No edges connect the stations this unit visits — diagram shows nodes "
+            "only. Open **🔧 Edit process flow** below to add precedence edges."
+        )
+        st.graphviz_chart(dot, use_container_width=True)
 
-    # ---- Below: per-station table ----------------------------------------
+    # ---- Per-station breakdown table ------------------------------------
     st.markdown("#### 🔎 Per-station breakdown")
     table_rows = []
     for sv in station_visits:
+        d = depths.get(sv["key"], 0)
+        same_depth = len(by_depth.get(d, []))
         table_rows.append({
-            "Stage": "Parallel sub-asm" if sv["is_parallel"] else "Sequential",
+            "Stage / depth": d,
+            "Stage type": "Parallel" if same_depth > 1 else "Sequential",
             "Station": sv["name"],
             "Labor (p-min)": sv["labor"],
             "Cycle (cal-min)": sv["cycle"],
@@ -2423,20 +2466,147 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
                 else _crew_for(sv["key"])
             ),
         })
-    breakdown_df = pd.DataFrame(table_rows)
-    # Total row
+    breakdown_df = pd.DataFrame(table_rows).sort_values(by="Stage / depth")
     total_row = pd.DataFrame([{
-        "Stage": "🟦 TOTAL",
+        "Stage / depth": "",
+        "Stage type": "🟦 TOTAL",
         "Station": "All stations",
         "Labor (p-min)": total_labor,
         "Cycle (cal-min)": round(sum_cycles, 1),
         "Crew (parallel)": "—",
     }])
     breakdown_df = pd.concat([breakdown_df, total_row], ignore_index=True)
-
     st.dataframe(
         breakdown_df, use_container_width=True, hide_index=True, height=420,
     )
+
+    # ---- Editor panel ----------------------------------------------------
+    _render_flow_editor(all_edges)
+
+
+def _render_flow_editor(edges: list) -> None:
+    """Editable table of process-flow edges. Save / Reset push to GitHub."""
+    from core.constants import STATION_KEYS
+
+    with st.expander("🔧 Edit process flow", expanded=False):
+        # Replay any one-shot toast stashed before rerun
+        toast = st.session_state.pop("_flow_toast", None)
+        if toast:
+            level, msg = toast
+            (st.success if level == "success" else st.error)(msg)
+
+        st.caption(
+            "Each row is one edge **From → To**. Use **Class = All** for edges that "
+            "apply to every unit type, or **STD / HT / HS** for class-specific edges. "
+            f"**Valid stations**: {', '.join(STATION_KEYS)}. "
+            "**Valid classes**: All, STD, HT, HS."
+        )
+
+        # Build a clean seed DataFrame; normalize dtypes to avoid the
+        # data_editor type-compat error.
+        if edges:
+            seed = pd.DataFrame(edges, columns=["From", "To", "Class"])
+        else:
+            seed = pd.DataFrame(columns=["From", "To", "Class"])
+        for c in ("From", "To", "Class"):
+            if c in seed.columns:
+                seed[c] = seed[c].astype(str).replace({"nan": "", "None": ""})
+
+        edited = st.data_editor(
+            seed,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="flow_editor",
+            height=420,
+            column_config={
+                "From": st.column_config.TextColumn(
+                    "From", help=f"Station key (one of: {', '.join(STATION_KEYS)})",
+                ),
+                "To": st.column_config.TextColumn(
+                    "To", help=f"Station key (one of: {', '.join(STATION_KEYS)})",
+                ),
+                "Class": st.column_config.TextColumn(
+                    "Class", help="All / STD / HT / HS", width="small",
+                ),
+            },
+        )
+
+        # Live validation feedback
+        bad_count = 0
+        valid_stations = set(STATION_KEYS)
+        for _, row in edited.iterrows():
+            f = str(row.get("From", "") or "").strip()
+            t = str(row.get("To", "") or "").strip()
+            c = str(row.get("Class", "") or "").strip()
+            if not f and not t and not c:
+                continue  # blank scratch row
+            if (f and f not in valid_stations) \
+                    or (t and t not in valid_stations) \
+                    or (c and c not in PROCESS_FLOW_VALID_CLASSES):
+                bad_count += 1
+        if bad_count:
+            st.warning(
+                f"⚠️ {bad_count} row(s) reference unknown station(s) or class. "
+                "These will be silently dropped on save."
+            )
+
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            if st.button(
+                "💾 Save process flow to GitHub",
+                key="flow_save_btn", use_container_width=True,
+            ):
+                _flow_save(edited)
+        with c2:
+            if st.button(
+                "🔄 Reset to default",
+                key="flow_reset_btn", use_container_width=True,
+            ):
+                _flow_reset()
+
+
+def _flow_save(edited_df) -> None:
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return
+    try:
+        with st.spinner("Saving process flow to GitHub..."):
+            response = save_process_flow_to_github(edited_df, token)
+        commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+        commit_url = (response or {}).get("commit", {}).get("html_url", "")
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.session_state["_flow_toast"] = (
+            "success",
+            f"✅ Process flow saved"
+            + (f" (commit [`{commit_sha}`]({commit_url}))." if commit_url else "."),
+        )
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Save failed: {e}")
+
+
+def _flow_reset() -> None:
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return
+    try:
+        with st.spinner("Resetting process flow to default..."):
+            reset_process_flow_to_default(token)
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.session_state["_flow_toast"] = (
+            "success", "🔄 Process flow reset to default.",
+        )
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Reset failed: {e}")
 
 
 def tab_data_validation(machine_df, acc_df):

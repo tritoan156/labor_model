@@ -140,12 +140,13 @@ def load_item_master(path: Path | str | None = None) -> pd.DataFrame:
         df = pd.read_csv(path)
     except pd.errors.EmptyDataError:
         return pd.DataFrame(columns=ITEM_MASTER_COLUMNS)
-    for c in df.select_dtypes(include="object").columns:
-        df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
     # Backfill columns that may be missing from older CSV versions
     for c in ITEM_MASTER_COLUMNS:
         if c not in df.columns:
             df[c] = 0 if "Time" in c else ""
+    # Force text columns to clean strings (handles NaN, mixed dtypes, etc.)
+    for c in ("Abbr", "Description", "FG family", "Notes"):
+        df[c] = df[c].map(_to_clean_str)
     for c in ("Time on Compressor (min)", "Time on Generator (min)", "Time on PM (min)"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     return df[ITEM_MASTER_COLUMNS].reset_index(drop=True)
@@ -180,8 +181,10 @@ def resolve_item_time(abbr: str, family: str, side: str,
         return 0.0
 
     m = master_df.copy()
-    m["__abbr"] = m["Abbr"].astype(str).str.strip().str.upper()
-    m["__family"] = m["FG family"].astype(str).str.strip().str.upper()
+    # Force string dtype explicitly — handles cases where pandas inferred the
+    # FG family column as float64 (all-NaN) or object with mixed numeric / NaN.
+    m["__abbr"] = m["Abbr"].map(_to_clean_str).str.upper()
+    m["__family"] = m["FG family"].map(_to_clean_str).str.upper()
     m_abbr = m[m["__abbr"] == abbr_norm]
     if m_abbr.empty:
         return 0.0
@@ -191,7 +194,9 @@ def resolve_item_time(abbr: str, family: str, side: str,
     best_value = None
     for _, row in m_abbr.iterrows():
         fam = row["__family"]
-        if fam and family_norm.startswith(fam) and len(fam) > best_prefix_len:
+        if not isinstance(fam, str) or not fam:
+            continue
+        if family_norm.startswith(fam) and len(fam) > best_prefix_len:
             best_prefix_len = len(fam)
             try:
                 best_value = float(row[col])
@@ -208,6 +213,25 @@ def resolve_item_time(abbr: str, family: str, side: str,
         return float(defaults.iloc[0][col])
     except (KeyError, TypeError, ValueError):
         return 0.0
+
+
+def _to_clean_str(value) -> str:
+    """Coerce any value (NaN, None, number, etc.) to a clean stripped string.
+
+    NaN / None / "nan" / "None" all collapse to "".
+    """
+    if value is None:
+        return ""
+    # numpy NaN is a float — pd.isna handles both
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(value).strip()
+    if s.lower() in ("nan", "none"):
+        return ""
+    return s
 
 
 def unique_abbrs(master_df: pd.DataFrame) -> list:

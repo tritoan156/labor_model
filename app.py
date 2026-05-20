@@ -22,9 +22,6 @@ from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
 )
-from core.scheduler import (
-    schedule_batteries, daily_cell_view, unit_completion_view,
-)
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
     DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
@@ -32,6 +29,7 @@ from core.constants import (
 from core.facility_storage import (
     load_facility_crew_df, save_facility_crew_to_github,
 )
+from core.catalog_storage import save_catalog_to_github
 from core.data_validator import validate_all
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -249,7 +247,7 @@ def render_sidebar() -> dict:
 # =============================================================
 # Tab renderers
 # =============================================================
-def tab_overview(units, capacity, batt_type, sched, inputs, schedule_month: str = ""):
+def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = ""):
     st.header("🏠 Overview")
     month_label = f" — {schedule_month}" if schedule_month else ""
     st.caption(f"{inputs['location']} Manufacturing — Energy Storage Systems{month_label}")
@@ -452,65 +450,6 @@ def tab_battery_throughput(batt_sku, batt_type, capacity, inputs):
     st.dataframe(cmp, use_container_width=True)
 
 
-def tab_battery_allocation(batt_type, sched, units, inputs):
-    st.header("🔋⚙️ Battery Allocation")
-    st.caption(
-        "Battery scheduler output. Priority: carryover → ETO → highest-volume type → FIFO. "
-        "Single + 2-batt units run on one cell; 3+ batt units spread across cells in parallel. "
-        "Cells minimize type changeovers (sticky 1-day threshold)."
-    )
-
-    # Headline metrics
-    max_day = int(sched["day"].max()) if not sched.empty else 0
-    n_batt = len(sched)
-    n_units = sched["unit_id"].nunique() if not sched.empty else 0
-    completion = unit_completion_view(sched)
-    on_time = (completion["completion_day"] <= inputs["days"]).sum() if not completion.empty else 0
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total batteries scheduled", f"{n_batt:,}")
-    c2.metric("Schedule spans", f"Day 1 → Day {max_day}")
-    c3.metric(f"Units done by Day {inputs['days']}", f"{on_time} / {n_units}")
-    c4.metric("Units slipping past window",
-              f"{n_units - on_time}",
-              delta_color="inverse")
-
-    st.markdown("---")
-
-    view = st.radio(
-        "View",
-        ["📅 Daily Cell View", "🔢 Per-Battery List", "📦 Per-Unit Completion"],
-        horizontal=True,
-    )
-
-    if view == "📅 Daily Cell View":
-        st.subheader("Day × Cell schedule")
-        st.caption("Each cell shows the battery types it builds that day, with counts.")
-        dcv = daily_cell_view(sched)
-        st.dataframe(dcv, use_container_width=True, height=600)
-
-    elif view == "🔢 Per-Battery List":
-        st.subheader("Chronological battery list")
-        st.caption(f"All {len(sched)} batteries in build order.")
-        st.dataframe(sched, use_container_width=True, height=600)
-
-    else:  # Per-Unit Completion
-        st.subheader("Per-finished-unit completion")
-        st.caption("When each unit has all its batteries done.")
-        st.dataframe(completion, use_container_width=True, height=600)
-
-        # Cumulative completion chart
-        st.subheader("Cumulative units completing batteries")
-        cum = completion.groupby("completion_day").size().cumsum().reset_index()
-        cum.columns = ["Day", "Cumulative units"]
-        fig = px.line(cum, x="Day", y="Cumulative units", markers=True,
-                      title=f"Target: all {n_units} by Day {inputs['days']}")
-        fig.add_vline(x=inputs["days"], line_dash="dash", line_color="red",
-                      annotation_text=f"Day {inputs['days']} target")
-        fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
-
-
 def tab_mitigation(capacity, batt_sku, units, inputs):
     st.header("🔧 Mitigation")
     st.caption("Fix options for over-capacity stations + idle HC available for rotation.")
@@ -600,95 +539,158 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     )
 
 
-def tab_floor_verification(units, machine_df, acc_df, inputs):
-    st.header("✅ Floor Verification")
+def tab_floor_verification(machine_df, acc_df, schedule_df):
+    st.header("✅ Floor Verification — Update Labor Catalogs")
     st.caption(
-        "Per station-SKU pair. Floor team measures ACTUAL HC and cycle time. "
-        "Variance % auto-calculates."
+        "Edit labor values directly in the Machine or Accessory catalog. "
+        "SKUs used in the current schedule are highlighted. "
+        "Click **Save** to push changes to GitHub — all users see the new values "
+        "after the app redeploys (~1 min)."
     )
 
-    # Build per-station-SKU table for May SKUs
-    pairings = (
-        units.groupby(["fg_base", "acc"])
-        .agg(qty=("unit_id", "count"))
-        .reset_index()
+    # Aggregate qty per SKU from the schedule for highlighting
+    used_fg = schedule_df.groupby("FG_BASE")["BUILD QTY"].sum().to_dict() \
+        if not schedule_df.empty else {}
+    used_acc = schedule_df[schedule_df["ACC"] != ""].groupby("ACC")["BUILD QTY"].sum().to_dict() \
+        if not schedule_df.empty else {}
+
+    catalog = st.radio(
+        "Catalog to edit", ["Machine (FG SKU)", "Accessory (Acc SKU)"], horizontal=True,
     )
 
-    rows = []
-    for _, p in pairings.iterrows():
-        fg = p["fg_base"]
-        acc = p["acc"] or None
-        qty = int(p["qty"])
-        # Find one expanded row for the labor breakdown
-        sample_row = units[(units["fg_base"] == fg) & (units["acc"] == p["acc"])].iloc[0]
-        cls = sample_row["Class"]
-        bat = sample_row["Bat"]
+    if catalog == "Machine (FG SKU)":
+        # Machine labor columns the user can edit
+        editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy_old", "PDI", "QC", "Ship", "Bat"]
+        display_df = machine_df.reset_index(drop=True).copy()
+        display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_fg.get(s, 0)))
+        display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
 
-        from core.constants import STATION_KEY_TO_DISPLAY, STATION_KEYS, HS_FINAL_CREW
-        for st_key in STATION_KEYS:
-            total_lbr = sample_row[st_key]
-            if total_lbr == 0:
-                continue
-            crew = inputs["crew_config"].loc[STATION_KEY_TO_DISPLAY[st_key], "Crew"]
-            if st_key == "Final" and cls == "HS":
-                cycle = total_lbr / HS_FINAL_CREW
-                hc_used = HS_FINAL_CREW
-            else:
-                cycle = total_lbr / crew if crew else 0
-                hc_used = crew
-            rows.append({
-                "FG Base": fg,
-                "ACC SKU": acc or "—",
-                "Class": cls,
-                "Bat": bat,
-                "Qty in May": qty,
-                "Station": STATION_KEY_TO_DISPLAY[st_key],
-                "Total Labor (p-min)": int(total_lbr),
-                "HC (Crew)": int(hc_used),
-                "Cycle Time (cal min)": round(cycle, 1),
-                "Actual HC": "",
-                "Actual Cycle (min)": "",
-                "Floor Note": "",
-            })
-    df_fv = pd.DataFrame(rows)
+        only_used = st.checkbox(
+            "Show only SKUs used in current schedule", value=False, key="fv_m_only_used"
+        )
+        if only_used:
+            display_df = display_df[display_df["In schedule"]].copy()
 
-    st.markdown(
-        "💡 **How to use:** Floor team fills in `Actual HC` and `Actual Cycle (min)`. "
-        "Variance shows automatically. Battery rows are highlighted because that's the bottleneck."
-    )
+        # Sort: used first, then by SKU
+        display_df = display_df.sort_values(
+            by=["In schedule", "Used (qty)"], ascending=[False, False]
+        ).reset_index(drop=True)
 
-    edited = st.data_editor(
-        df_fv,
-        use_container_width=True,
-        num_rows="fixed",
-        key="floor_verification",
-        height=600,
-        column_config={
-            "Actual HC": st.column_config.NumberColumn("Actual HC", min_value=0, step=1),
-            "Actual Cycle (min)": st.column_config.NumberColumn("Actual Cycle (min)", min_value=0, step=1),
-        },
-    )
+        # Column config: read-only for SKU/Description, editable for labor
+        col_cfg = {
+            "SKU": st.column_config.TextColumn("SKU", disabled=True),
+            "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+            "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
+            "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
+        }
+        for c in editable_cols:
+            col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
 
-    # Compute variance
-    edited = edited.copy()
-    edited["Actual Total Labor"] = pd.to_numeric(edited["Actual HC"], errors="coerce") * pd.to_numeric(edited["Actual Cycle (min)"], errors="coerce")
-    edited["Variance %"] = ((edited["Actual Total Labor"] - edited["Total Labor (p-min)"]) / edited["Total Labor (p-min)"] * 100).round(1)
+        edited = st.data_editor(
+            display_df,
+            use_container_width=True,
+            num_rows="fixed",
+            key="fv_machine_editor",
+            height=600,
+            column_config=col_cfg,
+            hide_index=True,
+        )
 
-    if edited["Actual Total Labor"].notna().any():
-        st.subheader("Variance summary")
-        flagged = edited[edited["Actual Total Labor"].notna()]
-        st.dataframe(flagged[["FG Base", "Station", "Total Labor (p-min)",
-                               "Actual Total Labor", "Variance %", "Floor Note"]],
-                     use_container_width=True)
+        # Save button
+        if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
+            _save_catalog_csv(
+                edited=edited,
+                source_df=machine_df,
+                editable_cols=editable_cols,
+                file_path="data/machine_clean.csv",
+                label="machine",
+            )
 
-    # Download button
-    csv = edited.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "📥 Download Floor Verification CSV",
-        csv,
-        "floor_verification.csv",
-        "text/csv",
-    )
+    else:  # Accessory
+        editable_cols = ["Warehouse", "AccKIT", "BattPrep", "BattSubRaw",
+                         "PMAcc", "GenAcc", "Compressor"]
+        display_df = acc_df.reset_index(drop=True).copy()
+        display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_acc.get(s, 0)))
+        display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
+
+        only_used = st.checkbox(
+            "Show only SKUs used in current schedule", value=False, key="fv_a_only_used"
+        )
+        if only_used:
+            display_df = display_df[display_df["In schedule"]].copy()
+
+        display_df = display_df.sort_values(
+            by=["In schedule", "Used (qty)"], ascending=[False, False]
+        ).reset_index(drop=True)
+
+        col_cfg = {
+            "SKU": st.column_config.TextColumn("SKU", disabled=True),
+            "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+            "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
+            "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
+        }
+        for c in editable_cols:
+            col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
+
+        edited = st.data_editor(
+            display_df,
+            use_container_width=True,
+            num_rows="fixed",
+            key="fv_acc_editor",
+            height=600,
+            column_config=col_cfg,
+            hide_index=True,
+        )
+
+        if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
+            _save_catalog_csv(
+                edited=edited,
+                source_df=acc_df,
+                editable_cols=editable_cols,
+                file_path="data/acc_clean.csv",
+                label="accessory",
+            )
+
+
+def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
+    """Merge the edited values into the source DataFrame and push to GitHub."""
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return
+
+    # Reset edited to be keyed by SKU; pull labor edits, drop UI-only columns
+    edited_indexed = edited.set_index("SKU")
+    out = source_df.copy()
+    changed_rows = 0
+    for sku in edited_indexed.index:
+        if sku not in out.index:
+            continue
+        for col in editable_cols:
+            new_val = edited_indexed.loc[sku, col]
+            old_val = out.loc[sku, col]
+            if pd.notna(new_val) and float(new_val) != float(old_val):
+                out.loc[sku, col] = new_val
+                changed_rows += 1
+
+    if changed_rows == 0:
+        st.info("No changes detected.")
+        return
+
+    # Write to CSV string (friendly column names — data_loader handles both formats)
+    csv_text = out.drop(columns=["SKU"], errors="ignore").reset_index().to_csv(index=False)
+
+    try:
+        with st.spinner(f"Saving {label} catalog to GitHub ({changed_rows} cells changed)..."):
+            save_catalog_to_github(
+                csv_text, file_path, token,
+                message=f"Update {label} catalog labor values via app ({changed_rows} cells)",
+            )
+        st.success(
+            f"✅ Saved! {changed_rows} cells updated. All users see new values after redeploy (~1 min)."
+        )
+    except Exception as e:
+        st.error(f"Save failed: {e}")
 
 
 def tab_cycle_time(units, inputs):
@@ -887,19 +889,16 @@ def main():
     )
     batt_sku = battery_demand_by_sku(units)
     batt_type = battery_demand_by_type(units)
-    sched = schedule_batteries(units, n_cells=int(inputs["crew_config"].loc["Battery Assembly", "Conc"]),
-                                shift_minutes=inputs["shift"])
 
     # Detect schedule month for display (Mon-YY format rows, not carryover)
     current_months = schedule_df.loc[~schedule_df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
     schedule_month = current_months[0] if current_months else ""
 
-    # Tabs
+    # Tabs (Battery Allocation removed)
     tabs = st.tabs([
         "🏠 Overview",
         "📊 Capacity vs Demand",
         "🔋 Battery Throughput",
-        "🔋⚙️ Battery Allocation",
         "🔧 Mitigation",
         "✅ Floor Verification",
         "⏱ Cycle Time",
@@ -908,22 +907,20 @@ def main():
     ])
 
     with tabs[0]:
-        tab_overview(units, capacity, batt_type, sched, inputs, schedule_month)
+        tab_overview(units, capacity, batt_type, inputs, schedule_month)
     with tabs[1]:
         tab_capacity_vs_demand(capacity, inputs)
     with tabs[2]:
         tab_battery_throughput(batt_sku, batt_type, capacity, inputs)
     with tabs[3]:
-        tab_battery_allocation(batt_type, sched, units, inputs)
-    with tabs[4]:
         tab_mitigation(capacity, batt_sku, units, inputs)
+    with tabs[4]:
+        tab_floor_verification(machine_df, acc_df, schedule_df)
     with tabs[5]:
-        tab_floor_verification(units, machine_df, acc_df, inputs)
-    with tabs[6]:
         tab_cycle_time(units, inputs)
-    with tabs[7]:
+    with tabs[6]:
         tab_data_validation(machine_df, acc_df)
-    with tabs[8]:
+    with tabs[7]:
         tab_source_data(machine_df, acc_df, schedule_df)
 
 

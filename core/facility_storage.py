@@ -49,14 +49,36 @@ def load_facility_crew_df(facility: str) -> pd.DataFrame:
     """Return a crew DataFrame (indexed by Station) for the given facility.
 
     Falls back to STATION_DEFAULTS if the facility has no saved config.
+    Also merges in any STATION_DEFAULTS keys that are missing from the saved
+    config — so adding a new station (e.g. Com Accessories) doesn't disappear
+    from facilities whose JSON was saved before the station existed.
     """
     all_cfg = load_all_facility_configs()
-    facility_cfg = all_cfg.get(facility) or _default_facility_config()
-    rows = [
-        {"Station": st_name, "HC": v["HC"], "Conc": v["Conc"], "Crew": v["Crew"]}
-        for st_name, v in facility_cfg.items()
-    ]
-    return pd.DataFrame(rows).set_index("Station")
+    facility_cfg = dict(all_cfg.get(facility) or _default_facility_config())
+
+    # Backfill any stations that are in STATION_DEFAULTS but missing from the
+    # saved config. Use a sensible default of (0, 0, default_crew) for new
+    # stations — admin can edit later, but at least the row exists.
+    for st_name, (hc, conc, crew) in STATION_DEFAULTS.items():
+        if st_name not in facility_cfg:
+            facility_cfg[st_name] = {"HC": 0, "Conc": 0, "Crew": crew}
+
+    # Preserve the STATION_DEFAULTS ordering for display consistency
+    ordered = []
+    for st_name in STATION_DEFAULTS.keys():
+        v = facility_cfg.get(st_name)
+        if v is not None:
+            ordered.append({
+                "Station": st_name, "HC": v["HC"], "Conc": v["Conc"], "Crew": v["Crew"],
+            })
+    # Tack on any stations that were saved but aren't in STATION_DEFAULTS (rare)
+    for st_name, v in facility_cfg.items():
+        if st_name not in STATION_DEFAULTS:
+            ordered.append({
+                "Station": st_name, "HC": v["HC"], "Conc": v["Conc"], "Crew": v["Crew"],
+            })
+
+    return pd.DataFrame(ordered).set_index("Station")
 
 
 def save_facility_crew_to_github(facility: str, crew_df: pd.DataFrame, token: str) -> dict:

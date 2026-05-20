@@ -1507,6 +1507,13 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
             label="accessory",
         )
 
+        # Family-level placeholder helper (e.g. BOSS25-A999)
+        _render_add_family_placeholder(
+            acc_df=acc_df,
+            editable_cols=editable_cols,
+            file_path="data/acc_clean.csv",
+        )
+
 
 def _render_pending_changes(edited, source_df, editable_cols):
     """Show a small expander listing cells where the edited value differs from
@@ -1547,6 +1554,156 @@ def _render_pending_changes(edited, source_df, editable_cols):
     n = len(diffs)
     with st.expander(f"📝 {n} pending change(s) — preview before saving", expanded=False):
         st.dataframe(pd.DataFrame(diffs), use_container_width=True, hide_index=True)
+
+
+def _render_add_family_placeholder(acc_df, editable_cols, file_path):
+    """Quick form to add a family-level placeholder accessory (e.g. BOSS25-A999).
+
+    Convenience wrapper around the regular new-SKU save flow that:
+      • Pre-fills the SKU as `{family}-A999` (read-only)
+      • Pre-fills the Description as "Family-level placeholder for {family}"
+      • Provides reasonable default labor times the user can override
+      • Rejects if `{family}-A999` already exists
+
+    Note: the model does NOT auto-fall-back to this placeholder when an
+    accessory is missing. Some real orders have no accessory; a silent
+    fallback would inflate labor. The placeholder is a regular row that the
+    user can OPT to use by typing its SKU in the manual entry.
+    """
+    with st.expander("➕ Add a family placeholder accessory", expanded=False):
+        st.caption(
+            "Creates a `{family}-A999` accessory row with the times you provide. "
+            "This is **not** used as an automatic fallback — it's just a "
+            "conventionally-named accessory you can reference explicitly."
+        )
+
+        family = st.selectbox(
+            "FG family",
+            options=KNOWN_FAMILIES,
+            help="The new placeholder SKU will be `{family}-A999`.",
+            key="placeholder_family",
+        )
+        new_sku = f"{family}-A999"
+        st.text(f"SKU → {new_sku}")
+
+        # Defaults — sensible numbers for the typical family placeholder
+        default_labor = {
+            "Warehouse": 10,
+            "AccKIT": 10,
+            "Nameplate Prep": 10,
+            "BattSubRaw": 320,
+            "PMAcc": 60,
+            "GenAcc": 60,
+            "ComAcc": 0,
+        }
+
+        with st.form("add_family_placeholder", clear_on_submit=True):
+            new_desc = st.text_input(
+                "Description",
+                value=f"Family-level placeholder for {family}",
+                key="placeholder_desc",
+            )
+
+            cols_per_row = 4
+            new_values = {}
+            for i in range(0, len(editable_cols), cols_per_row):
+                row_cols = st.columns(cols_per_row)
+                for j, c in enumerate(editable_cols[i:i + cols_per_row]):
+                    new_values[c] = row_cols[j].number_input(
+                        c, min_value=0, step=1,
+                        value=int(default_labor.get(c, 0)),
+                        key=f"placeholder_num_{c}",
+                    )
+
+            submitted = st.form_submit_button(
+                f"💾 Add `{new_sku}` & save to GitHub",
+                use_container_width=True,
+            )
+
+        if not submitted:
+            return
+
+        # Validate
+        existing = {str(s).upper() for s in acc_df["SKU"].astype(str)}
+        if new_sku.upper() in existing:
+            st.error(
+                f"`{new_sku}` already exists in the accessory catalog. "
+                "Edit the existing row in the table above instead."
+            )
+            return
+
+        token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+        if not token:
+            st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+            return
+
+        today = pd.Timestamp.today().strftime("%Y-%m-%d")
+        new_sku_upper = new_sku.upper()
+        response = None
+        for attempt in (1, 2):
+            try:
+                with st.spinner(
+                    f"Adding {new_sku} to {file_path}"
+                    + (" — retrying" if attempt == 2 else "") + "..."
+                ):
+                    fresh_df, fresh_sha = _read_fresh_csv(file_path, token)
+                    if fresh_df.empty:
+                        st.error("Could not fetch the current catalog from GitHub.")
+                        return
+
+                    fresh_skus_upper = set(
+                        fresh_df["SKU"].astype(str).str.strip().str.upper()
+                    ) if "SKU" in fresh_df.columns else set()
+                    if new_sku_upper in fresh_skus_upper:
+                        st.error(
+                            f"`{new_sku}` was just added by another user. Refresh."
+                        )
+                        return
+
+                    if "Last Modified" not in fresh_df.columns:
+                        fresh_df["Last Modified"] = ""
+
+                    new_row = {col: "" for col in fresh_df.columns}
+                    new_row["SKU"] = new_sku
+                    if "Description" in new_row:
+                        new_row["Description"] = new_desc
+                    for c, v in new_values.items():
+                        if c in new_row:
+                            new_row[c] = int(v)
+                    new_row["Last Modified"] = today
+
+                    merged = pd.concat(
+                        [fresh_df, pd.DataFrame([new_row])],
+                        ignore_index=True,
+                    )
+                    csv_text = merged.to_csv(index=False)
+
+                    response = save_catalog_to_github(
+                        csv_text, file_path, token,
+                        message=f"Add family placeholder {new_sku} via app",
+                        sha=fresh_sha,
+                    )
+                break
+            except GitHubConflict:
+                if attempt == 2:
+                    st.error("❌ Save failed: concurrent commit. Please refresh and retry.")
+                    return
+                continue
+            except Exception as e:
+                st.error(f"❌ Save failed: {e}")
+                return
+
+        commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+        commit_url = (response or {}).get("commit", {}).get("html_url", "")
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.success(
+            f"✅ Added family placeholder `{new_sku}` "
+            + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
+            + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
+        )
 
 
 def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_cols=None):
@@ -2068,6 +2225,218 @@ def tab_cycle_time(units, inputs):
             f"• Sequential build cycle (with current Crew): **{total_cycle:.0f} cal-min** "
             f"(= {total_cycle/60:.1f} hours, ~{total_cycle/shift:.2f} shifts)"
         )
+
+
+def tab_process_flow(units_df, machine_df, acc_df, inputs):
+    """Visual flow chart of a single unit's path through the workstations.
+
+    User picks an FG SKU and (optional) Accessory SKU, the tab renders a
+    Graphviz diagram with one box per station the unit touches, colored by
+    parallel sub-assembly vs sequential stages, plus a per-station table
+    below.
+    """
+    from core.labor_calculator import compute_unit_labor, classify_unit
+    from core.constants import STATION_KEY_TO_DISPLAY, STATION_KEYS, HS_FINAL_CREW
+
+    st.header("🔀 Process Flow")
+    st.markdown(
+        "**Where does this unit go on the floor?** Pick an FG SKU "
+        "(+ optional Accessory) below to see the route from Warehouse pick "
+        "through sub-assembly to ship-out. Boxes are colored by stage: "
+        "🟧 **sequential** stations everyone goes through; "
+        "🟦 **parallel sub-assembly** stations that run side-by-side."
+    )
+
+    # ---- SKU selectors ---------------------------------------------------
+    fg_options = sorted(machine_df["SKU"].astype(str).unique().tolist())
+    if not fg_options:
+        st.info("No machine SKUs loaded.")
+        return
+
+    # If we have units in the current schedule, default to the first one
+    default_fg = None
+    if units_df is not None and not units_df.empty:
+        try:
+            default_fg = str(units_df.iloc[0]["fg_base"])
+        except Exception:
+            default_fg = None
+    if default_fg and default_fg in fg_options:
+        fg_default_idx = fg_options.index(default_fg)
+    else:
+        fg_default_idx = 0
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fg_choice = st.selectbox(
+            "FG SKU", fg_options, index=fg_default_idx, key="flow_fg",
+        )
+    with c2:
+        # Accessory options: "(none)" + all accessories whose family matches the FG
+        family = _machine_family(fg_choice)
+        acc_subset = acc_df[
+            acc_df["SKU"].astype(str).apply(_accessory_family_hint).str.upper()
+            == family.upper()
+        ] if family != "OTHER" else acc_df.iloc[0:0]
+        acc_options = ["(none)"] + sorted(acc_subset["SKU"].astype(str).tolist())
+        acc_choice = st.selectbox("Accessory SKU", acc_options, key="flow_acc")
+
+    acc_sku = None if acc_choice == "(none)" else acc_choice
+
+    # ---- Compute labor for this pairing ---------------------------------
+    labor = compute_unit_labor(fg_choice, acc_sku, machine_df, acc_df)
+    if labor is None:
+        st.error(f"`{fg_choice}` not found in the machine catalog.")
+        return
+    cls = labor["Class"]
+    bat = int(labor["Bat"])
+
+    # ---- Build the per-station summary ----------------------------------
+    crew_config = inputs["crew_config"]
+    station_visits = []  # list of (key, display_name, labor, cycle, is_parallel)
+
+    # Stage definitions (key sets) — used for layout + color
+    sequential_pre = ["Warehouse"]
+    parallel_subasm = ["Wire", "Battery", "PMAcc", "GenAcc", "ComAcc",
+                       "AccKIT", "Trailer", "ETO"]
+    sequential_post = ["Final", "PDI", "QC", "Ship"]
+
+    def _crew_for(st_key):
+        disp = STATION_KEY_TO_DISPLAY.get(st_key, st_key)
+        if disp in crew_config.index:
+            try:
+                return int(crew_config.loc[disp, "Crew"])
+            except Exception:
+                return 1
+        return 1
+
+    def _cycle(st_key, lbr):
+        if lbr <= 0:
+            return 0.0
+        if st_key == "Final" and cls == "HS":
+            return lbr / HS_FINAL_CREW
+        crew = _crew_for(st_key)
+        return lbr / crew if crew else 0.0
+
+    for st_key in STATION_KEYS:
+        lbr = float(labor.get(st_key, 0) or 0)
+        if lbr <= 0:
+            continue
+        is_parallel = st_key in parallel_subasm
+        station_visits.append({
+            "key": st_key,
+            "name": STATION_KEY_TO_DISPLAY.get(st_key, st_key),
+            "labor": int(round(lbr)),
+            "cycle": round(_cycle(st_key, lbr), 1),
+            "is_parallel": is_parallel,
+        })
+
+    if not station_visits:
+        st.warning("This unit has no labor at any station — check the catalog.")
+        return
+
+    # ---- Build the Graphviz DOT string ----------------------------------
+    visited_keys = {sv["key"] for sv in station_visits}
+
+    def _node_id(st_key: str) -> str:
+        return f"n_{st_key}"
+
+    def _node_label(sv) -> str:
+        return f"{sv['name']}\\n{sv['labor']} p-min · {sv['cycle']:.0f} cal-min"
+
+    dot_lines = ["digraph G {",
+                 '  rankdir=TB;',
+                 '  node [shape=box, style="rounded,filled", fontname="Helvetica", margin="0.18,0.10"];',
+                 '  edge [color="#666"];']
+
+    # Visited stations indexed by stage
+    pre_stations = [sv for sv in station_visits if sv["key"] in sequential_pre]
+    parallel_stations = [sv for sv in station_visits if sv["key"] in parallel_subasm]
+    post_stations = [sv for sv in station_visits if sv["key"] in sequential_post]
+
+    # Colors
+    SEQ_COLOR = "#FFE4B5"    # light orange
+    PAR_COLOR = "#BCD6F2"    # light blue
+
+    # Sequential pre-stations
+    for sv in pre_stations:
+        dot_lines.append(
+            f'  {_node_id(sv["key"])} [label="{_node_label(sv)}", fillcolor="{SEQ_COLOR}"];'
+        )
+    # Parallel sub-assembly stations — grouped in a same-rank subgraph
+    if parallel_stations:
+        dot_lines.append("  { rank=same;")
+        for sv in parallel_stations:
+            dot_lines.append(
+                f'    {_node_id(sv["key"])} [label="{_node_label(sv)}", fillcolor="{PAR_COLOR}"];'
+            )
+        dot_lines.append("  }")
+    # Sequential post-stations
+    for sv in post_stations:
+        dot_lines.append(
+            f'  {_node_id(sv["key"])} [label="{_node_label(sv)}", fillcolor="{SEQ_COLOR}"];'
+        )
+
+    # Edges: pre → each parallel; each parallel → first post; post chain
+    last_pre = pre_stations[-1]["key"] if pre_stations else None
+    first_post = post_stations[0]["key"] if post_stations else None
+
+    if last_pre and parallel_stations:
+        for sv in parallel_stations:
+            dot_lines.append(f'  {_node_id(last_pre)} -> {_node_id(sv["key"])};')
+    if parallel_stations and first_post:
+        for sv in parallel_stations:
+            dot_lines.append(f'  {_node_id(sv["key"])} -> {_node_id(first_post)};')
+    elif last_pre and first_post and not parallel_stations:
+        dot_lines.append(f'  {_node_id(last_pre)} -> {_node_id(first_post)};')
+
+    # Chain post-stations sequentially
+    for a, b in zip(post_stations, post_stations[1:]):
+        dot_lines.append(f'  {_node_id(a["key"])} -> {_node_id(b["key"])};')
+
+    dot_lines.append("}")
+    dot = "\n".join(dot_lines)
+
+    # ---- Render ----------------------------------------------------------
+    total_labor = sum(sv["labor"] for sv in station_visits)
+    sum_cycles = sum(sv["cycle"] for sv in station_visits)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Class", cls,
+              help="HS = head-skid (PM only); HT = head + trailer; STD = standard trailer.")
+    c2.metric("Batteries", bat)
+    c3.metric("Total labor", f"{total_labor:,} p-min")
+    c4.metric("Stations visited", len(station_visits))
+
+    st.graphviz_chart(dot, use_container_width=True)
+
+    # ---- Below: per-station table ----------------------------------------
+    st.markdown("#### 🔎 Per-station breakdown")
+    table_rows = []
+    for sv in station_visits:
+        table_rows.append({
+            "Stage": "Parallel sub-asm" if sv["is_parallel"] else "Sequential",
+            "Station": sv["name"],
+            "Labor (p-min)": sv["labor"],
+            "Cycle (cal-min)": sv["cycle"],
+            "Crew (parallel)": (
+                HS_FINAL_CREW if (sv["key"] == "Final" and cls == "HS")
+                else _crew_for(sv["key"])
+            ),
+        })
+    breakdown_df = pd.DataFrame(table_rows)
+    # Total row
+    total_row = pd.DataFrame([{
+        "Stage": "🟦 TOTAL",
+        "Station": "All stations",
+        "Labor (p-min)": total_labor,
+        "Cycle (cal-min)": round(sum_cycles, 1),
+        "Crew (parallel)": "—",
+    }])
+    breakdown_df = pd.concat([breakdown_df, total_row], ignore_index=True)
+
+    st.dataframe(
+        breakdown_df, use_container_width=True, hide_index=True, height=420,
+    )
 
 
 def tab_data_validation(machine_df, acc_df):
@@ -2945,6 +3314,7 @@ def main():
         "🔋 Batteries",
         "🔧 Recommendations",
         "⏱ Build Time",
+        "🔀 Process Flow",
         "✅ Update Labor",
         "🔍 Data Quality",
         "📁 Source Data",
@@ -2961,10 +3331,12 @@ def main():
     with tabs[4]:
         tab_cycle_time(units, inputs)
     with tabs[5]:
-        tab_floor_verification(machine_df, acc_df, schedule_df)
+        tab_process_flow(units, machine_df, acc_df, inputs)
     with tabs[6]:
-        tab_data_validation(machine_df, acc_df)
+        tab_floor_verification(machine_df, acc_df, schedule_df)
     with tabs[7]:
+        tab_data_validation(machine_df, acc_df)
+    with tabs[8]:
         tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
                          item_master_df, item_packages_df)
 

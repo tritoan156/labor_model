@@ -25,6 +25,11 @@
       "Conc": 8,
       "Crew": 1
     },
+    "Com Accessories": {
+      "HC": 1,
+      "Conc": 1,
+      "Crew": 1
+    },
     "Trailer Assembly": {
       "HC": 6,
       "Conc": 3,
@@ -87,6 +92,11 @@
       "Conc": 8,
       "Crew": 1
     },
+    "Com Accessories": {
+      "HC": 0,
+      "Conc": 0,
+      "Crew": 1
+    },
     "Trailer Assembly": {
       "HC": 6,
       "Conc": 3,
@@ -147,6 +157,11 @@
     "Gen Accessories": {
       "HC": 8,
       "Conc": 8,
+      "Crew": 1
+    },
+    "Com Accessories": {
+      "HC": 1,
+      "Conc": 1,
       "Crew": 1
     },
     "Trailer Assembly": {

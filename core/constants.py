@@ -41,6 +41,7 @@ STATION_DEFAULTS = {
     "Battery Assembly":   (8, 4, 2),
     "PM Acc (Headunit)":  (3, 3, 1),
     "Gen Accessories":    (8, 8, 1),
+    "Com Accessories":    (1, 1, 1),
     "Trailer Assembly":   (6, 3, 2),
     "ETO":                (4, 2, 2),
     "Accessories KIT":    (1, 1, 1),
@@ -52,7 +53,7 @@ STATION_DEFAULTS = {
 
 # Internal station keys (used in code, not display)
 STATION_KEYS = [
-    "Warehouse", "Wire", "Battery", "PMAcc", "GenAcc", "Trailer",
+    "Warehouse", "Wire", "Battery", "PMAcc", "GenAcc", "ComAcc", "Trailer",
     "AccKIT", "Final", "PDI", "QC", "Ship", "ETO",
 ]
 
@@ -63,6 +64,7 @@ STATION_KEY_TO_DISPLAY = {
     "Battery": "Battery Assembly",
     "PMAcc": "PM Acc (Headunit)",
     "GenAcc": "Gen Accessories",
+    "ComAcc": "Com Accessories",
     "Trailer": "Trailer Assembly",
     "AccKIT": "Accessories KIT",
     "Final": "Final Assembly",

@@ -48,7 +48,7 @@ def _safe_get(df: pd.DataFrame, possible_columns: list, default=0):
 def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     """Load Machine_Clean CSV → DataFrame indexed by SKU.
 
-    Columns returned (one row per SKU): Warehouse, Wire, Trailer, FN_Assy_old,
+    Columns returned (one row per SKU): Warehouse, Wire, Trailer, FN_Assy,
     PDI, QC, Ship, Bat, Description.
     """
     if path is None:
@@ -74,7 +74,7 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     bat_col = _safe_get(df, ["🔋Bat", "Bat", "Battery"])
 
     # Robust detection — match original verbose headers OR friendly names
-    # written back by the catalog save (e.g. "Wire", "Trailer", "FN_Assy_old").
+    # written back by the catalog save (e.g. "Wire", "Trailer", "FN_Assy").
     def _find(df_cols, *patterns):
         for c in df_cols:
             s = str(c).upper()
@@ -86,7 +86,7 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     pick_col = _find(df.columns, "PICK", "Warehouse")
     wire_col = _find(df.columns, "PREP-WH", "Wire")
     trl_col  = _find(df.columns, "SUB-TRL", "Trl", "Trailer")
-    fn_col   = _find(df.columns, "FN-ASSY", "Final", "FN_Assy", "FNAssy")
+    fn_col   = _find(df.columns, "FN-ASSY", "Final", "FN_Assy", "FNAssy", "FN_Assy_old")
     pdi_col  = _find(df.columns, "TEST-PDI", "PDI")
     qc_col   = _find(df.columns, "FN-QC", "QC")
     ship_col = _find(df.columns, "SHIP")
@@ -100,7 +100,7 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["Warehouse"] = pd.to_numeric(df[pick_col], errors="coerce").fillna(0) if pick_col else zeros
     out["Wire"] = pd.to_numeric(df[wire_col], errors="coerce").fillna(0) if wire_col else zeros
     out["Trailer"] = pd.to_numeric(df[trl_col], errors="coerce").fillna(0) if trl_col else zeros
-    out["FN_Assy_old"] = pd.to_numeric(df[fn_col], errors="coerce").fillna(0) if fn_col else zeros
+    out["FN_Assy"] = pd.to_numeric(df[fn_col], errors="coerce").fillna(0) if fn_col else zeros
     out["PDI"] = pd.to_numeric(df[pdi_col], errors="coerce").fillna(0) if pdi_col else zeros
     out["QC"] = pd.to_numeric(df[qc_col], errors="coerce").fillna(0) if qc_col else zeros
     out["Ship"] = pd.to_numeric(df[ship_col], errors="coerce").fillna(0) if ship_col else zeros
@@ -322,15 +322,15 @@ def accessory_item_rollup(items_df: pd.DataFrame) -> pd.DataFrame:
     """
     if items_df is None or items_df.empty:
         return pd.DataFrame(columns=[
-            "items_sum_Gen", "items_sum_PM", "items_sum_Compressor",
+            "items_sum_Gen", "items_sum_PM", "items_sum_ComAcc",
         ])
     grouped = items_df.groupby(["Accessory SKU", "Category"])["Time (min)"].sum().unstack(fill_value=0)
-    rename = {"Gen": "items_sum_Gen", "PM": "items_sum_PM", "Compressor": "items_sum_Compressor"}
+    rename = {"Gen": "items_sum_Gen", "PM": "items_sum_PM", "Compressor": "items_sum_ComAcc"}
     grouped = grouped.rename(columns=rename)
-    for col in ("items_sum_Gen", "items_sum_PM", "items_sum_Compressor"):
+    for col in ("items_sum_Gen", "items_sum_PM", "items_sum_ComAcc"):
         if col not in grouped.columns:
             grouped[col] = 0.0
-    return grouped[["items_sum_Gen", "items_sum_PM", "items_sum_Compressor"]]
+    return grouped[["items_sum_Gen", "items_sum_PM", "items_sum_ComAcc"]]
 
 
 def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
@@ -370,7 +370,7 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     btr_col  = _find(df.columns, "SUB-BTR raw", "SUB-BTR)", "Battery Sub raw", "BattSubRaw", "SubRaw")
     pm_col   = _find(df.columns, "SUB-PM", "PMAcc", "PM Acc", "PM ")
     gen_col  = _find(df.columns, "SUB-GEN", "Gen Sub", "GenAcc", "Gen Acc")
-    com_col  = _find(df.columns, "SUB-COM", "Compressor")
+    com_col  = _find(df.columns, "SUB-COM", "Compressor", "ComAcc")
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
@@ -384,7 +384,7 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["BattSubRaw"] = pd.to_numeric(df[btr_col], errors="coerce").fillna(0) if btr_col else zeros
     out["PMAcc"] = pd.to_numeric(df[pm_col], errors="coerce").fillna(0) if pm_col else zeros
     out["GenAcc"] = pd.to_numeric(df[gen_col], errors="coerce").fillna(0) if gen_col else zeros
-    out["Compressor"] = pd.to_numeric(df[com_col], errors="coerce").fillna(0) if com_col else zeros
+    out["ComAcc"] = pd.to_numeric(df[com_col], errors="coerce").fillna(0) if com_col else zeros
     # Last-modified date — empty for rows never edited through the app.
     mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
     out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * len(df), index=df.index, dtype=object)

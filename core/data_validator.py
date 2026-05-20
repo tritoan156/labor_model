@@ -99,7 +99,7 @@ def validate_accessory_catalog(acc_df: pd.DataFrame, machine_df: pd.DataFrame) -
 
         # 3) All labor columns are zero (suspicious)
         labor_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
-                      "PMAcc", "GenAcc", "Compressor"]
+                      "PMAcc", "GenAcc", "ComAcc"]
         labor_total = sum(float(row.get(c, 0) or 0) for c in labor_cols)
         if labor_total == 0:
             _add(issues, "warning", "Zero labor", str(sku),

@@ -1131,7 +1131,7 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
 
     if catalog == "Machine (FG SKU)":
         # Machine labor columns the user can edit
-        editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy_old", "PDI", "QC", "Ship", "Bat"]
+        editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "Bat"]
         display_df = machine_df.reset_index(drop=True).copy()
         display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_fg.get(s, 0)))
         display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
@@ -1194,7 +1194,7 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
 
     else:  # Accessory
         editable_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
-                         "PMAcc", "GenAcc", "Compressor"]
+                         "PMAcc", "GenAcc", "ComAcc"]
         display_df = acc_df.reset_index(drop=True).copy()
         display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_acc.get(s, 0)))
         display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
@@ -1965,7 +1965,7 @@ def _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_a
             key="recon_side_filter",
         )
 
-    side_to_agg_col = {"Compressor": "Compressor", "Generator": "GenAcc", "PM": "PMAcc"}
+    side_to_agg_col = {"Compressor": "ComAcc", "Generator": "GenAcc", "PM": "PMAcc"}
 
     rows = []
     for sku in acc_df.index:
@@ -2101,7 +2101,7 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
         st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
         return
 
-    side_to_agg_col = {"Compressor": "Compressor", "Generator": "GenAcc", "PM": "PMAcc"}
+    side_to_agg_col = {"Compressor": "ComAcc", "Generator": "GenAcc", "PM": "PMAcc"}
 
     # Start from the current acc_df (excluding the index 'SKU' duplicate column noise)
     out = acc_df.copy()
@@ -2301,7 +2301,7 @@ def _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df):
             acc_items_df.groupby(["Accessory SKU", "Category"])["Time (min)"]
             .sum().reset_index(name="Sum of items")
         )
-        cat_to_col = {"Gen": "GenAcc", "PM": "PMAcc", "Compressor": "Compressor"}
+        cat_to_col = {"Gen": "GenAcc", "PM": "PMAcc", "Compressor": "ComAcc"}
         roll["Catalog value"] = roll.apply(
             lambda r: float(acc_df.at[r["Accessory SKU"], cat_to_col[r["Category"]]])
                       if r["Accessory SKU"] in acc_df.index and r["Category"] in cat_to_col
@@ -2423,7 +2423,7 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
         m_disp = machine_df.copy()
         # Per-machine total labor across the assembly stations.
         # Bat is a COUNT (not labor) so it's excluded from the sum.
-        machine_labor_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy_old",
+        machine_labor_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy",
                               "PDI", "QC", "Ship"]
         present_cols = [c for c in machine_labor_cols if c in m_disp.columns]
         m_disp["Total labor (p-min)"] = m_disp[present_cols].fillna(0).sum(axis=1).astype(int)
@@ -2459,7 +2459,7 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
         # Per-accessory total uses the EXACT battery count from machine_clean.csv
         # for the family. PDS / SDG accessories → 0 (no battery multiplier).
         acc_labor_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
-                          "PMAcc", "GenAcc", "Compressor"]
+                          "PMAcc", "GenAcc", "ComAcc"]
         non_batt_cols = [c for c in acc_labor_cols if c != "BattSubRaw"]
         bat_counts = a_disp.index.to_series().astype(str).apply(
             lambda s: _family_battery_count(machine_df, _accessory_family_hint(s))

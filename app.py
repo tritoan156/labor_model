@@ -37,6 +37,13 @@ from core.catalog_storage import (
     latest_catalog_sha,
     GitHubConflict,
 )
+from core.scenario_storage import (
+    load_all_scenarios,
+    list_scenarios,
+    get_scenario,
+    save_scenario_to_github,
+    delete_scenario_on_github,
+)
 from core.data_validator import validate_all
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -116,6 +123,12 @@ def _load_item_packages_df(_mtime: float):
     return load_item_packages()
 
 
+@st.cache_data(show_spinner=False)
+def _load_scenarios_dict(_mtime: float):
+    """Load data/scenarios.json. Cached per file mtime."""
+    return load_all_scenarios()
+
+
 
 
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
@@ -134,6 +147,174 @@ def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.Dat
 # =============================================================
 # SKU browser — supports the manual-entry "Browse catalog" panel
 # =============================================================
+def _render_scenarios_panel(location: str, seed_key: str, rev_key: str) -> None:
+    """Sidebar expander for saving / loading named build-plan scenarios for the
+    current facility. Persists to data/scenarios.json on GitHub."""
+    # Always reload the latest scenarios from the cache (keyed on file mtime).
+    scenarios = _load_scenarios_dict(_csv_mtime("scenarios.json")).get(location, {})
+    scenario_names = sorted(scenarios.keys()) if isinstance(scenarios, dict) else []
+
+    with st.sidebar.expander("📂 Save / load scenarios", expanded=False):
+        st.caption(
+            f"Scenarios for **{location}** only. "
+            "Saved to `data/scenarios.json` on GitHub — shared across all users."
+        )
+
+        # ------------------------------------------------------------------
+        # SAVE
+        # ------------------------------------------------------------------
+        st.markdown("**Save current as**")
+        save_name = st.text_input(
+            "Scenario name",
+            key=f"scenario_save_name_{location}",
+            placeholder="e.g. May 2026 push",
+            label_visibility="collapsed",
+        )
+        if st.button(
+            "💾 Save scenario",
+            key=f"scenario_save_btn_{location}",
+            use_container_width=True,
+        ):
+            _scenario_save(location, save_name, seed_key, scenario_names)
+
+        # ------------------------------------------------------------------
+        # LOAD / DELETE
+        # ------------------------------------------------------------------
+        st.markdown("---")
+        st.markdown("**Load a saved scenario**")
+        if not scenario_names:
+            st.caption(f"_No saved scenarios for {location} yet._")
+            return
+
+        chosen = st.selectbox(
+            "Scenario",
+            options=scenario_names,
+            key=f"scenario_load_pick_{location}",
+            label_visibility="collapsed",
+        )
+        # Show metadata for the chosen scenario
+        meta = scenarios.get(chosen, {}) if isinstance(scenarios, dict) else {}
+        n_entries = len(meta.get("entries", []) or [])
+        saved_at = meta.get("saved_at", "")
+        st.caption(f"📋 {n_entries} row(s)  ·  saved {saved_at}")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("📥 Load", key=f"scenario_load_btn_{location}",
+                         use_container_width=True):
+                _scenario_load(location, chosen, seed_key, rev_key)
+        with c2:
+            if st.button("🗑 Delete", key=f"scenario_del_btn_{location}",
+                         use_container_width=True):
+                _scenario_delete(location, chosen)
+
+
+def _scenario_save(location: str, name: str, seed_key: str, existing_names: list) -> None:
+    """Handler for the Save button — validates and pushes the current
+    manual-entry rows as a named scenario."""
+    name = (name or "").strip()
+    if not name:
+        st.warning("Please enter a scenario name before saving.")
+        return
+
+    # Build the entries DataFrame from the latest manual-editor state. Prefer
+    # the current data_editor key (so any in-flight edits are captured);
+    # fall back to the seed if the editor hasn't rendered yet.
+    rev = st.session_state.get(f"manual_rev_{location}", 0)
+    editor_key = f"manual_entries_{location}_v{rev}"
+    df = st.session_state.get(editor_key)
+    if not isinstance(df, pd.DataFrame):
+        df = st.session_state.get(seed_key, pd.DataFrame(
+            columns=["FG SKU", "Accessory SKU", "Qty"]
+        ))
+
+    # Check empty after stripping blank rows — let save handler do the cleaning
+    non_empty = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if not non_empty.empty:
+        non_empty["__fg"] = non_empty.get("FG SKU", "").astype(str).str.strip()
+        non_empty["__qty"] = pd.to_numeric(
+            non_empty.get("Qty", 0), errors="coerce",
+        ).fillna(0).astype(int)
+        non_empty = non_empty[(non_empty["__fg"] != "") & (non_empty["__qty"] > 0)]
+    if non_empty.empty:
+        st.warning(
+            "The manual-entry table is empty. Fill in at least one row (FG SKU + Qty > 0) "
+            "before saving the scenario."
+        )
+        return
+
+    if name in existing_names:
+        # Streamlit doesn't have a modal yet — use a session flag to require
+        # a second click for confirmation.
+        confirm_key = f"scenario_overwrite_confirmed_{location}_{name}"
+        if not st.session_state.get(confirm_key, False):
+            st.session_state[confirm_key] = True
+            st.warning(
+                f"A scenario named **{name}** already exists for {location}. "
+                "Click **💾 Save scenario** again to overwrite it."
+            )
+            return
+        # second click — clear the flag and proceed
+        st.session_state[confirm_key] = False
+
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return
+
+    try:
+        with st.spinner(f"Saving scenario '{name}'..."):
+            response = save_scenario_to_github(location, name, df, token)
+        commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+        commit_url = (response or {}).get("commit", {}).get("html_url", "")
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.success(
+            f"✅ Saved scenario **{name}** for {location}"
+            + (f" (commit [`{commit_sha}`]({commit_url}))." if commit_url else ".")
+        )
+    except Exception as e:
+        st.error(f"❌ Save failed: {e}")
+
+
+def _scenario_load(location: str, name: str, seed_key: str, rev_key: str) -> None:
+    """Handler for the Load button — replaces the manual-editor's seed with
+    the saved scenario's rows and forces the editor to re-render."""
+    block = get_scenario(location, name) or {}
+    rows = block.get("entries", []) or []
+    if not rows:
+        st.warning(f"Scenario '{name}' has no entries.")
+        return
+    seed = pd.DataFrame(rows, columns=["FG SKU", "Accessory SKU", "Qty"])
+    # Coerce Qty to int (json round-trip can produce floats)
+    seed["Qty"] = pd.to_numeric(seed["Qty"], errors="coerce").fillna(0).astype(int)
+    st.session_state[seed_key] = seed
+    st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
+    st.success(f"Loaded scenario **{name}** — {len(seed)} row(s).")
+    st.rerun()
+
+
+def _scenario_delete(location: str, name: str) -> None:
+    """Handler for the Delete button."""
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return
+    try:
+        with st.spinner(f"Deleting scenario '{name}'..."):
+            delete_scenario_on_github(location, name, token)
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.success(f"🗑 Deleted scenario **{name}** for {location}.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Delete failed: {e}")
+
+
 def _render_sku_browser(machine_df, acc_df, location: str, seed_key: str, rev_key: str) -> None:
     """Sidebar expander that lets the user filter the machine catalog by
     family + class and add a chosen FG SKU + accessory + qty into the
@@ -431,6 +612,7 @@ def render_sidebar() -> dict:
 
         # Render the Browse panel (it may bump rev_key + rerun on Add)
         _render_sku_browser(machine_df, acc_df, location, seed_key, rev_key)
+        _render_scenarios_panel(location, seed_key, rev_key)
 
         # Render the data_editor with a rev-suffixed key so a fresh seed
         # is picked up after each programmatic add.

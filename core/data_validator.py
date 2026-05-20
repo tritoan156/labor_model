@@ -98,7 +98,7 @@ def validate_accessory_catalog(acc_df: pd.DataFrame, machine_df: pd.DataFrame) -
                  "SKU has leading or trailing whitespace — will cause lookup failures.")
 
         # 3) All labor columns are zero (suspicious)
-        labor_cols = ["Warehouse", "AccKIT", "BattPrep", "BattSubRaw",
+        labor_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
                       "PMAcc", "GenAcc", "Compressor"]
         labor_total = sum(float(row.get(c, 0) or 0) for c in labor_cols)
         if labor_total == 0:

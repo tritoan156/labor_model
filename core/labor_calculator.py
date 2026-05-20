@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 
 from .constants import (
-    FINAL_LABOR, HS_FINAL_CREW, DEFAULT_BATT_PREP, DEFAULT_BATT_RAW,
+    FINAL_LABOR, HS_FINAL_CREW, DEFAULT_NAMEPLATE_PREP, DEFAULT_BATT_RAW,
     ETO_LABOR_PER_UNIT, STATION_KEY_TO_DISPLAY, STATION_KEYS,
     BATTERY_CYCLE_MINUTES, get_battery_type,
 )
@@ -36,8 +36,8 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     GenAcc, Trailer, AccKIT, Final, PDI, QC, Ship, ETO.
 
     Battery handling:
-      - If Acc has BattSubRaw > 0 OR BattPrep > 0, use its values
-      - Else if Machine has Bat ≥ 1, use defaults (BattPrep=10, BattRaw=320)
+      - If Acc has BattSubRaw > 0 OR Nameplate Prep > 0, use its values
+      - Else if Machine has Bat ≥ 1, use defaults (Nameplate Prep=10, BattRaw=320)
       - Else 0
 
     Final logic:
@@ -70,10 +70,10 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     # Battery total
     if not is_boss:
         batt_total = 0
-    elif a is not None and (a["BattSubRaw"] > 0 or a["BattPrep"] > 0):
-        batt_total = a["BattSubRaw"] * bat + a["BattPrep"]
+    elif a is not None and (a["BattSubRaw"] > 0 or a["Nameplate Prep"] > 0):
+        batt_total = a["BattSubRaw"] * bat + a["Nameplate Prep"]
     elif bat > 0:
-        batt_total = DEFAULT_BATT_RAW * bat + DEFAULT_BATT_PREP
+        batt_total = DEFAULT_BATT_RAW * bat + DEFAULT_NAMEPLATE_PREP
     else:
         batt_total = 0
 

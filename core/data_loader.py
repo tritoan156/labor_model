@@ -86,7 +86,7 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
 def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     """Load Acc_Clean CSV → DataFrame indexed by SKU.
 
-    Returns columns: Warehouse, AccKIT, BattPrep, BattSubRaw, PMAcc, GenAcc,
+    Returns columns: Warehouse, AccKIT, Nameplate Prep, BattSubRaw, PMAcc, GenAcc,
     Compressor, Description.
     """
     if path is None:
@@ -112,7 +112,7 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["Description"] = df[desc_col].fillna("") if desc_col else ""
     out["Warehouse"] = pd.to_numeric(df[pick_col], errors="coerce").fillna(0) if pick_col else 0
     out["AccKIT"] = pd.to_numeric(df[kit_col], errors="coerce").fillna(0) if kit_col else 0
-    out["BattPrep"] = pd.to_numeric(df[prep_col], errors="coerce").fillna(0) if prep_col else 0
+    out["Nameplate Prep"] = pd.to_numeric(df[prep_col], errors="coerce").fillna(0) if prep_col else 0
     out["BattSubRaw"] = pd.to_numeric(df[btr_col], errors="coerce").fillna(0) if btr_col else 0
     out["PMAcc"] = pd.to_numeric(df[pm_col], errors="coerce").fillna(0) if pm_col else 0
     out["GenAcc"] = pd.to_numeric(df[gen_col], errors="coerce").fillna(0) if gen_col else 0

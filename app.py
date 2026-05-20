@@ -607,7 +607,7 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
             )
 
     else:  # Accessory
-        editable_cols = ["Warehouse", "AccKIT", "BattPrep", "BattSubRaw",
+        editable_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
                          "PMAcc", "GenAcc", "Compressor"]
         display_df = acc_df.reset_index(drop=True).copy()
         display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_acc.get(s, 0)))
@@ -849,7 +849,7 @@ def tab_source_data(machine_df, acc_df, schedule_df):
         a_disp.insert(0, "Used (qty)", a_disp.index.map(lambda s: used_acc.get(s, 0)))
         a_disp.insert(1, "In schedule", a_disp["Used (qty)"] > 0)
         # Per-accessory total time (sum of all labor columns, 1-battery basis)
-        acc_labor_cols = ["Warehouse", "AccKIT", "BattPrep", "BattSubRaw",
+        acc_labor_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
                           "PMAcc", "GenAcc", "Compressor"]
         a_disp["Total (1 batt)"] = a_disp[acc_labor_cols].fillna(0).sum(axis=1).astype(int)
         if only_used:

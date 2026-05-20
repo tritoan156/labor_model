@@ -22,7 +22,7 @@ FINAL_LABOR = {"HS": 30, "HT": 60, "STD": 156}
 HS_FINAL_CREW = 1
 
 # === Battery defaults (when Acc data is missing) ===
-DEFAULT_BATT_PREP = 10  # PREP-NP, person-mins per unit
+DEFAULT_NAMEPLATE_PREP = 10  # PREP-NP (Nameplate Prep), person-mins per unit
 DEFAULT_BATT_RAW = 320  # SUB-BTR, person-mins per battery
 BATTERY_CYCLE_MINUTES = 170  # 10 prep + 160 build per battery (calendar mins per cell)
 

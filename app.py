@@ -1144,6 +1144,9 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
         if "FN_Assy_old" in display_df.columns and "FN_Assy" not in display_df.columns:
             display_df = display_df.rename(columns={"FN_Assy_old": "FN_Assy"})
+        # Defensive: ensure Last Modified column exists (might be missing from stale cache)
+        if "Last Modified" not in display_df.columns:
+            display_df["Last Modified"] = ""
         display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_fg.get(s, 0)))
         display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
 
@@ -1210,6 +1213,9 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         # Backward-compat: alias "Compressor" → "ComAcc" if cache is stale
         if "Compressor" in display_df.columns and "ComAcc" not in display_df.columns:
             display_df = display_df.rename(columns={"Compressor": "ComAcc"})
+        # Defensive: ensure Last Modified column exists (might be missing from stale cache)
+        if "Last Modified" not in display_df.columns:
+            display_df["Last Modified"] = ""
         display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_acc.get(s, 0)))
         display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
 
@@ -2438,6 +2444,9 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
         # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
         if "FN_Assy_old" in m_disp.columns and "FN_Assy" not in m_disp.columns:
             m_disp = m_disp.rename(columns={"FN_Assy_old": "FN_Assy"})
+        # Defensive: ensure Last Modified column exists (might be missing from stale cache)
+        if "Last Modified" not in m_disp.columns:
+            m_disp["Last Modified"] = ""
         # Per-machine total labor across the assembly stations.
         # Bat is a COUNT (not labor) so it's excluded from the sum.
         machine_labor_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy",
@@ -2475,6 +2484,9 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
         # column (because cache hasn't refreshed), alias it to "ComAcc".
         if "Compressor" in a_disp.columns and "ComAcc" not in a_disp.columns:
             a_disp = a_disp.rename(columns={"Compressor": "ComAcc"})
+        # Defensive: ensure Last Modified column exists (might be missing from stale cache)
+        if "Last Modified" not in a_disp.columns:
+            a_disp["Last Modified"] = ""
         a_disp.insert(0, "Used (qty)", a_disp.index.map(lambda s: used_acc.get(s, 0)))
         a_disp.insert(1, "In schedule", a_disp["Used (qty)"] > 0)
         # Per-accessory total uses the EXACT battery count from machine_clean.csv

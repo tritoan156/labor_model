@@ -44,12 +44,17 @@ st.set_page_config(
     layout="wide",
 )
 
-# Suppress the default page padding for a more dashboard-y look
+# A few small style tweaks for a cleaner, more dashboard-like look.
 st.markdown(
     """
     <style>
-      .block-container { padding-top: 2rem; padding-bottom: 2rem; }
-      [data-testid="stMetricValue"] { font-size: 1.5rem; }
+      .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+      [data-testid="stMetricValue"] { font-size: 1.55rem; }
+      [data-testid="stMetricLabel"] { font-size: 0.85rem; opacity: 0.9; }
+      h1, h2, h3 { letter-spacing: -0.01em; }
+      /* Tighter tab labels */
+      .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+      .stTabs [data-baseweb="tab"] { padding-left: 14px; padding-right: 14px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -96,40 +101,51 @@ def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.Dat
 # Sidebar — global inputs
 # =============================================================
 def render_sidebar() -> dict:
-    st.sidebar.header("⚙️ Inputs")
+    st.sidebar.title("🏭 Labor Planning")
+    st.sidebar.caption("Set up your scenario, then review tabs on the right.")
+    st.sidebar.markdown("---")
 
-    # Location selector
-    st.sidebar.subheader("Location")
+    # ----------------------------------------------------------------
+    # STEP 1 — Facility (always visible)
+    # ----------------------------------------------------------------
+    st.sidebar.markdown("#### Step 1 · Pick a facility")
     location = st.sidebar.selectbox(
         "Facility",
         LOCATIONS,
         index=0,
-        help="Filter the schedule to the selected facility.",
+        label_visibility="collapsed",
+        help="Each facility has its own saved headcount and station setup.",
     )
 
-    # Schedule data — pick CSV upload OR manual SKU entry
-    st.sidebar.subheader("Schedule data")
+    # ----------------------------------------------------------------
+    # STEP 2 — Schedule (always visible)
+    # ----------------------------------------------------------------
+    st.sidebar.markdown("#### Step 2 · Tell us what to build")
     schedule_mode = st.sidebar.radio(
-        "Mode",
-        ["📤 Upload CSV", "✏️ Manual entry"],
+        "How would you like to enter the build plan?",
+        ["📤 Upload schedule file", "✏️ Type a few SKUs"],
         index=0,
-        help="Upload a production schedule, or quickly type a few SKUs for an ad-hoc capacity check.",
+        help=(
+            "Upload a full production schedule (CSV) — best for monthly planning. "
+            "Or type a few SKU rows by hand — best for quick what-if scenarios."
+        ),
     )
 
     uploaded = None
     manual_entries = None
 
-    if schedule_mode == "📤 Upload CSV":
+    if schedule_mode == "📤 Upload schedule file":
         uploaded = st.sidebar.file_uploader(
-            "Upload production schedule CSV",
+            "Choose a CSV",
             type=["csv"],
-            help="Defaults to bundled May 2026 Henderson schedule.",
+            help="Expected columns: LOCATION, FG SKU ID, FG ACCRY SKU ID, BUILD QTY, PRODUCTION MONTH.",
+            label_visibility="collapsed",
         )
         if uploaded is None:
-            st.sidebar.caption("📁 Using bundled May 2026 Henderson schedule")
+            st.sidebar.info("Using the bundled May 2026 sample schedule.")
     else:
         st.sidebar.caption(
-            "Type FG SKU + Accessory SKU + Qty. Leave Accessory blank if none."
+            "Enter FG SKU, Accessory SKU (optional), and Quantity for each row."
         )
         default_entries = pd.DataFrame({
             "FG SKU": [""] * 8,
@@ -150,86 +166,135 @@ def render_sidebar() -> dict:
             },
         )
 
-    # Working time
-    st.sidebar.subheader("Working time")
-    safety = st.sidebar.slider(
-        "Safety factor",
-        min_value=0.50, max_value=1.00,
-        value=DEFAULT_SAFETY_FACTOR, step=0.05,
-        help="0.85 = 15% buffer (recommended). 1.00 = raw capacity, no buffer.",
-    )
-    efficiency = st.sidebar.slider(
-        "Efficiency factor",
-        min_value=0.40, max_value=1.00,
-        value=DEFAULT_EFFICIENCY_FACTOR, step=0.025,
-        help=(
-            "Fraction of shift time that is actually productive (breaks, setup, "
-            "rework reduce it). 1.00 = no loss. 0.625 ≈ VSM productive-time rate."
-        ),
-    )
-    days = st.sidebar.number_input(
-        "Working days/month",
-        min_value=1, max_value=31,
-        value=DEFAULT_WORKING_DAYS,
-    )
-    shift = st.sidebar.number_input(
-        "Shift length (mins)",
-        min_value=60, max_value=1440,
-        value=DEFAULT_SHIFT_MINUTES, step=30,
-    )
+    st.sidebar.markdown("---")
 
-    # Crew config — loaded per-facility from data/facility_crew.json
-    # Using a facility-scoped widget key means edits to one facility don't
-    # bleed into another; Streamlit preserves each facility's edits separately.
-    st.sidebar.subheader(f"Station crew — {location}")
-    st.sidebar.caption("HC=0 means the station does not exist at this facility.")
-
-    crew_default_df = load_facility_crew_df(location)
-
-    edited = st.sidebar.data_editor(
-        crew_default_df,
-        use_container_width=True,
-        num_rows="fixed",
-        key=f"crew_editor_{location}",
-        column_config={
-            "HC": st.column_config.NumberColumn(
-                "HC", min_value=0, step=1,
-                help="Set to 0 if this station does not exist at the selected facility.",
+    # ----------------------------------------------------------------
+    # STEP 3 — Settings, behind an expander
+    # ----------------------------------------------------------------
+    with st.sidebar.expander("⏱️ Working-time settings", expanded=False):
+        st.caption("How much capacity you have per person per day.")
+        days = st.number_input(
+            "Working days in the period",
+            min_value=1, max_value=31,
+            value=DEFAULT_WORKING_DAYS,
+            help="E.g. 20 for a typical month with 5-day weeks.",
+        )
+        shift = st.number_input(
+            "Shift length (minutes)",
+            min_value=60, max_value=1440,
+            value=DEFAULT_SHIFT_MINUTES, step=30,
+            help="480 = 8 hours.",
+        )
+        safety = st.slider(
+            "Planning buffer (safety factor)",
+            min_value=0.50, max_value=1.00,
+            value=DEFAULT_SAFETY_FACTOR, step=0.05,
+            help="0.85 leaves a 15% buffer. 1.00 = use 100% of capacity (no buffer).",
+        )
+        efficiency = st.slider(
+            "Productive time (efficiency factor)",
+            min_value=0.40, max_value=1.00,
+            value=DEFAULT_EFFICIENCY_FACTOR, step=0.025,
+            help=(
+                "Fraction of the shift that is actually productive — breaks, setup, "
+                "and rework reduce it. 1.00 = no loss. Use 0.625 to match the VSM standard."
             ),
-            "Conc": st.column_config.NumberColumn(
-                "Conc", min_value=0, step=1,
-                help="Set to 0 if this station does not exist at the selected facility.",
-            ),
-            "Crew": st.column_config.NumberColumn("Crew", min_value=1, step=1),
-        },
-    )
+        )
 
-    # Save button — persists to GitHub for everyone
-    if st.sidebar.button(f"💾 Save crew for {location}", use_container_width=True):
-        token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
-        if not token:
-            st.sidebar.error(
-                "GitHub token not configured. Add `github_token` to Streamlit Secrets "
-                "to enable saving."
-            )
-        else:
-            try:
-                with st.spinner(f"Saving {location} crew to GitHub..."):
-                    save_facility_crew_to_github(location, edited, token)
-                st.sidebar.success(
-                    f"✅ Saved! All users will see the new {location} values "
-                    "after Streamlit Cloud redeploys (~1 min)."
+    # ----------------------------------------------------------------
+    # STEP 4 — Station headcount (per facility), behind an expander
+    # ----------------------------------------------------------------
+    with st.sidebar.expander(f"👥 Station headcount for {location}", expanded=False):
+        st.caption(
+            "Edit how many people work at each station. Set **People = 0** "
+            "for any station that doesn't exist at this facility."
+        )
+
+        crew_default_df = load_facility_crew_df(location)
+        # Friendly display: rename columns for the editor
+        display_crew = crew_default_df.rename(
+            columns={"HC": "People", "Conc": "Stations/Cells", "Crew": "Crew per unit"}
+        )
+
+        edited_display = st.data_editor(
+            display_crew,
+            use_container_width=True,
+            num_rows="fixed",
+            key=f"crew_editor_{location}",
+            column_config={
+                "People": st.column_config.NumberColumn(
+                    "People", min_value=0, step=1,
+                    help="Total headcount available at this station.",
+                ),
+                "Stations/Cells": st.column_config.NumberColumn(
+                    "Stations/Cells", min_value=0, step=1,
+                    help="How many units can be worked on at the same time (parallel bays/cells).",
+                ),
+                "Crew per unit": st.column_config.NumberColumn(
+                    "Crew per unit", min_value=1, step=1,
+                    help="People assigned to one unit at this station.",
+                ),
+            },
+        )
+        # Convert back to internal column names
+        edited = edited_display.rename(
+            columns={"People": "HC", "Stations/Cells": "Conc", "Crew per unit": "Crew"}
+        )
+
+        # Save button
+        if st.button(f"💾 Save crew for {location}", use_container_width=True):
+            token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+            if not token:
+                st.error(
+                    "GitHub token not configured. Ask your admin to add "
+                    "`github_token` to Streamlit Secrets."
                 )
-            except Exception as e:
-                st.sidebar.error(f"Save failed: {e}")
+            else:
+                try:
+                    with st.spinner(f"Saving {location} crew to GitHub..."):
+                        save_facility_crew_to_github(location, edited, token)
+                    st.success(
+                        f"✅ Saved! Everyone sees the new {location} values "
+                        "after the app redeploys (~1 min)."
+                    )
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
 
-    # Total headcount summary (live)
-    total_hc = int(edited["HC"].sum())
-    active_stations = int((edited["HC"] > 0).sum())
-    st.sidebar.markdown(
-        f"**👥 Total headcount:** {total_hc}  \n"
-        f"**🏭 Active stations:** {active_stations} / {len(edited)}"
-    )
+        # Live totals
+        total_hc = int(edited["HC"].sum())
+        active_stations = int((edited["HC"] > 0).sum())
+        st.markdown(
+            f"**👥 Total headcount:** {total_hc}  \n"
+            f"**🏭 Active stations:** {active_stations} of {len(edited)}"
+        )
+
+    # ----------------------------------------------------------------
+    # Help / Glossary — always last
+    # ----------------------------------------------------------------
+    with st.sidebar.expander("ℹ️ Help & glossary", expanded=False):
+        st.markdown(
+            """
+**Common terms**
+
+- **Headcount (HC)** — number of people assigned to a station.
+- **Stations/Cells (Conc)** — how many units can be worked on at the same time at one station.
+- **Crew per unit** — number of people working together on one unit at a station.
+- **Person-minutes (p-min)** — labor effort. 1 person working 1 min = 1 p-min.
+- **Cycle time** — calendar minutes a unit physically spends at a station.
+- **Lead time** — total calendar days for one person to build a unit alone.
+- **Required HC** — number of people needed to meet the schedule.
+- **Safety factor** — planning buffer applied to capacity.
+- **Efficiency factor** — fraction of the shift that is actually productive.
+
+**Unit classes**
+- **STD** — standard trailer (full assembly with marry)
+- **HS** — Head Skid only (no trailer)
+- **HT** — Head + Trailer (mount only, no marry)
+
+**Status colors**
+- 🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility
+            """
+        )
 
     return {
         "uploaded": uploaded,
@@ -248,12 +313,11 @@ def render_sidebar() -> dict:
 # Tab renderers
 # =============================================================
 def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = ""):
-    st.header("🏠 Overview")
-    month_label = f" — {schedule_month}" if schedule_month else ""
-    st.caption(f"{inputs['location']} Manufacturing — Energy Storage Systems{month_label}")
-
+    # =============================================================
+    # Compute headline numbers
+    # =============================================================
     total_units = len(units)
-    total_labor = units["total_labor"].sum()
+    total_labor = int(units["total_labor"].sum())
     total_batt = int(units["Bat"].where(units["Battery"] > 0, 0).sum())
     total_hc = int(inputs["crew_config"]["HC"].sum())
     active_stations = int((inputs["crew_config"]["HC"] > 0).sum())
@@ -261,163 +325,355 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = ""):
     total_hc_gap = total_required_hc - total_hc
 
     over_stations = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
-    bottleneck = over_stations[0] if over_stations else "None"
+    no_station_list = capacity[capacity["overall_status"] == "🔴 NO STATION"].index.tolist()
+    near_cap = capacity[capacity["overall_status"] == "🟠 NEAR-CAP"].index.tolist()
+    tight = capacity[capacity["overall_status"] == "🟡 TIGHT"].index.tolist()
+    ok_stations = capacity[capacity["overall_status"] == "🟢 OK"].index.tolist()
 
+    # =============================================================
+    # Big status banner
+    # =============================================================
+    month_label = f" · {schedule_month}" if schedule_month else ""
+    st.markdown(f"### {inputs['location']} Manufacturing{month_label}")
+
+    has_blocker = bool(over_stations or no_station_list)
+    has_warning = bool(near_cap)
+
+    if has_blocker:
+        blockers = []
+        if over_stations:
+            blockers.append(f"{len(over_stations)} station(s) **over capacity** ({', '.join(over_stations)})")
+        if no_station_list:
+            blockers.append(f"{len(no_station_list)} station(s) **not available** here ({', '.join(no_station_list)})")
+        st.error(
+            "🚨 **Action needed.** " + " · ".join(blockers)
+            + "\n\nSee the **Capacity** and **Recommendations** tabs for fixes."
+        )
+    elif has_warning:
+        st.warning(
+            f"⚠️ **Watch closely.** {len(near_cap)} station(s) near capacity: "
+            f"**{', '.join(near_cap)}**. Small changes could push them over."
+        )
+    else:
+        st.success("✅ **All clear.** Every station is within safe capacity for this plan.")
+
+    st.markdown("---")
+
+    # =============================================================
+    # Hero KPIs — what an executive needs at a glance
+    # =============================================================
+    st.markdown("#### 📦 What this plan builds")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total units", f"{total_units:,}")
-    c2.metric("Total labor (person-mins)", f"{int(total_labor):,}")
-    c3.metric("Total batteries", f"{total_batt:,}")
-    c4.metric("Primary bottleneck", bottleneck)
+    c1.metric(
+        "Units to build", f"{total_units:,}",
+        help="Total finished-good units in this schedule (or manual entry).",
+    )
+    c2.metric(
+        "Total work", f"{total_labor:,} p-min",
+        help="Total person-minutes of labor required across all stations.",
+    )
+    c3.metric(
+        "Batteries required", f"{total_batt:,}",
+        help="Total batteries that need to be assembled (BOSS units only).",
+    )
+    primary_bottleneck = over_stations[0] if over_stations else (
+        near_cap[0] if near_cap else (tight[0] if tight else "None")
+    )
+    c4.metric(
+        "Primary bottleneck", primary_bottleneck,
+        help="The station closest to or over capacity. Address this first.",
+    )
 
-    # Second row — headcount picture
+    st.markdown("#### 👥 Headcount picture")
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Current HC", f"{total_hc}", help=f"{active_stations} active stations")
+    c5.metric(
+        "People you have", f"{total_hc}",
+        help=f"Total headcount across {active_stations} active stations.",
+    )
     c6.metric(
-        "Required HC",
-        f"{total_required_hc}",
+        "People you need", f"{total_required_hc}",
         help=(
-            f"Sum of HC needed at each station, given safety={inputs['safety']:.2f} "
-            f"× efficiency={inputs['efficiency']:.3f}."
+            f"Sum of headcount required at every station to meet this plan, "
+            f"using your buffer ({inputs['safety']:.2f}) and "
+            f"productive-time settings ({inputs['efficiency']:.3f})."
         ),
     )
+    gap_label = "Short" if total_hc_gap > 0 else ("Surplus" if total_hc_gap < 0 else "Even")
     c7.metric(
-        "HC gap",
-        f"{total_hc_gap:+d}",
-        delta=f"{total_hc_gap:+d}",
+        gap_label, f"{abs(total_hc_gap)}",
+        delta=f"{total_hc_gap:+d}" if total_hc_gap != 0 else None,
         delta_color="inverse",
-        help="Positive = short staffed; negative = surplus.",
+        help="Difference between people you need and people you have.",
     )
-    over_stations_count = int((capacity["hc_gap"] > 0).sum())
+    short_count = int((capacity["hc_gap"] > 0).sum())
     c8.metric(
-        "Stations short",
-        f"{over_stations_count}",
-        help="Stations where Required HC > Current HC.",
+        "Stations needing more people", f"{short_count}",
+        help="Stations where required headcount exceeds what you have today.",
     )
 
     st.markdown("---")
 
-    # Bottom line
-    st.subheader("🎯 Bottom Line")
-    no_station_list = capacity[capacity["overall_status"] == "🔴 NO STATION"].index.tolist()
+    # =============================================================
+    # Recommended actions — auto-generated from data
+    # =============================================================
+    st.markdown("#### 🎯 Recommended actions")
+    actions = []
+    # 1. Stations missing entirely
     if no_station_list:
-        st.error(
-            f"**{len(no_station_list)} station(s) NOT AVAILABLE at {inputs['location']}** "
-            f"but have demand: {', '.join(no_station_list)}.  \n"
-            f"Set HC > 0 in the sidebar or remove those units from the schedule."
+        actions.append(
+            f"**Fix facility setup.** {len(no_station_list)} station(s) have demand but 0 headcount: "
+            f"{', '.join(no_station_list)}. Either add people in the sidebar or remove those units from the schedule."
         )
-    if "🔴 OVER" in capacity["overall_status"].values:
-        over_list = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
-        st.error(
-            f"**{len(over_list)} station(s) OVER capacity:** {', '.join(over_list)}.  \n"
-            f"See the **Capacity vs Demand** tab for details and the **Mitigation** tab for fix options."
+    # 2. Over-capacity stations
+    if over_stations:
+        actions.append(
+            f"**Add capacity at {', '.join(over_stations)}.** "
+            f"Options: add people, run overtime, extend working days, or defer some units. "
+            f"See the **Recommendations** tab for specifics."
         )
-    elif "🟠 NEAR-CAP" in capacity["overall_status"].values:
-        near = capacity[capacity["overall_status"] == "🟠 NEAR-CAP"].index.tolist()
-        st.warning(
-            f"**{len(near)} station(s) near capacity:** {', '.join(near)}.  "
-            f"Monitor closely; small changes could push them over."
+    # 3. Headcount short overall
+    if total_hc_gap > 0 and not over_stations:
+        actions.append(
+            f"**Plan to add ~{total_hc_gap} people** across the line to comfortably hit this plan."
         )
-    else:
-        st.success("All stations are within capacity.")
+    # 4. Near-cap warnings
+    if near_cap and not over_stations:
+        actions.append(
+            f"**Monitor {', '.join(near_cap)}** — these are 90%+ utilized and risky for any schedule change."
+        )
+    # 5. Surplus
+    if total_hc_gap < -3:  # only call out meaningful surplus
+        idle = capacity[capacity["labor_util_safe"] < 0.5].index.tolist()
+        if idle:
+            actions.append(
+                f"**Surplus capacity at {', '.join(idle[:3])}** — consider cross-training "
+                f"these {abs(total_hc_gap)} people to support bottleneck stations."
+            )
+    if not actions:
+        actions.append("✅ **No action needed** — this plan is well-balanced. Maintain current staffing.")
 
-    # Quick station status grid
-    st.subheader("📊 Station status at a glance")
-    status_df = capacity[["overall_status"]].copy()
-    status_df.columns = ["Status"]
-    st.dataframe(status_df, use_container_width=True, height=480)
+    for i, action in enumerate(actions, 1):
+        st.markdown(f"{i}. {action}")
 
-    # Battery type mix mini-chart
-    st.subheader("🔋 Battery demand by type")
+    st.markdown("---")
+
+    # =============================================================
+    # Station status — colored cards instead of a dense table
+    # =============================================================
+    st.markdown("#### 📊 Station status at a glance")
+    st.caption(
+        "Each card shows one station. Color = overall status (labor + throughput). "
+        "Number = how loaded it is."
+    )
+
+    # Build cards in rows of 4
+    stations_to_show = list(capacity.index)
+    color_map = {
+        "🔴 OVER":       ("#E15759", "white"),
+        "🔴 NO STATION": ("#999999", "white"),
+        "🟠 NEAR-CAP":   ("#F0A04B", "white"),
+        "🟡 TIGHT":      ("#F2D75D", "#333"),
+        "🟢 OK":         ("#70AD47", "white"),
+        "⚪ N/A":         ("#EEEEEE", "#666"),
+    }
+    for i in range(0, len(stations_to_show), 4):
+        cols = st.columns(4)
+        for j, st_name in enumerate(stations_to_show[i:i + 4]):
+            row = capacity.loc[st_name]
+            status = row["overall_status"]
+            bg, fg = color_map.get(status, ("#EEEEEE", "#333"))
+            util_pct = row["labor_util_safe"] * 100 if not row.get("station_missing") else 0
+            hc = int(row["HC"])
+            req = int(row["required_hc"])
+            status_label = status.split(" ", 1)[1] if " " in status else status
+            cols[j].markdown(
+                f"""
+<div style="background:{bg};color:{fg};padding:12px;border-radius:8px;margin-bottom:8px;">
+<div style="font-weight:600;font-size:0.95rem;">{st_name}</div>
+<div style="font-size:0.78rem;opacity:0.85;">{status_label}</div>
+<div style="font-size:1.6rem;font-weight:700;margin-top:6px;">{util_pct:.0f}%</div>
+<div style="font-size:0.78rem;opacity:0.85;">{hc} people · need {req}</div>
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("---")
+
+    # =============================================================
+    # Battery type mix (kept — visual is clearer than table)
+    # =============================================================
+    st.markdown("#### 🔋 Batteries needed by type")
     fig = px.bar(
         batt_type, x="batt_type", y="total_batteries", color="batt_type",
         text="total_batteries",
         labels={"batt_type": "Battery type", "total_batteries": "Batteries"},
     )
-    fig.update_layout(showlegend=False, height=350)
+    fig.update_traces(textposition="outside")
+    fig.update_layout(showlegend=False, height=340, margin=dict(t=20, b=20))
     st.plotly_chart(fig, use_container_width=True)
 
 
 def tab_capacity_vs_demand(capacity, inputs):
     st.header("📊 Capacity vs Demand")
+    st.markdown(
+        "**Are stations comfortably staffed for this plan?** "
+        "Each row is one station. Use the chart for a visual scan, the simple table for the headline numbers."
+    )
     st.caption(
-        f"Shift: {inputs['shift']} min · Days: {inputs['days']} · "
-        f"Safety: {inputs['safety']:.2f} · Efficiency: {inputs['efficiency']:.3f}  ·  "
-        f"Battery row reports BATTERIES/day (not units/day)."
+        f"Plan settings — shift: {inputs['shift']} min · "
+        f"working days: {inputs['days']} · "
+        f"buffer: {inputs['safety']:.2f} · "
+        f"productive time: {inputs['efficiency']:.3f}"
     )
 
-    # Compose a display-friendly DataFrame
-    disp = pd.DataFrame(index=capacity.index)
-    disp["HC"] = capacity["HC"]
-    disp["Required HC"] = capacity["required_hc"]
-    disp["HC gap"] = capacity["hc_gap"]
-    disp["Conc"] = capacity["Conc"]
-    disp["Crew"] = capacity["Crew"]
-    disp["Labor demand"] = capacity["labor_demand"].astype(int)
-    disp["Labor cap (safe)"] = capacity["labor_cap_safe"].astype(int)
-    disp["Labor util (safe)"] = (capacity["labor_util_safe"] * 100).round(1).astype(str) + "%"
-    disp["Labor status (safe)"] = capacity["labor_status_safe"]
-    disp["Labor cap (raw)"] = capacity["labor_cap_raw"].astype(int)
-    disp["Labor util (raw)"] = (capacity["labor_util_raw"] * 100).round(1).astype(str) + "%"
-    disp["Labor status (raw)"] = capacity["labor_status_raw"]
-    disp["Avg cycle (min)"] = capacity["avg_cycle"].round(1)
-    disp["Units / batt"] = capacity["units_or_batt"]
-    disp["Need / day"] = capacity["need_per_day"].round(2)
-    disp["Thru cap (safe)"] = capacity["thru_cap_safe"].round(2)
-    disp["Thru util (safe)"] = (capacity["thru_util_safe"] * 100).round(1).astype(str) + "%"
-    disp["Thru status (safe)"] = capacity["thru_status_safe"]
-    disp["Thru cap (raw)"] = capacity["thru_cap_raw"].round(2)
-    disp["Thru util (raw)"] = (capacity["thru_util_raw"] * 100).round(1).astype(str) + "%"
-    disp["Thru status (raw)"] = capacity["thru_status_raw"]
-    disp["Overall"] = capacity["overall_status"]
-
-    st.dataframe(disp, use_container_width=True, height=480)
-
-    # Utilisation chart
-    st.subheader("Utilization by station")
+    # =============================================================
+    # Utilization chart (most scannable)
+    # =============================================================
     chart_data = capacity.reset_index()
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=chart_data["station_display"],
         y=chart_data["labor_util_safe"] * 100,
-        name=f"Labor util @ safety {inputs['safety']:.2f}",
+        name="Labor utilization",
         marker_color="#5B9BD5",
+        text=[f"{v*100:.0f}%" for v in chart_data["labor_util_safe"]],
+        textposition="outside",
     ))
     fig.add_trace(go.Bar(
         x=chart_data["station_display"],
         y=chart_data["thru_util_safe"] * 100,
-        name=f"Throughput util @ safety {inputs['safety']:.2f}",
+        name="Throughput utilization",
         marker_color="#ED7D31",
     ))
     fig.add_hline(y=100, line_dash="dash", line_color="red", annotation_text="100% (over capacity)")
     fig.add_hline(y=90, line_dash="dot", line_color="orange", annotation_text="90% (near cap)")
-    fig.update_layout(barmode="group", height=420, yaxis_title="Utilization (%)")
+    fig.update_layout(
+        barmode="group", height=420,
+        yaxis_title="Utilization (%)",
+        margin=dict(t=20, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
     st.plotly_chart(fig, use_container_width=True)
+
+    # =============================================================
+    # Simple, executive-friendly table
+    # =============================================================
+    st.markdown("#### 📋 Station summary")
+    simple = pd.DataFrame(index=capacity.index)
+    simple["Status"] = capacity["overall_status"]
+    simple["People"] = capacity["HC"].astype(int)
+    simple["Need"] = capacity["required_hc"].astype(int)
+    simple["Gap"] = capacity["hc_gap"].astype(int)
+    simple["Labor used %"] = (capacity["labor_util_safe"] * 100).round(0).astype(int)
+    simple["Throughput used %"] = (capacity["thru_util_safe"] * 100).round(0).astype(int)
+    simple["Avg cycle (min)"] = capacity["avg_cycle"].round(1)
+
+    st.dataframe(
+        simple, use_container_width=True, height=480,
+        column_config={
+            "Status":  st.column_config.TextColumn("Status", help="Color-coded overall health: 🟢 OK · 🟡 Tight · 🟠 Near cap · 🔴 Over · ⚪ Not at this facility."),
+            "People":  st.column_config.NumberColumn("People", help="Headcount you have at this station."),
+            "Need":    st.column_config.NumberColumn("Need", help="People you'd need to comfortably meet the plan."),
+            "Gap":     st.column_config.NumberColumn("Gap", help="Need − People. Positive = short staffed."),
+            "Labor used %": st.column_config.NumberColumn(
+                "Labor used %",
+                help="How much of the available labor at this station is consumed by the plan. >100% means over capacity.",
+                format="%d%%",
+            ),
+            "Throughput used %": st.column_config.NumberColumn(
+                "Throughput used %",
+                help="How much of the line/cell time at this station is consumed. >100% means physical bottleneck.",
+                format="%d%%",
+            ),
+        },
+    )
+
+    # =============================================================
+    # Full detail — for engineers / planners who want all the numbers
+    # =============================================================
+    with st.expander("🔍 Show full detail (all columns)", expanded=False):
+        disp = pd.DataFrame(index=capacity.index)
+        disp["HC"] = capacity["HC"]
+        disp["Required HC"] = capacity["required_hc"]
+        disp["HC gap"] = capacity["hc_gap"]
+        disp["Stations/Cells"] = capacity["Conc"]
+        disp["Crew/unit"] = capacity["Crew"]
+        disp["Labor demand (p-min)"] = capacity["labor_demand"].astype(int)
+        disp["Labor capacity (with buffer)"] = capacity["labor_cap_safe"].astype(int)
+        disp["Labor util (with buffer)"] = (capacity["labor_util_safe"] * 100).round(1).astype(str) + "%"
+        disp["Labor status"] = capacity["labor_status_safe"]
+        disp["Labor capacity (raw)"] = capacity["labor_cap_raw"].astype(int)
+        disp["Labor util (raw)"] = (capacity["labor_util_raw"] * 100).round(1).astype(str) + "%"
+        disp["Avg cycle (min)"] = capacity["avg_cycle"].round(1)
+        disp["Units or batteries"] = capacity["units_or_batt"]
+        disp["Need / day"] = capacity["need_per_day"].round(2)
+        disp["Throughput cap (with buffer)"] = capacity["thru_cap_safe"].round(2)
+        disp["Throughput util (with buffer)"] = (capacity["thru_util_safe"] * 100).round(1).astype(str) + "%"
+        disp["Throughput status"] = capacity["thru_status_safe"]
+        disp["Throughput cap (raw)"] = capacity["thru_cap_raw"].round(2)
+        disp["Throughput util (raw)"] = (capacity["thru_util_raw"] * 100).round(1).astype(str) + "%"
+        disp["Overall"] = capacity["overall_status"]
+        st.dataframe(disp, use_container_width=True, height=480)
+        st.caption(
+            "**With buffer** = capacity multiplied by your safety + efficiency factors. "
+            "**Raw** = theoretical maximum, no buffers applied. "
+            "Battery row reports BATTERIES/day, not units/day."
+        )
 
 
 def tab_battery_throughput(batt_sku, batt_type, capacity, inputs):
-    st.header("🔋 Battery Throughput")
+    st.header("🔋 Battery demand & throughput")
+    st.markdown(
+        "**Can we build enough batteries to meet this plan?** "
+        "Batteries are usually the bottleneck — this tab shows demand vs daily capacity."
+    )
 
     total_batt = int(batt_sku["total_batteries"].sum())
     total_units = int(batt_sku["units"].sum())
     avg_per_unit = total_batt / total_units if total_units else 0
     daily_need = total_batt / inputs["days"] if inputs["days"] else 0
 
-    cap_safe = capacity.loc["Battery Assembly", "thru_cap_safe"]
-    cap_raw = capacity.loc["Battery Assembly", "thru_cap_raw"]
+    cap_safe = capacity.loc["Battery Assembly", "thru_cap_safe"] if "Battery Assembly" in capacity.index else 0
+    cap_raw = capacity.loc["Battery Assembly", "thru_cap_raw"] if "Battery Assembly" in capacity.index else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total batteries needed", f"{total_batt:,}")
-    c2.metric("Avg per unit", f"{avg_per_unit:.2f}")
-    c3.metric("Daily rate needed", f"{daily_need:.2f} / day")
-    c4.metric("Cap (safe)", f"{cap_safe:.1f} / day",
-              delta=f"{(daily_need - cap_safe):+.1f}",
-              delta_color="inverse")
+    c1.metric(
+        "Batteries to build", f"{total_batt:,}",
+        help="Total batteries needed across all units in this plan.",
+    )
+    c2.metric(
+        "Avg per unit", f"{avg_per_unit:.2f}",
+        help="Average batteries per BOSS unit (varies — BOSS25 = 1, BOSS220 = 3, BOSS400 = 5).",
+    )
+    c3.metric(
+        "Need / day", f"{daily_need:.2f}",
+        help=f"Daily build rate to finish in {inputs['days']} working days.",
+    )
+    c4.metric(
+        "Have / day (with buffer)", f"{cap_safe:.1f}",
+        delta=f"{(cap_safe - daily_need):+.1f} vs need",
+        delta_color="normal" if cap_safe >= daily_need else "inverse",
+        help="Daily capacity at the Battery Assembly cells, with your safety + efficiency buffers applied.",
+    )
+
+    if cap_safe < daily_need and cap_safe > 0:
+        st.error(
+            f"🚨 **Battery throughput is the bottleneck.** "
+            f"You need ~{daily_need:.1f}/day but can only do ~{cap_safe:.1f}/day. "
+            f"See **Recommendations** for fix options."
+        )
+    elif cap_safe == 0:
+        st.warning(
+            "⚠️ Battery Assembly is set to 0 cells/headcount for this facility. "
+            "If you need batteries here, configure the station in the sidebar."
+        )
 
     st.markdown("---")
-    st.subheader("Battery demand by SKU")
+    st.markdown("#### 📋 Battery demand by FG SKU")
     st.dataframe(batt_sku, use_container_width=True, height=360)
 
-    st.subheader("Battery demand by type")
+    st.markdown("#### 📊 Battery demand by type")
     cc1, cc2 = st.columns([2, 1])
     with cc1:
         fig = px.pie(batt_type, values="total_batteries", names="batt_type",
@@ -428,114 +684,157 @@ def tab_battery_throughput(batt_sku, batt_type, capacity, inputs):
         st.dataframe(batt_type, use_container_width=True)
 
     # Comparison view
-    st.subheader("Two ways to read battery throughput")
-    cmp = pd.DataFrame({
-        "Metric": ["Need", f"Cap @ {inputs['safety']:.2f}", "Cap @ 1.00",
-                   "Days needed @ safety", "Days needed @ 1.00"],
-        "Units / day view": [
-            f"{capacity.loc['Battery Assembly','units_or_batt']/inputs['days']:.2f} u/d",  # not quite — left as informational
-            f"{cap_safe:.2f}",
-            f"{cap_raw:.2f}",
-            f"{daily_need/cap_safe*inputs['days']:.1f}" if cap_safe else "∞",
-            f"{daily_need/cap_raw*inputs['days']:.1f}" if cap_raw else "∞",
-        ],
-        "Batteries / day view": [
-            f"{daily_need:.2f} batt/d",
-            f"{cap_safe:.2f} batt/d",
-            f"{cap_raw:.2f} batt/d",
-            f"{total_batt/cap_safe:.1f}" if cap_safe else "∞",
-            f"{total_batt/cap_raw:.1f}" if cap_raw else "∞",
-        ],
-    }).set_index("Metric")
-    st.dataframe(cmp, use_container_width=True)
+    # =============================================================
+    # Plain-English summary
+    # =============================================================
+    days_needed_safe = (total_batt / cap_safe) if cap_safe else float("inf")
+    days_needed_raw = (total_batt / cap_raw) if cap_raw else float("inf")
+
+    st.markdown("#### 📅 How many days to finish all batteries?")
+    summary = pd.DataFrame([
+        {
+            "Scenario": "Realistic (with buffer)",
+            "Capacity / day": f"{cap_safe:.1f} batt/day" if cap_safe else "—",
+            "Days needed": f"{days_needed_safe:.1f} days" if days_needed_safe != float("inf") else "—",
+            "Verdict": "✅ Fits" if (days_needed_safe <= inputs["days"]) else "❌ Over target",
+        },
+        {
+            "Scenario": "Best case (no buffer)",
+            "Capacity / day": f"{cap_raw:.1f} batt/day" if cap_raw else "—",
+            "Days needed": f"{days_needed_raw:.1f} days" if days_needed_raw != float("inf") else "—",
+            "Verdict": "✅ Fits" if (days_needed_raw <= inputs["days"]) else "❌ Over target",
+        },
+    ])
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.caption(
+        f"Your target window is **{inputs['days']} working days**. "
+        "The realistic scenario uses your safety + efficiency factors; "
+        "the best case assumes everything runs flawlessly."
+    )
 
 
 def tab_mitigation(capacity, batt_sku, units, inputs):
-    st.header("🔧 Mitigation")
-    st.caption("Fix options for over-capacity stations + idle HC available for rotation.")
+    st.header("🔧 Recommendations")
+    st.markdown(
+        "**Where to find slack and how to close gaps.** "
+        "Use this tab when one or more stations are tight, near, or over capacity."
+    )
 
-    # Idle HC table
-    st.subheader("Idle HC at other stations (rotation candidates)")
+    # Quick summary of where the issues are
+    over_stations = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
+    near_stations = capacity[capacity["overall_status"] == "🟠 NEAR-CAP"].index.tolist()
+    if over_stations:
+        st.error(f"🚨 Over capacity: **{', '.join(over_stations)}**. Address first.")
+    if near_stations:
+        st.warning(f"⚠️ Near capacity: **{', '.join(near_stations)}**. Monitor.")
+    if not over_stations and not near_stations:
+        st.success("✅ No stations are over or near capacity — no urgent action needed.")
+
+    st.markdown("---")
+    st.markdown("#### 👥 People you could move (rotation candidates)")
+    st.caption(
+        "Stations sorted from most idle to most loaded. The greener the row, the more "
+        "people are free to cross-train and help bottleneck stations."
+    )
 
     idle_rows = []
     for disp, row in capacity.iterrows():
         if row.get("station_missing", False):
-            # Station doesn't exist at this facility — skip from rotation candidates
             continue
         util = row["labor_util_safe"]
         idle_pct = max(0, 1 - util)
         idle_hc_eq = idle_pct * row["HC"]
         if util > 1:
-            tag = "🔴 OVER"
-            note = "Bottleneck — needs help"
+            tag = "🔴 Bottleneck"
+            note = "Needs help — add capacity here"
         elif idle_pct > 0.5:
-            tag = "✅ HIGH"
-            note = f"~{idle_hc_eq:.1f} HC equivalent free"
+            tag = "✅ Lots of slack"
+            note = f"~{idle_hc_eq:.1f} people equivalent free"
         elif idle_pct > 0.3:
-            tag = "🟡 MEDIUM"
-            note = f"{idle_pct*100:.0f}% idle"
+            tag = "🟡 Some slack"
+            note = f"{idle_pct*100:.0f}% of capacity is idle"
         else:
-            tag = "🔴 LOW"
-            note = "Already busy"
+            tag = "🟠 Busy"
+            note = "Limited rotation potential"
         idle_rows.append({
             "Station": disp,
-            "HC": row["HC"],
-            "Util (safe)": f"{util*100:.1f}%",
-            "Idle %": f"{idle_pct*100:.1f}%",
+            "People": int(row["HC"]),
+            "Used %": int(round(util * 100)),
+            "Idle %": int(round(idle_pct * 100)),
             "Rotation potential": tag,
             "Notes": note,
+            "_sort": idle_pct,
         })
-    st.dataframe(pd.DataFrame(idle_rows), use_container_width=True, height=480)
+    idle_df = pd.DataFrame(idle_rows).sort_values("_sort", ascending=False).drop(columns="_sort")
+    st.dataframe(
+        idle_df, use_container_width=True, height=420, hide_index=True,
+        column_config={
+            "Used %": st.column_config.NumberColumn("Used %", format="%d%%"),
+            "Idle %": st.column_config.NumberColumn("Idle %", format="%d%%"),
+        },
+    )
 
-    # Option list
-    st.subheader("Mitigation options for Battery Assembly")
-    options = [
+    # =============================================================
+    # Fix playbook — scenario-aware (works for any bottleneck)
+    # =============================================================
+    st.markdown("---")
+    st.markdown("#### 🛠️ Standard fix options")
+    st.caption(
+        "Each option closes a capacity gap differently. Pick the right one based on "
+        "whether you need a permanent vs. temporary fix and how much capex you can spend."
+    )
+
+    bottleneck = (over_stations[0] if over_stations
+                  else (near_stations[0] if near_stations else "the bottleneck station"))
+
+    playbook = pd.DataFrame([
         {
             "#": 1,
-            "Option": "Add 5th Battery cell + 2 ppl",
-            "Mechanism": "5 cells × 2.82 batt/day = 14.1 batt/day raw → 12.0 with safety",
-            "Impact": "+25% capacity (covers demand)",
-            "Cost": "Space, training, $",
-            "Recommendation": "🟢 BEST long-term — permanent fix",
+            "Option": f"Cross-train and rotate people to {bottleneck}",
+            "What it does": "Move people from idle stations to where they're needed.",
+            "Effort": "Low — uses the rotation table above",
+            "Speed": "Days",
+            "When to use": "🟢 Best first move — no capex, immediate",
         },
         {
             "#": 2,
-            "Option": "Defer BOSS400HS-002 (×10) to June",
-            "Mechanism": f"Removes 50 batteries (≈21% of demand)",
-            "Impact": "Brings util down to ~85% @ 0.85",
-            "Cost": "Customer lead time impact",
-            "Recommendation": "🟢 STRONG — immediate, no capex",
+            "Option": "Defer some units to next period",
+            "What it does": "Pull the lowest-priority units out of this schedule.",
+            "Effort": "Low — schedule change only",
+            "Speed": "Immediate",
+            "When to use": "🟢 When customer lead time can absorb it",
         },
         {
             "#": 3,
-            "Option": "4 hrs OT/day on Battery (5 days/week)",
-            "Mechanism": "8 HC × 4 hr × 20d = 640 OT hrs",
-            "Impact": "+49% labor cap",
-            "Cost": "OT premium",
-            "Recommendation": "🟡 GOOD — temporary",
+            "Option": "Overtime at the bottleneck",
+            "What it does": f"Extra hours per day on {bottleneck}.",
+            "Effort": "Low — staffing-only change",
+            "Speed": "Days",
+            "When to use": "🟡 Temporary fix; budget for OT premium",
         },
         {
             "#": 4,
-            "Option": "Run 1 Saturday/week (4 extra days)",
-            "Mechanism": "20→24 working days = +20% capacity",
-            "Impact": "Closes most of the gap",
-            "Cost": "Saturday premium",
-            "Recommendation": "🟡 OK — temporary",
+            "Option": "Add Saturday shifts",
+            "What it does": "Extra working days in the month.",
+            "Effort": "Medium — touches whole line",
+            "Speed": "Weeks",
+            "When to use": "🟡 When OT isn't enough; weekend premium",
         },
         {
             "#": 5,
-            "Option": "Rotate 1-2 ppl from Gen Acc / QC to Battery",
-            "Mechanism": "Cross-train idle HC to Battery duty",
-            "Impact": "+12-25% Battery cap",
-            "Cost": "Cross-training time",
-            "Recommendation": "🟡 GOOD — see idle HC table above",
+            "Option": "Hire / add a cell at the bottleneck",
+            "What it does": "Permanent capacity increase.",
+            "Effort": "High — hiring, training, possibly capex",
+            "Speed": "Months",
+            "When to use": "🟢 If demand is sustained beyond this period",
         },
-    ]
-    st.dataframe(pd.DataFrame(options).set_index("#"), use_container_width=True, height=320)
+    ]).set_index("#")
+    st.dataframe(playbook, use_container_width=True, height=260)
 
     st.info(
-        "**Recommended path:** Combine Option 2 (defer BOSS400HS-002) + Option 5 (rotate 1-2 from Gen Acc). "
-        "This solves May without capex. For June+, plan Option 1 (5th cell)."
+        "**Tip for planners:** Combine a short-term move (rotation or overtime) "
+        "with a structural decision (hiring or scheduling change) so you handle "
+        "this month *and* set up the next one for success."
     )
 
 
@@ -1004,7 +1303,11 @@ def tab_source_data(machine_df, acc_df, schedule_df):
 # Main
 # =============================================================
 def main():
-    st.title("🏭 Labor Capacity Tool")
+    st.title("🏭 Labor Capacity Planner")
+    st.caption(
+        "Plan production capacity across facilities. "
+        "Set up your scenario in the sidebar, then review the tabs below."
+    )
 
     inputs = render_sidebar()
 
@@ -1012,17 +1315,17 @@ def main():
     machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
     acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"))
 
-    if inputs.get("schedule_mode") == "✏️ Manual entry":
+    if inputs.get("schedule_mode") == "✏️ Type a few SKUs":
         manual_entries = inputs.get("manual_entries")
         if manual_entries is None or manual_entries.empty:
-            st.info("✏️ Manual entry mode — fill in FG SKU and Qty in the sidebar to begin.")
+            st.info("✏️ **Manual entry mode** — fill in FG SKU and Quantity in the sidebar to begin.")
             return
         machine_skus = set(machine_df["SKU"])
         schedule_df = build_manual_schedule(
             manual_entries, location=inputs["location"], machine_skus=machine_skus,
         )
         if schedule_df.empty:
-            st.info("✏️ Manual entry mode — fill in at least one row (FG SKU + Qty > 0) in the sidebar.")
+            st.info("✏️ **Manual entry mode** — please fill in at least one row (FG SKU + Quantity > 0) in the sidebar.")
             return
     else:
         schedule_df = _load_schedule_df(inputs["uploaded"], location=inputs["location"])
@@ -1050,15 +1353,15 @@ def main():
     current_months = schedule_df.loc[~schedule_df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
     schedule_month = current_months[0] if current_months else ""
 
-    # Tabs (Battery Allocation removed)
+    # Tabs — ordered from executive summary → planner detail → admin
     tabs = st.tabs([
         "🏠 Overview",
-        "📊 Capacity vs Demand",
-        "🔋 Battery Throughput",
-        "🔧 Mitigation",
-        "✅ Floor Verification",
-        "⏱ Cycle Time",
-        "🔍 Data Validation",
+        "📊 Capacity",
+        "🔋 Batteries",
+        "🔧 Recommendations",
+        "⏱ Build Time",
+        "✅ Update Labor",
+        "🔍 Data Quality",
         "📁 Source Data",
     ])
 
@@ -1071,9 +1374,9 @@ def main():
     with tabs[3]:
         tab_mitigation(capacity, batt_sku, units, inputs)
     with tabs[4]:
-        tab_floor_verification(machine_df, acc_df, schedule_df)
-    with tabs[5]:
         tab_cycle_time(units, inputs)
+    with tabs[5]:
+        tab_floor_verification(machine_df, acc_df, schedule_df)
     with tabs[6]:
         tab_data_validation(machine_df, acc_df)
     with tabs[7]:

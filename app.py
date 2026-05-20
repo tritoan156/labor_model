@@ -1863,6 +1863,12 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
             "Show only SKUs used in current schedule", value=False, key="m_only_used"
         )
         m_disp = machine_df.copy()
+        # Per-machine total labor across the assembly stations.
+        # Bat is a COUNT (not labor) so it's excluded from the sum.
+        machine_labor_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy_old",
+                              "PDI", "QC", "Ship"]
+        present_cols = [c for c in machine_labor_cols if c in m_disp.columns]
+        m_disp["Total labor (p-min)"] = m_disp[present_cols].fillna(0).sum(axis=1).astype(int)
         m_disp.insert(0, "Used (qty)", m_disp.index.map(lambda s: used_fg.get(s, 0)))
         m_disp.insert(1, "In schedule", m_disp["Used (qty)"] > 0)
         if only_used:
@@ -1879,7 +1885,12 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
             m_disp.style.apply(_highlight_machine, axis=1),
             use_container_width=True, height=600,
         )
-        st.caption(f"🟡 highlighted = used in current schedule ({sum(m_disp['In schedule'])} of {len(m_disp)} shown)")
+        st.caption(
+            f"🟡 highlighted = used in current schedule "
+            f"({sum(m_disp['In schedule'])} of {len(m_disp)} shown). "
+            "**Total labor** = sum of Warehouse + Wire + Trailer + Final + PDI + QC + Ship "
+            "(person-minutes per unit, excluding accessory + battery labor)."
+        )
     else:  # Accessory catalog
         only_used = st.checkbox(
             "Show only SKUs used in current schedule", value=False, key="a_only_used"

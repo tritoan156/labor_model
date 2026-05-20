@@ -18,7 +18,7 @@ import streamlit as st
 from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
     load_accessory_items, load_item_master, load_item_packages,
-    load_item_variants, resolve_item_time,
+    resolve_item_time, unique_abbrs,
 )
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
@@ -103,9 +103,6 @@ def _load_item_packages_df(_mtime: float):
     return load_item_packages()
 
 
-@st.cache_data(show_spinner=False)
-def _load_item_variants_df(_mtime: float):
-    return load_item_variants()
 
 
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
@@ -1266,15 +1263,25 @@ def _tokenize_description(description: str) -> set:
 
 
 def _detect_items_in_description(description: str, item_master_df) -> list:
-    """Items from item master whose Abbr appears as a whole token in the description."""
+    """Unique items from the master whose Abbr appears as a whole token in the description.
+
+    The master may have multiple rows per Abbr (one default + variants). We
+    dedupe so each item appears only once in the detected list.
+    """
     if item_master_df is None or item_master_df.empty:
         return []
     tokens = _tokenize_description(description)
-    return [
-        str(a).strip()
-        for a in item_master_df["Abbr"]
-        if str(a).strip() and str(a).strip().upper() in tokens
-    ]
+    out = []
+    seen = set()
+    for a in item_master_df["Abbr"]:
+        s = str(a).strip()
+        if not s:
+            continue
+        u = s.upper()
+        if u in tokens and u not in seen:
+            seen.add(u)
+            out.append(s)
+    return out
 
 
 def _detect_packages_in_description(description: str, packages_df) -> list:
@@ -1363,23 +1370,22 @@ def _accessory_family_hint(sku: str) -> str:
     return re.split(r"-A", s)[0]
 
 
-def _render_reconciliation_view(acc_df, item_master_df, item_packages_df,
-                                 item_variants_df, used_acc):
-    """Reconciliation & Apply — packages expanded, variants honored, PM included.
+def _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_acc):
+    """Reconciliation & Apply — packages expanded, family variants honored, PM included.
 
     For each accessory:
       1. Detect item abbrevs + package codes in the description
       2. Expand packages -> components, dedupe with standalone items
-      3. For each side this accessory feeds, resolve each item's time via variants
-         then master, sum, and compare against the aggregate in acc_clean.csv
-      4. Let the user select rows to push back into acc_clean.csv (one button =
-         one commit covering all selected SKUs).
+      3. For each side this accessory feeds, resolve each item's time from the
+         unified item master (variant rows override the default row), sum, and
+         compare against the aggregate in acc_clean.csv
+      4. Let the user select rows to push back into acc_clean.csv.
     """
     st.subheader("🔬 Reconciliation & Apply")
     st.markdown(
-        "**Cross-check the catalog aggregate against the item master + packages + variants.**  \n"
+        "**Cross-check the catalog aggregate against the item master + packages.**  \n"
         "Packages auto-expand into their components (no double-counting). "
-        "Family-specific time variants override the master defaults. "
+        "Family-specific time variants in the item master override the default row. "
         "When the math looks right, tick rows in the **Apply** column and click "
         "**Apply selected updates** to write the new value back to `acc_clean.csv`."
     )
@@ -1427,7 +1433,7 @@ def _render_reconciliation_view(acc_df, item_master_df, item_packages_df,
 
             item_times = []
             for abbr in expanded:
-                t = resolve_item_time(abbr, family_hint, side, item_master_df, item_variants_df)
+                t = resolve_item_time(abbr, family_hint, side, item_master_df)
                 if t > 0:
                     item_times.append((abbr, t))
             items_sum = sum(t for _, t in item_times)
@@ -1499,7 +1505,7 @@ def _render_reconciliation_view(acc_df, item_master_df, item_packages_df,
             ),
             "Sum of items": st.column_config.NumberColumn(
                 "Sum of items", disabled=True,
-                help="Sum of resolved item times (variants > master), with packages expanded.",
+                help="Sum of item times resolved from the master (family variant wins over default), with packages expanded.",
             ),
             "Difference": st.column_config.NumberColumn("Difference", disabled=True),
             "Status": st.column_config.TextColumn("Status", disabled=True),
@@ -1587,13 +1593,23 @@ def _render_item_master_view(item_master_df):
         "click Save to persist."
     )
     st.caption(
-        "Some items vary by FG family (e.g. `RHK`, `SL`, `LF`, `TB`) — those "
-        "live in the **Item variants** view. The simple times here are the typical "
-        "case used when no variant matches."
+        "**Default rows** have a blank `FG family`. **Variant rows** specify a "
+        "family prefix (e.g. `SDG13`, `PDS185EZ`) and override the default for "
+        "any accessory whose family starts with that value. Longest matching "
+        "prefix wins (so `SDG125` beats `SDG`)."
     )
 
+    # Normalize dtypes so st.data_editor's type checker doesn't complain
+    seed = item_master_df.copy()
+    for c in ("Abbr", "Description", "FG family", "Notes"):
+        if c in seed.columns:
+            seed[c] = seed[c].astype(str).replace({"nan": "", "None": ""})
+    for c in ("Time on Compressor (min)", "Time on Generator (min)", "Time on PM (min)"):
+        if c in seed.columns:
+            seed[c] = pd.to_numeric(seed[c], errors="coerce").fillna(0).astype(float)
+
     edited = st.data_editor(
-        item_master_df,
+        seed,
         use_container_width=True,
         num_rows="dynamic",
         key="item_master_editor",
@@ -1604,6 +1620,12 @@ def _render_item_master_view(item_master_df):
                 width="small",
             ),
             "Description": st.column_config.TextColumn("Description", width="large"),
+            "FG family": st.column_config.TextColumn(
+                "FG family",
+                help="Leave blank for the default row. Set to a prefix like "
+                     "SDG13 or PDS185EZ to make this row a variant.",
+                width="small",
+            ),
             "Time on Compressor (min)": st.column_config.NumberColumn(
                 "Compressor min", min_value=0, step=1,
                 help="Install time on a Compressor product (PDS series).",
@@ -1623,72 +1645,6 @@ def _render_item_master_view(item_master_df):
 
     if st.button("💾 Save item master to GitHub", use_container_width=True):
         _save_simple_csv(edited, "data/item_master.csv", "item master")
-
-
-def _render_item_variants_view(variants_df, item_master_df):
-    """Family-specific overrides for items like RHK, SL, LF, TB."""
-    st.subheader("🎚️ Item variants (family-specific times)")
-    st.markdown(
-        "**Family-specific time overrides.** Some items take different time "
-        "depending on which product family they're installed on. Each row says: "
-        "*item X, when installed on a unit whose family starts with Y, takes Z minutes "
-        "on side S.* Variants take precedence over the master default."
-    )
-    st.caption(
-        "**FG family** matches via prefix — `SDG13` matches `SDG13`, `SDG13S-U`, `SDG13-001`. "
-        "**Side** is one of `Compressor`, `Generator`, or `PM`."
-    )
-
-    # Warn if a variant references an unknown item
-    if not variants_df.empty and not item_master_df.empty:
-        known = {str(a).strip().upper() for a in item_master_df["Abbr"]}
-        unknown = sorted({
-            str(it).strip()
-            for it in variants_df["Item"]
-            if str(it).strip().upper() not in known
-        })
-        if unknown:
-            st.warning(f"⚠️ Variants reference unknown items not in the master: {', '.join(unknown)}")
-
-    # Normalize column dtypes so st.data_editor's type checker is happy:
-    # cast text columns to plain strings (no NaN), Time (min) to float.
-    seed = variants_df.copy()
-    for c in ("Item", "FG family", "Side", "Notes"):
-        if c in seed.columns:
-            seed[c] = seed[c].astype(str).replace({"nan": "", "None": ""})
-    if "Time (min)" in seed.columns:
-        seed["Time (min)"] = pd.to_numeric(seed["Time (min)"], errors="coerce").fillna(0).astype(float)
-
-    edited = st.data_editor(
-        seed,
-        use_container_width=True,
-        num_rows="dynamic",
-        key="item_variants_editor",
-        height=440,
-        column_config={
-            "Item": st.column_config.TextColumn(
-                "Item", help="Abbreviation from the Item master (e.g. RHK, SL).",
-                width="small",
-            ),
-            "FG family": st.column_config.TextColumn(
-                "FG family",
-                help="Prefix to match the FG family (e.g. SDG13, PDS185EZ, BOSS25).",
-            ),
-            "Side": st.column_config.TextColumn(
-                "Side",
-                help="Which station the time rolls up to: Compressor, Generator, or PM.",
-                width="small",
-            ),
-            "Time (min)": st.column_config.NumberColumn(
-                "Time (min)", min_value=0, step=1,
-                help="Install time for this item on this family at this side.",
-            ),
-            "Notes": st.column_config.TextColumn("Notes"),
-        },
-    )
-
-    if st.button("💾 Save item variants to GitHub", use_container_width=True):
-        _save_simple_csv(edited, "data/item_variants.csv", "item variants")
 
 
 def _render_item_packages_view(packages_df, item_master_df):
@@ -1712,8 +1668,16 @@ def _render_item_packages_view(packages_df, item_master_df):
         if problems:
             st.warning("⚠️ " + " · ".join(problems))
 
+    # Normalize column dtypes so the editor's type checker is happy
+    seed = packages_df.copy()
+    for c in ("Package", "Description", "Components", "Notes"):
+        if c in seed.columns:
+            seed[c] = seed[c].astype(str).replace({"nan": "", "None": ""})
+    if "Total Time (min)" in seed.columns:
+        seed["Total Time (min)"] = pd.to_numeric(seed["Total Time (min)"], errors="coerce").fillna(0).astype(float)
+
     edited = st.data_editor(
-        packages_df,
+        seed,
         use_container_width=True,
         num_rows="dynamic",
         key="item_packages_editor",
@@ -1852,7 +1816,7 @@ def _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df):
 
 
 def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
-                     item_master_df, item_packages_df, item_variants_df):
+                     item_master_df, item_packages_df):
     st.header("📁 Source Data")
     st.caption(
         "Raw inputs to the model. SKUs used in the current schedule/manual entry "
@@ -1872,7 +1836,6 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
             "Machine catalog",
             "Accessory catalog",
             "Item master",
-            "Item variants",
             "Item packages",
             "Reconciliation & Apply",
             "Accessory item details",
@@ -1883,15 +1846,11 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
     if sub == "Item master":
         _render_item_master_view(item_master_df)
         return
-    if sub == "Item variants":
-        _render_item_variants_view(item_variants_df, item_master_df)
-        return
     if sub == "Item packages":
         _render_item_packages_view(item_packages_df, item_master_df)
         return
     if sub == "Reconciliation & Apply":
-        _render_reconciliation_view(acc_df, item_master_df, item_packages_df,
-                                    item_variants_df, used_acc)
+        _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_acc)
         return
     if sub == "Accessory item details":
         _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df)
@@ -1965,7 +1924,6 @@ def main():
     acc_items_df = _load_accessory_items_df(_csv_mtime("accessory_items.csv"))
     item_master_df = _load_item_master_df(_csv_mtime("item_master.csv"))
     item_packages_df = _load_item_packages_df(_csv_mtime("item_packages.csv"))
-    item_variants_df = _load_item_variants_df(_csv_mtime("item_variants.csv"))
 
     if inputs.get("schedule_mode") == "✏️ Type a few SKUs":
         manual_entries = inputs.get("manual_entries")
@@ -2033,7 +1991,7 @@ def main():
         tab_data_validation(machine_df, acc_df)
     with tabs[7]:
         tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
-                         item_master_df, item_packages_df, item_variants_df)
+                         item_master_df, item_packages_df)
 
 
 if __name__ == "__main__":

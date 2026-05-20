@@ -4,11 +4,10 @@ Reads CSV inputs and returns clean DataFrames:
   - load_machine_labor()    → machine SKU labor table
   - load_acc_labor()        → accessory SKU labor table
   - load_schedule()         → work order schedule (auto-detects month, any location)
-  - load_item_master()      → reference items with per-side install times
-  - load_item_variants()    → family-specific time overrides for items
+  - load_item_master()      → reference items + family variants in one table
   - load_item_packages()    → bundled packages (e.g. CWP, AWP)
   - load_accessory_items()  → per-SKU item composition (analytical)
-  - resolve_item_time()     → variant-aware lookup for one (item, family, side)
+  - resolve_item_time()     → family-aware lookup for one (item, family, side)
 """
 from __future__ import annotations
 
@@ -102,16 +101,20 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
 
 
 ITEM_MASTER_COLUMNS = [
-    "Abbr", "Description",
+    "Abbr", "Description", "FG family",
     "Time on Compressor (min)", "Time on Generator (min)", "Time on PM (min)",
     "Notes",
 ]
 
 
 def load_item_master(path: Path | str | None = None) -> pd.DataFrame:
-    """Load the reference table of installable items (abbreviations + times).
+    """Load the unified item master (defaults + family-specific variants).
 
-    Returns columns: Abbr, Description, Time on Compressor (min),
+    Each row is identified by (Abbr, FG family). A blank FG family means the
+    row is the default for that item; a non-blank FG family is a variant that
+    overrides the default when the accessory's FG family starts with that value.
+
+    Columns: Abbr, Description, FG family, Time on Compressor (min),
     Time on Generator (min), Time on PM (min), Notes.
     """
     if path is None:
@@ -123,7 +126,7 @@ def load_item_master(path: Path | str | None = None) -> pd.DataFrame:
     except pd.errors.EmptyDataError:
         return pd.DataFrame(columns=ITEM_MASTER_COLUMNS)
     for c in df.select_dtypes(include="object").columns:
-        df[c] = df[c].astype(str).str.strip()
+        df[c] = df[c].astype(str).str.strip().replace({"nan": "", "None": ""})
     # Backfill columns that may be missing from older CSV versions
     for c in ITEM_MASTER_COLUMNS:
         if c not in df.columns:
@@ -133,82 +136,77 @@ def load_item_master(path: Path | str | None = None) -> pd.DataFrame:
     return df[ITEM_MASTER_COLUMNS].reset_index(drop=True)
 
 
-def load_item_variants(path: Path | str | None = None) -> pd.DataFrame:
-    """Load the family-specific time overrides for items.
-
-    Columns: Item, FG family, Side, Time (min), Notes.
-    Side is one of "Compressor", "Generator", "PM".
-    FG family is matched via startswith — "SDG13" matches "SDG13-001", "SDG13S-U".
-    """
-    cols = ["Item", "FG family", "Side", "Time (min)", "Notes"]
-    if path is None:
-        path = DATA_DIR / "item_variants.csv"
-    if not Path(path).exists():
-        return pd.DataFrame(columns=cols)
-    try:
-        df = pd.read_csv(path)
-    except pd.errors.EmptyDataError:
-        return pd.DataFrame(columns=cols)
-    for c in df.select_dtypes(include="object").columns:
-        df[c] = df[c].astype(str).str.strip()
-    for c in cols:
-        if c not in df.columns:
-            df[c] = 0 if c == "Time (min)" else ""
-    df["Time (min)"] = pd.to_numeric(df["Time (min)"], errors="coerce").fillna(0)
-    df = df[df["Item"].notna() & (df["Item"] != "")]
-    return df[cols].reset_index(drop=True)
-
-
 def resolve_item_time(abbr: str, family: str, side: str,
-                       master_df: pd.DataFrame, variants_df: pd.DataFrame) -> float:
+                       master_df: pd.DataFrame) -> float:
     """Return the install time for one item on one accessory.
 
-    Lookup precedence:
-      1. Variants table — match (Item == abbr) AND (family starts with FG family) AND (Side == side)
-      2. Item master — `Time on <side> (min)` column for the row with Abbr == abbr
+    Lookup precedence within the single master table:
+      1. Variant rows: same Abbr, non-empty FG family that is a prefix of `family`
+         (longest matching prefix wins, so SDG125 beats SDG when both are present)
+      2. Default row: same Abbr, empty FG family
 
-    Both lookups are case-insensitive on Abbr / Item / Side.
+    All matches are case-insensitive on Abbr and FG family.
+    `side` is one of "Compressor", "Generator", "PM" (case-insensitive).
     Returns 0.0 if nothing matches.
     """
-    if not abbr:
+    if not abbr or master_df is None or master_df.empty:
         return 0.0
     abbr_norm = str(abbr).strip().upper()
     family_norm = str(family or "").strip().upper()
     side_norm = str(side or "").strip().capitalize()
 
-    # 1) Variants override
-    if variants_df is not None and not variants_df.empty:
-        v = variants_df.copy()
-        v["__item"] = v["Item"].astype(str).str.strip().str.upper()
-        v["__side"] = v["Side"].astype(str).str.strip().str.capitalize()
-        v["__family"] = v["FG family"].astype(str).str.strip().str.upper()
-        candidates = v[(v["__item"] == abbr_norm) & (v["__side"] == side_norm)]
-        for _, row in candidates.iterrows():
-            fam = row["__family"]
-            if fam and family_norm.startswith(fam):
-                try:
-                    return float(row["Time (min)"])
-                except (TypeError, ValueError):
-                    return 0.0
-
-    # 2) Master default
     col_map = {
         "Compressor": "Time on Compressor (min)",
         "Generator": "Time on Generator (min)",
         "Pm": "Time on PM (min)",
     }
     col = col_map.get(side_norm)
-    if col is None or master_df is None or master_df.empty:
+    if col is None or col not in master_df.columns:
         return 0.0
+
     m = master_df.copy()
     m["__abbr"] = m["Abbr"].astype(str).str.strip().str.upper()
-    match = m[m["__abbr"] == abbr_norm]
-    if match.empty:
+    m["__family"] = m["FG family"].astype(str).str.strip().str.upper()
+    m_abbr = m[m["__abbr"] == abbr_norm]
+    if m_abbr.empty:
+        return 0.0
+
+    # 1) Best (longest-prefix) variant match
+    best_prefix_len = -1
+    best_value = None
+    for _, row in m_abbr.iterrows():
+        fam = row["__family"]
+        if fam and family_norm.startswith(fam) and len(fam) > best_prefix_len:
+            best_prefix_len = len(fam)
+            try:
+                best_value = float(row[col])
+            except (TypeError, ValueError):
+                best_value = None
+    if best_value is not None:
+        return best_value
+
+    # 2) Default row (FG family blank)
+    defaults = m_abbr[m_abbr["__family"] == ""]
+    if defaults.empty:
         return 0.0
     try:
-        return float(match.iloc[0][col])
+        return float(defaults.iloc[0][col])
     except (KeyError, TypeError, ValueError):
         return 0.0
+
+
+def unique_abbrs(master_df: pd.DataFrame) -> list:
+    """Return the unique item abbreviations in the master, preserving first-seen order."""
+    if master_df is None or master_df.empty or "Abbr" not in master_df.columns:
+        return []
+    seen = []
+    seen_set = set()
+    for a in master_df["Abbr"]:
+        s = str(a).strip()
+        if s and s.upper() not in seen_set:
+            seen_set.add(s.upper())
+            seen.append(s)
+    return seen
 
 
 def load_item_packages(path: Path | str | None = None) -> pd.DataFrame:

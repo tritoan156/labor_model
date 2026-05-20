@@ -134,117 +134,217 @@ def _render_sku_browser(machine_df, acc_df, location: str, seed_key: str, rev_ke
         lambda r: _machine_class(r["SKU"], r.get("Description", "")), axis=1,
     )
 
-    with st.sidebar.expander("📚 Browse catalog & add SKU", expanded=False):
-        # --- Family selector -------------------------------------------------
-        family_counts = work["__family"].value_counts()
-        # Show only families that actually have rows; order by KNOWN_FAMILIES
-        ordered_families = [f for f in KNOWN_FAMILIES if f in family_counts.index]
-        if "OTHER" in family_counts.index:
-            ordered_families.append("OTHER")
-        family_labels = [f"{f} ({family_counts[f]})" for f in ordered_families]
-        family_choice = st.selectbox(
-            "Family",
-            options=ordered_families,
-            format_func=lambda f: f"{f} ({family_counts.get(f, 0)})",
-            key=f"browse_family_{location}",
-        )
+    # Helpers used by both directions
+    def _fg_label_for_row(row):
+        bat = int(row.get("Bat", 0) or 0)
+        cls = row.get("__class", "")
+        bat_part = f" · {bat} batt" if bat > 0 else ""
+        placeholder = " ⚠" if cls == "⚠ Placeholder" else ""
+        return f"{row['SKU']} — {cls}{bat_part}{placeholder}"
 
-        # --- Class selector --------------------------------------------------
-        in_family = work[work["__family"] == family_choice]
-        class_counts = in_family["__class"].value_counts()
-        # Stable class order
-        class_order_pref = ["Standard Trailer", "Hybrid", "Power Module",
-                            "Head Trailer", "Standard", "⚠ Placeholder"]
-        ordered_classes = [c for c in class_order_pref if c in class_counts.index]
-        # Append any unexpected class types at the end
-        for c in class_counts.index:
-            if c not in ordered_classes:
-                ordered_classes.append(c)
-        class_choices = ["All classes"] + ordered_classes
-        class_choice = st.selectbox(
-            "Class",
-            options=class_choices,
-            key=f"browse_class_{location}",
-        )
+    def _acc_label(sku: str) -> str:
+        if sku == "(none)":
+            return "(no accessory)"
+        placeholder = " ⚠ family placeholder" if "999" in sku or "XXX" in sku.upper() else ""
+        return f"{sku}{placeholder}"
 
-        # --- FG SKU selector -------------------------------------------------
-        if class_choice == "All classes":
-            sku_rows = in_family
+    def _commit_add(fg_choice: str, acc_choice: str, qty: int) -> None:
+        """Append the chosen row to the manual entries DataFrame and bump the rev."""
+        editor_key = f"manual_entries_{location}_v{st.session_state.get(rev_key, 0)}"
+        latest = st.session_state.get(editor_key)
+        if isinstance(latest, pd.DataFrame):
+            current = latest.copy()
         else:
-            sku_rows = in_family[in_family["__class"] == class_choice]
-        sku_rows = sku_rows.sort_values(by="SKU")
-        sku_options = sku_rows["SKU"].astype(str).tolist()
-
-        if not sku_options:
-            st.info("No SKUs match this family + class combination.")
-            return
-
-        def _fg_label(sku):
-            row = sku_rows[sku_rows["SKU"] == sku].iloc[0]
-            bat = int(row.get("Bat", 0) or 0)
-            cls = row["__class"]
-            bat_part = f" · {bat} batt" if bat > 0 else ""
-            placeholder = " ⚠" if cls == "⚠ Placeholder" else ""
-            return f"{sku} — {cls}{bat_part}{placeholder}"
-
-        fg_choice = st.selectbox(
-            "FG SKU",
-            options=sku_options,
-            format_func=_fg_label,
-            key=f"browse_fg_{location}",
-        )
-
-        # --- Accessory selector (matching FG family) -------------------------
-        acc_options = ["(none)"]
-        if acc_df is not None and not acc_df.empty:
-            acc_work = acc_df.reset_index(drop=True).copy()
-            acc_skus = acc_work["SKU"].astype(str)
-            # Match accessories whose family hint == chosen family
-            acc_mask = acc_skus.apply(_accessory_family_hint).str.upper() == family_choice.upper()
-            acc_subset = acc_work[acc_mask].copy()
-            acc_subset = acc_subset.sort_values(by="SKU")
-            acc_options.extend(acc_subset["SKU"].astype(str).tolist())
-
-        def _acc_label(sku):
-            if sku == "(none)":
-                return "(no accessory)"
-            placeholder = " ⚠ family placeholder" if "999" in sku or "XXX" in sku.upper() else ""
-            return f"{sku}{placeholder}"
-
-        acc_choice = st.selectbox(
-            "Accessory",
-            options=acc_options,
-            format_func=_acc_label,
-            key=f"browse_acc_{location}",
-        )
-
-        # --- Quantity + Add --------------------------------------------------
-        qty = st.number_input(
-            "Qty",
-            min_value=1, max_value=999, value=1, step=1,
-            key=f"browse_qty_{location}",
-        )
-
-        if st.button("➕ Add to manual entries", use_container_width=True,
-                     key=f"browse_add_{location}"):
-            # Merge in-flight data_editor edits, append the new row, bump rev
-            editor_key = f"manual_entries_{location}_v{st.session_state.get(rev_key, 0)}"
-            latest = st.session_state.get(editor_key)
-            if isinstance(latest, pd.DataFrame):
-                current = latest.copy()
-            else:
-                current = st.session_state.get(seed_key, pd.DataFrame(columns=["FG SKU", "Accessory SKU", "Qty"])).copy()
-
-            new_row = {
+            current = st.session_state.get(
+                seed_key, pd.DataFrame(columns=["FG SKU", "Accessory SKU", "Qty"]),
+            ).copy()
+        current = pd.concat(
+            [current, pd.DataFrame([{
                 "FG SKU": fg_choice,
                 "Accessory SKU": "" if acc_choice == "(none)" else acc_choice,
                 "Qty": int(qty),
-            }
-            current = pd.concat([current, pd.DataFrame([new_row])], ignore_index=True)
-            st.session_state[seed_key] = current
-            st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
-            st.success(f"Added {fg_choice} × {int(qty)} to manual entries.")
-            st.rerun()
+            }])],
+            ignore_index=True,
+        )
+        st.session_state[seed_key] = current
+        st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
+        st.success(f"Added {fg_choice} × {int(qty)} to manual entries.")
+        st.rerun()
+
+    with st.sidebar.expander("📚 Browse catalog & add SKU", expanded=False):
+        direction = st.radio(
+            "Start from",
+            options=["FG SKU first", "Accessory SKU first"],
+            horizontal=True,
+            help=(
+                "**FG SKU first** — pick a finished good, then match accessory.  \n"
+                "**Accessory SKU first** — pick an accessory, then match a finished good."
+            ),
+            key=f"browse_direction_{location}",
+        )
+
+        if direction == "FG SKU first":
+            _render_fg_first(work, acc_df, location, _fg_label_for_row, _acc_label, _commit_add)
+        else:
+            _render_acc_first(work, acc_df, location, _fg_label_for_row, _acc_label, _commit_add)
+
+
+def _render_fg_first(work, acc_df, location, fg_label_for_row, acc_label, commit_add):
+    """FG-first browse flow: Family → Class → FG SKU → Accessory → Qty."""
+    family_counts = work["__family"].value_counts()
+    ordered_families = [f for f in KNOWN_FAMILIES if f in family_counts.index]
+    if "OTHER" in family_counts.index:
+        ordered_families.append("OTHER")
+    family_choice = st.selectbox(
+        "Family",
+        options=ordered_families,
+        format_func=lambda f: f"{f} ({family_counts.get(f, 0)})",
+        key=f"browse_family_{location}",
+    )
+
+    in_family = work[work["__family"] == family_choice]
+    class_counts = in_family["__class"].value_counts()
+    class_order_pref = ["Standard Trailer", "Hybrid", "Power Module",
+                        "Head Trailer", "Standard", "⚠ Placeholder"]
+    ordered_classes = [c for c in class_order_pref if c in class_counts.index]
+    for c in class_counts.index:
+        if c not in ordered_classes:
+            ordered_classes.append(c)
+    class_choice = st.selectbox(
+        "Class",
+        options=["All classes"] + ordered_classes,
+        key=f"browse_class_{location}",
+    )
+
+    if class_choice == "All classes":
+        sku_rows = in_family
+    else:
+        sku_rows = in_family[in_family["__class"] == class_choice]
+    sku_rows = sku_rows.sort_values(by="SKU")
+    sku_options = sku_rows["SKU"].astype(str).tolist()
+    if not sku_options:
+        st.info("No SKUs match this family + class combination.")
+        return
+
+    fg_choice = st.selectbox(
+        "FG SKU",
+        options=sku_options,
+        format_func=lambda s: fg_label_for_row(sku_rows[sku_rows["SKU"] == s].iloc[0]),
+        key=f"browse_fg_{location}",
+    )
+
+    acc_options = ["(none)"]
+    if acc_df is not None and not acc_df.empty:
+        acc_work = acc_df.reset_index(drop=True).copy()
+        acc_skus = acc_work["SKU"].astype(str)
+        acc_mask = acc_skus.apply(_accessory_family_hint).str.upper() == family_choice.upper()
+        acc_subset = acc_work[acc_mask].sort_values(by="SKU")
+        acc_options.extend(acc_subset["SKU"].astype(str).tolist())
+
+    acc_choice = st.selectbox(
+        "Accessory",
+        options=acc_options,
+        format_func=acc_label,
+        key=f"browse_acc_{location}",
+    )
+    qty = st.number_input(
+        "Qty", min_value=1, max_value=999, value=1, step=1,
+        key=f"browse_qty_{location}",
+    )
+    if st.button("➕ Add to manual entries", use_container_width=True,
+                 key=f"browse_add_{location}"):
+        commit_add(fg_choice, acc_choice, qty)
+
+
+def _render_acc_first(work, acc_df, location, fg_label_for_row, acc_label, commit_add):
+    """Accessory-first browse flow: Family → Accessory SKU → matching FG SKUs → Qty.
+
+    Useful when the planner knows which accessory kit a customer ordered and
+    wants the system to suggest a compatible finished-good unit.
+    """
+    if acc_df is None or acc_df.empty:
+        st.info("No accessory catalog loaded.")
+        return
+
+    acc_work = acc_df.reset_index(drop=True).copy()
+    acc_work["__family"] = acc_work["SKU"].astype(str).apply(_accessory_family_hint).str.upper()
+
+    # Family selector — uses accessory-side family counts
+    fam_counts = acc_work["__family"].value_counts()
+    ordered_families = [f for f in KNOWN_FAMILIES if f.upper() in fam_counts.index]
+    if not ordered_families:
+        st.info("No accessories grouped by known families.")
+        return
+    family_choice = st.selectbox(
+        "Family (accessories)",
+        options=ordered_families,
+        format_func=lambda f: f"{f} ({int(fam_counts.get(f.upper(), 0))})",
+        key=f"browse_acc_family_{location}",
+    )
+
+    # Accessory SKU dropdown (filtered to chosen family)
+    family_up = family_choice.upper()
+    in_family_acc = acc_work[acc_work["__family"] == family_up].sort_values(by="SKU")
+    acc_options = in_family_acc["SKU"].astype(str).tolist()
+    if not acc_options:
+        st.info("No accessories in this family.")
+        return
+    acc_choice = st.selectbox(
+        "Accessory SKU",
+        options=acc_options,
+        format_func=acc_label,
+        key=f"browse_acc_pick_{location}",
+    )
+
+    # Show description hint for the chosen accessory
+    chosen_row = in_family_acc[in_family_acc["SKU"] == acc_choice]
+    if not chosen_row.empty:
+        desc = str(chosen_row.iloc[0].get("Description", "") or "").strip()
+        if desc:
+            st.caption(f"📋 {desc}")
+
+    # Suggested FG SKUs — machines in the SAME family as the accessory
+    matching_fg = work[work["__family"] == family_choice]
+    # Allow optional class filter for the FG suggestion too
+    fg_class_counts = matching_fg["__class"].value_counts()
+    class_order_pref = ["Standard Trailer", "Hybrid", "Power Module",
+                        "Head Trailer", "Standard", "⚠ Placeholder"]
+    ordered_classes = [c for c in class_order_pref if c in fg_class_counts.index]
+    for c in fg_class_counts.index:
+        if c not in ordered_classes:
+            ordered_classes.append(c)
+    class_choice = st.selectbox(
+        "FG class filter",
+        options=["All classes"] + ordered_classes,
+        key=f"browse_acc_fgclass_{location}",
+    )
+    if class_choice != "All classes":
+        matching_fg = matching_fg[matching_fg["__class"] == class_choice]
+    matching_fg = matching_fg.sort_values(by="SKU")
+    fg_options = matching_fg["SKU"].astype(str).tolist()
+
+    if not fg_options:
+        st.warning(
+            f"No machine SKUs match the **{family_choice}** family for accessory "
+            f"`{acc_choice}`. Add the accessory by itself or pick a different "
+            "accessory family."
+        )
+        return
+
+    fg_choice = st.selectbox(
+        "Suggested FG SKU",
+        options=fg_options,
+        format_func=lambda s: fg_label_for_row(matching_fg[matching_fg["SKU"] == s].iloc[0]),
+        key=f"browse_acc_fg_{location}",
+    )
+
+    qty = st.number_input(
+        "Qty", min_value=1, max_value=999, value=1, step=1,
+        key=f"browse_acc_qty_{location}",
+    )
+    if st.button("➕ Add to manual entries", use_container_width=True,
+                 key=f"browse_acc_add_{location}"):
+        commit_add(fg_choice, acc_choice, qty)
 
 
 # =============================================================

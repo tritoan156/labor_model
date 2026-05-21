@@ -300,19 +300,26 @@ def _scenario_save(location: str, name: str, seed_key: str, existing_names: list
         )
         return
 
+    # Single per-location confirm key — stores the name the user was warned
+    # about on the previous click. We only honor it if the name STILL matches
+    # the current attempt, so a stale flag for an old name (left over after
+    # the user typed a new name and saved cleanly) can't fire an unconfirmed
+    # overwrite of a different scenario later.
+    confirm_key = f"_scenario_overwrite_pending_{location}"
     if name in existing_names:
-        # Streamlit doesn't have a modal yet — use a session flag to require
-        # a second click for confirmation.
-        confirm_key = f"scenario_overwrite_confirmed_{location}_{name}"
-        if not st.session_state.get(confirm_key, False):
-            st.session_state[confirm_key] = True
+        if st.session_state.get(confirm_key) != name:
+            st.session_state[confirm_key] = name
             st.warning(
                 f"A scenario named **{name}** already exists for {location}. "
                 "Click **💾 Save scenario** again to overwrite it."
             )
             return
-        # second click — clear the flag and proceed
-        st.session_state[confirm_key] = False
+        # Second click on the SAME name — clear the flag and fall through.
+        st.session_state.pop(confirm_key, None)
+    else:
+        # Saving a different (non-existing) name — drop any stale warning state
+        # so a later attempt at an existing name re-triggers the confirmation.
+        st.session_state.pop(confirm_key, None)
 
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
@@ -329,6 +336,8 @@ def _scenario_save(location: str, name: str, seed_key: str, existing_names: list
         except Exception:
             pass
         _track_and_flush("scenario_save", facility=location, name=name)
+        # Belt and braces — clear the confirm flag after a successful save.
+        st.session_state.pop(confirm_key, None)
         # Stash a one-shot success message that survives the upcoming rerun
         st.session_state[f"_scenario_toast_{location}"] = (
             "success",
@@ -2322,6 +2331,15 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
         if not new_sku:
             st.error("SKU cannot be empty.")
             return
+        # CSV / spreadsheet formula injection guard — values starting with
+        # =, +, -, or @ are interpreted as formulas when the CSV is opened
+        # in Excel / Sheets and can execute commands. Disallow them.
+        if new_sku[:1] in ("=", "+", "-", "@"):
+            st.error(
+                f"`{new_sku}` cannot start with `=`, `+`, `-`, or `@` — these "
+                "trigger formula execution in Excel. Choose a different prefix."
+            )
+            return
         existing = {str(s).upper() for s in source_df["SKU"].astype(str)}
         if new_sku.upper() in existing:
             st.error(f"`{new_sku}` is already in the {label} catalog. "
@@ -3604,52 +3622,106 @@ def _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_a
 
 
 def _apply_recon_to_acc_csv(selected_df, acc_df):
-    """Take the user's selected reconciliation rows and write updated values
-    into acc_clean.csv via the existing GitHub-API save path."""
+    """Take the user's selected reconciliation rows and write the new aggregate
+    cell values into acc_clean.csv on GitHub.
+
+    Uses the same fresh-fetch + SHA-locked merge pattern as ``_save_catalog_csv``
+    so a concurrent edit on an unrelated cell doesn't get clobbered. The
+    in-memory ``acc_df`` is only used to compute the diff (old vs. new value)
+    — the actual write is layered on top of a freshly-fetched copy from
+    GitHub.
+    """
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
         return
 
     side_to_agg_col = {"Compressor": "ComAcc", "Generator": "GenAcc", "PM": "PMAcc"}
+    file_path = "data/acc_clean.csv"
 
-    # Start from the current acc_df (excluding the index 'SKU' duplicate column noise)
-    out = acc_df.copy()
-    changed = 0
+    # Compute the set of (sku, col, new_val) changes the planner selected, then
+    # filter out no-ops (where the catalog already matches the items sum).
+    diffs: list[tuple] = []
     for _, sel in selected_df.iterrows():
         sku = sel["SKU"]
         side = sel["Side"]
-        new_val = float(sel["Sum of items"])
         col = side_to_agg_col.get(side)
-        if not col or sku not in out.index or col not in out.columns:
+        if not col:
             continue
-        old_val = float(out.at[sku, col]) if pd.notna(out.at[sku, col]) else 0.0
+        try:
+            new_val = float(sel["Sum of items"])
+        except (TypeError, ValueError):
+            continue
+        if sku not in acc_df.index or col not in acc_df.columns:
+            continue
+        try:
+            old_val = float(acc_df.at[sku, col]) if pd.notna(acc_df.at[sku, col]) else 0.0
+        except (TypeError, ValueError):
+            old_val = 0.0
         if abs(new_val - old_val) < 0.5:
             continue
-        out.at[sku, col] = new_val
-        changed += 1
+        diffs.append((str(sku), col, new_val))
 
-    if changed == 0:
+    if not diffs:
         st.info("No actual changes detected (selected rows already match the catalog).")
         return
 
-    # The SKU index and 'SKU' column are duplicates from set_index(..., drop=False);
-    # drop the column before writing so to_csv emits SKU once via reset_index.
-    csv_text = out.drop(columns=["SKU"], errors="ignore").reset_index().to_csv(index=False)
+    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    n_diffs = len(diffs)
+    response = None
+    for attempt in (1, 2):
+        try:
+            with st.spinner(
+                f"Saving {n_diffs} reconciliation cell(s) to acc_clean.csv"
+                + (" — retrying" if attempt == 2 else "") + "..."
+            ):
+                fresh_df, fresh_sha = _read_fresh_csv(file_path, token)
+                if fresh_df.empty or "SKU" not in fresh_df.columns:
+                    st.error("Could not fetch the current accessory catalog from GitHub.")
+                    return
+                # Apply each diff to the FRESH frame so any unrelated edits
+                # another user just committed stay intact.
+                fresh_indexed = fresh_df.set_index("SKU", drop=False)
+                if "Last Modified" not in fresh_indexed.columns:
+                    fresh_indexed["Last Modified"] = ""
+                touched_skus: set = set()
+                for sku, col, new_val in diffs:
+                    if sku not in fresh_indexed.index or col not in fresh_indexed.columns:
+                        continue
+                    fresh_indexed.at[sku, col] = new_val
+                    fresh_indexed.at[sku, "Last Modified"] = today
+                    touched_skus.add(sku)
+                csv_text = fresh_indexed.drop(columns=["SKU"], errors="ignore").reset_index().to_csv(index=False)
+                response = save_catalog_to_github(
+                    csv_text, file_path, token,
+                    message=f"Apply reconciliation: update {len(touched_skus)} SKU(s), {n_diffs} cell(s)",
+                    sha=fresh_sha,
+                )
+            break  # success
+        except GitHubConflict:
+            if attempt == 2:
+                st.error(
+                    "❌ Save failed: another user committed concurrently. "
+                    "Please refresh the page (your selections are not lost — re-check them) and try again."
+                )
+                return
+            continue
+        except Exception as e:
+            st.error(f"❌ Save failed: {e}")
+            return
 
+    commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+    commit_url = (response or {}).get("commit", {}).get("html_url", "")
     try:
-        with st.spinner(f"Saving {changed} updated cell(s) to acc_clean.csv..."):
-            save_catalog_to_github(
-                csv_text, "data/acc_clean.csv", token,
-                message=f"Apply reconciliation: update {changed} accessory cell(s)",
-            )
-        _track_and_flush("recon_apply", file="data/acc_clean.csv", cells=changed)
-        st.success(
-            f"✅ Wrote {changed} updated cell(s) to acc_clean.csv. "
-            "New values apply after the app redeploys (~1 min)."
-        )
-    except Exception as e:
-        st.error(f"Save failed: {e}")
+        st.cache_data.clear()
+    except Exception:
+        pass
+    _track_and_flush("recon_apply", file=file_path, cells=n_diffs)
+    st.success(
+        f"✅ Wrote {n_diffs} updated cell(s) to acc_clean.csv "
+        + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
+        + "  \nNew values apply after the app redeploys (~1 min)."
+    )
 
 
 def _render_item_master_view(item_master_df):
@@ -4101,6 +4173,15 @@ def main():
             item_master_df=item_master_df, item_packages_df=item_packages_df,
             units=units,
         )
+
+    # --- Footer ---------------------------------------------------------
+    # Lightweight provenance + support line at the bottom of every page.
+    # Replace the email below with the real team contact before publishing.
+    st.markdown("---")
+    st.caption(
+        "Last updated: May 2026 · Questions or issues? Contact "
+        "[your-team@example.com](mailto:your-team@example.com)"
+    )
 
 
 if __name__ == "__main__":

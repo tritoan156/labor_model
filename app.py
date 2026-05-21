@@ -817,6 +817,30 @@ def render_sidebar() -> dict:
             help="Expected columns: LOCATION, FG SKU ID, FG ACCRY SKU ID, BUILD QTY, PRODUCTION MONTH.",
             label_visibility="collapsed",
         )
+        # Blank template — gives the planner a ready-to-fill CSV with exactly
+        # the 5 columns the loader reads, plus a couple of example rows.
+        # CUSTOMER NAME is optional and intentionally omitted so the template
+        # stays minimal; the loader treats it as a `.get` with empty fallback.
+        _template_csv = (
+            "LOCATION,FG SKU ID,FG ACCRY SKU ID,BUILD QTY,PRODUCTION MONTH\n"
+            "HENDERSON,BOSS25-010,BOSS25-A016,5,May-26\n"
+            "CYPRESS,SDG25,,2,May-26\n"
+        )
+        st.sidebar.download_button(
+            "📥 Download blank template",
+            _template_csv.encode("utf-8"),
+            file_name="schedule_template.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help=(
+                "Empty CSV with the 5 columns the app needs. Fill in your "
+                "schedule and re-upload."
+            ),
+        )
+        st.sidebar.caption(
+            "🔒 Uploaded schedules stay in your browser. They aren't saved "
+            "on the server, pushed to GitHub, or shared with other users."
+        )
         if uploaded is None:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
     else:

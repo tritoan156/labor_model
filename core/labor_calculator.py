@@ -11,6 +11,7 @@ from .constants import (
     FINAL_LABOR, HS_FINAL_CREW, DEFAULT_NAMEPLATE_PREP, DEFAULT_BATT_RAW,
     ETO_LABOR_PER_UNIT, STATION_KEY_TO_DISPLAY, STATION_KEYS,
     BATTERY_CYCLE_MINUTES, get_battery_type,
+    UTIL_THRESHOLD_OVER, UTIL_THRESHOLD_NEAR, UTIL_THRESHOLD_TIGHT,
 )
 
 
@@ -130,20 +131,46 @@ def expand_schedule(schedule_df: pd.DataFrame,
     Returns DataFrame with one row per individual unit (qty=1 each), columns
     include: unit_id, fg_base, fg_raw, decal, acc, customer, carryover,
     Class, Bat, Warehouse..., Final, PDI, QC, Ship, ETO, total_labor.
+
+    Two helper lists are attached to the returned DataFrame as attributes so
+    callers can surface data-quality warnings without breaking the existing
+    callsites:
+
+      ``.attrs['skipped_fg']``       — FG SKUs in the schedule that aren't in
+                                       ``machine_clean.csv``. Their rows are
+                                       silently dropped because we have no
+                                       labor data for them.
+      ``.attrs['unknown_acc']``      — Accessory SKUs referenced by a kept
+                                       schedule row but not present in
+                                       ``acc_clean.csv``. The unit is still
+                                       built (with zero accessory labor),
+                                       which may not be the planner's intent.
     """
     rows = []
     unit_id = 0
+    skipped_fg: set[str] = set()
+    unknown_acc: set[str] = set()
+    acc_index = set(acc_df.index) if acc_df is not None else set()
     for _, r in schedule_df.iterrows():
         qty = int(r["BUILD QTY"])
-        labor = compute_unit_labor(r["FG_BASE"], r.get("ACC") or None, machine_df, acc_df)
+        fg_base = r.get("FG_BASE")
+        acc_sku = (r.get("ACC") or "") or None
+        labor = compute_unit_labor(fg_base, acc_sku, machine_df, acc_df)
         if labor is None:
+            if fg_base:
+                skipped_fg.add(str(fg_base))
             continue
+        # The unit kept — note any accessory we couldn't resolve so the
+        # planner knows the labor at PMAcc/GenAcc/ComAcc/AccKIT/Battery is
+        # zero by default, not measured.
+        if acc_sku and acc_sku not in acc_index:
+            unknown_acc.add(str(acc_sku))
         for _ in range(qty):
             unit_id += 1
             row = {
                 "unit_id": unit_id,
                 "fg_raw": r["FG_RAW"],
-                "fg_base": r["FG_BASE"],
+                "fg_base": fg_base,
                 "decal": r.get("DECAL", ""),
                 "acc": r.get("ACC") or "",
                 "customer": str(r.get("CUSTOMER NAME", "") or ""),
@@ -151,9 +178,12 @@ def expand_schedule(schedule_df: pd.DataFrame,
             }
             row.update(labor)
             row["total_labor"] = sum(labor.get(s, 0) for s in STATION_KEYS)
-            row["batt_type"] = get_battery_type(r["FG_BASE"])
+            row["batt_type"] = get_battery_type(fg_base)
             rows.append(row)
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    out.attrs["skipped_fg"] = sorted(skipped_fg)
+    out.attrs["unknown_acc"] = sorted(unknown_acc)
+    return out
 
 
 def station_demand_table(units_df: pd.DataFrame) -> pd.DataFrame:
@@ -316,11 +346,11 @@ def _status_emoji(util: float, station_missing: bool = False, has_demand: bool =
     """
     if station_missing:
         return "🔴" if has_demand else "⚪"
-    if util > 1.0:
+    if util > UTIL_THRESHOLD_OVER:
         return "🔴"
-    if util > 0.9:
+    if util > UTIL_THRESHOLD_NEAR:
         return "🟠"
-    if util > 0.75:
+    if util > UTIL_THRESHOLD_TIGHT:
         return "🟡"
     return "🟢"
 

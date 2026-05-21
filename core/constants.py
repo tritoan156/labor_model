@@ -12,6 +12,13 @@ DEFAULT_WORKING_DAYS = 20
 DEFAULT_SAFETY_FACTOR = 0.85
 DEFAULT_EFFICIENCY_FACTOR = 1.00  # 1.00 = no efficiency loss; 0.625 ≈ VSM productive-time rate
 
+# === Utilization status thresholds ===
+# Drive the color flag for each station (🟢 OK / 🟡 Tight / 🟠 Near cap / 🔴 Over).
+# Tune these to match how aggressive your team wants the warnings to be.
+UTIL_THRESHOLD_OVER = 1.00   # above this → 🔴 OVER capacity
+UTIL_THRESHOLD_NEAR = 0.90   # above this → 🟠 Near capacity
+UTIL_THRESHOLD_TIGHT = 0.75  # above this → 🟡 Tight
+
 # === Final Assembly labor by unit class (person-mins) ===
 # HS = PM only, Final = 30 (1 person × 30 min)
 # HT = Head Trailer (Mount only) = 60 (2 ppl × 30 min)

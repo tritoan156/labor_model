@@ -1155,37 +1155,101 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = ""):
     # =============================================================
     st.markdown("#### 🎯 Recommended actions")
     actions = []
-    # 1. Stations missing entirely
+
+    # 0. Empty schedule — don't pretend everything is fine.
+    if total_units == 0 or capacity.empty:
+        st.info(
+            "ℹ️ **No schedule loaded.** Upload a CSV or type a few SKUs in the sidebar "
+            "to see recommendations tailored to your plan."
+        )
+        return
+
+    # Separate over-capacity stations into "throughput-only" vs "needs HC".
+    # A red Overall status can come from labor demand exceeding headcount
+    # (fix = add people), or from throughput (cells/cycle) exceeding daily
+    # need (fix = add stations/cells or extend working days). Telling a
+    # planner to "hire" when the constraint is actually fixture cycle time
+    # is misleading, so we split them out.
+    labor_over_stations = []  # need more headcount
+    throughput_over_stations = []  # need more cells / longer days
+    for st_disp in over_stations:
+        labor_over = str(capacity.loc[st_disp, "labor_status_safe"]) == "🔴"
+        thru_over = str(capacity.loc[st_disp, "thru_status_safe"]) == "🔴"
+        # If labor is the over-driver, hiring helps; otherwise treat as throughput.
+        if labor_over:
+            labor_over_stations.append(st_disp)
+        elif thru_over:
+            throughput_over_stations.append(st_disp)
+        else:
+            # Edge case (raw-but-not-safe over) — surface as labor anyway.
+            labor_over_stations.append(st_disp)
+
+    # 1. Stations missing entirely (HC=0 with demand)
     if no_station_list:
         actions.append(
             f"**Fix facility setup.** {len(no_station_list)} station(s) have demand but 0 headcount: "
             f"{', '.join(no_station_list)}. Either add people in the sidebar or remove those units from the schedule."
         )
-    # 2. Over-capacity stations
-    if over_stations:
+
+    # 2. Labor-driven over-capacity — name the per-station gap
+    if labor_over_stations:
+        parts = []
+        for st_disp in labor_over_stations:
+            gap = 0
+            try:
+                gap = int(capacity.loc[st_disp, "hc_gap"])
+            except Exception:
+                gap = 0
+            if gap > 0:
+                parts.append(f"**~{gap} more at {st_disp}**")
+            else:
+                # Gap math couldn't pin it (rounding or no required_hc) — fall back to a generic call-out.
+                parts.append(f"**more capacity at {st_disp}**")
         actions.append(
-            f"**Add capacity at {', '.join(over_stations)}.** "
-            f"Options: add people, run overtime, extend working days, or defer some units. "
-            f"See the **Recommendations** tab for specifics."
+            f"**Add {', '.join(parts)}** to bring utilization below 100% (with your safety buffer). "
+            f"Alternatives: run overtime, extend working days, or defer some units."
         )
-    # 3. Headcount short overall
-    if total_hc_gap > 0 and not over_stations:
+
+    # 3. Throughput-driven over-capacity — different fix
+    if throughput_over_stations:
+        # Battery Assembly is the canonical case (cell count × cycle time).
+        if "Battery Assembly" in throughput_over_stations:
+            actions.append(
+                "🔋 **Battery throughput is the bottleneck.** Add battery cells "
+                "(Stations/Cells) or extend working days — hiring more people at "
+                "Battery won't help, because the constraint is the assembly fixture cycle."
+            )
+            others = [s for s in throughput_over_stations if s != "Battery Assembly"]
+        else:
+            others = list(throughput_over_stations)
+        if others:
+            actions.append(
+                f"**Throughput is short at {', '.join(others)}** — these stations need more "
+                "parallel cells (Stations/Cells in the sidebar) or longer working days. "
+                "Adding labor without more cells won't move the cycle."
+            )
+
+    # 4. Headcount short overall (but no station is individually red)
+    if total_hc_gap > 0 and not labor_over_stations:
         actions.append(
             f"**Plan to add ~{total_hc_gap} people** across the line to comfortably hit this plan."
         )
-    # 4. Near-cap warnings
+
+    # 5. Near-cap warnings (only when nothing is already red)
     if near_cap and not over_stations:
         actions.append(
             f"**Monitor {', '.join(near_cap)}** — these are 90%+ utilized and risky for any schedule change."
         )
-    # 5. Surplus
-    if total_hc_gap < -3:  # only call out meaningful surplus
+
+    # 6. Surplus
+    if total_hc_gap < -3:
         idle = capacity[capacity["labor_util_safe"] < 0.5].index.tolist()
         if idle:
             actions.append(
                 f"**Surplus capacity at {', '.join(idle[:3])}** — consider cross-training "
                 f"these {abs(total_hc_gap)} people to support bottleneck stations."
             )
+
     if not actions:
         actions.append("✅ **No action needed** — this plan is well-balanced. Maintain current staffing.")
 
@@ -1594,7 +1658,7 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     )
 
 
-def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_packages_df):
+def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_packages_df, units=None):
     """Consolidated data + admin tab.
 
     Replaces three previous top-level tabs (Update Labor, Data Quality, Source
@@ -1659,7 +1723,7 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
         _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_acc)
 
     elif sub == "🔍 Data Quality":
-        tab_data_validation(machine_df, acc_df)
+        tab_data_validation(machine_df, acc_df, units=units)
 
 
 def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
@@ -2567,9 +2631,12 @@ def tab_cycle_time(units, inputs):
     st.header("⏱ Build Time per Unit")
     st.markdown(
         "**How long does it take to build one of each unit?**  \n"
+        "ℹ️ Lead Time assumes a **single person** building the whole unit start-to-finish. "
+        "Real production runs in parallel across stations, so the actual elapsed time is much shorter. "
+        "Use lead time to compare units to each other, not to predict ship dates.\n\n"
         "• **Total Labor** — sum of person-minutes across every station the unit touches.  \n"
         "• **Lead Time (days)** — wall-clock days if **one person** built the whole unit "
-        f"(`Total Labor ÷ {inputs['shift']} min × efficiency`).  \n"
+        f"alone = `Total Labor ÷ ({inputs['shift']} min × efficiency)`.  \n"
         "• **Sum of Cycles** — wall-clock minutes if every station was done sequentially "
         "with your current Crew settings (upper bound — real flow has parallel sub-assembly)."
     )
@@ -3100,17 +3167,52 @@ def _flow_reset() -> None:
         st.error(f"❌ Reset failed: {e}")
 
 
-def tab_data_validation(machine_df, acc_df):
+def tab_data_validation(machine_df, acc_df, units=None):
     st.header("🔍 Data Validation")
     st.caption(
         "Automatic checks over the Machine and Accessory catalogs. Re-runs every "
         "time the app reloads — push updated CSVs to GitHub to clear any issues."
     )
 
+    # ---- Schedule-vs-catalog mismatches (data drops that aren't otherwise visible) ----
+    # `expand_schedule` quietly skips schedule rows whose FG isn't in the catalog,
+    # and lets units build with zero accessory labor when the accessory isn't found.
+    # Surface both here so the planner knows the displayed labor totals are missing
+    # those rows.
+    skipped_fg: list = []
+    unknown_acc: list = []
+    if units is not None and hasattr(units, "attrs"):
+        skipped_fg = list(units.attrs.get("skipped_fg", []) or [])
+        unknown_acc = list(units.attrs.get("unknown_acc", []) or [])
+
+    if skipped_fg:
+        st.warning(
+            f"⚠️ **{len(skipped_fg)} FG SKU(s) in the schedule are missing from the "
+            "machine catalog — their units were dropped from the analysis.**  \n"
+            f"Missing: `" + "`, `".join(skipped_fg[:25]) + "`"
+            + (f" … (+{len(skipped_fg) - 25} more)" if len(skipped_fg) > 25 else "")
+            + "  \nFix by adding these SKUs in **🗂 Machine catalog → ➕ Add a new machine SKU**, "
+            "or correct typos in the schedule."
+        )
+    if unknown_acc:
+        st.warning(
+            f"⚠️ **{len(unknown_acc)} accessory SKU(s) referenced by the schedule are not "
+            "in the accessory catalog — those units were built with zero accessory labor.**  \n"
+            f"Missing: `" + "`, `".join(unknown_acc[:25]) + "`"
+            + (f" … (+{len(unknown_acc) - 25} more)" if len(unknown_acc) > 25 else "")
+            + "  \nFix by adding these SKUs in **🗂 Accessory catalog → ➕ Add a new accessory SKU** "
+            "or **➕ Add placeholder accessory (XXX)**."
+        )
+    if skipped_fg or unknown_acc:
+        st.markdown("---")
+
     issues_df = validate_all(machine_df, acc_df)
 
     if issues_df.empty:
-        st.success("✅ No issues found in either catalog.")
+        if not (skipped_fg or unknown_acc):
+            st.success("✅ No issues found in either catalog.")
+        else:
+            st.info("Catalog content itself looks clean — the warnings above are about schedule rows.")
         return
 
     # Summary metrics
@@ -3997,6 +4099,7 @@ def main():
         tab_data_setup(
             machine_df=machine_df, acc_df=acc_df, schedule_df=schedule_df,
             item_master_df=item_master_df, item_packages_df=item_packages_df,
+            units=units,
         )
 
 

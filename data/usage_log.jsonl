@@ -1,3 +1,5 @@
 {"ts":"2026-05-21T00:00:00","uid":"deploy000000","type":"deploy"}
 {"ts":"2026-05-21T20:17:15","uid":"a38f8c0c9cb8","type":"session_start","facility":"Henderson","mode":"📤 Upload schedule file"}
 {"ts":"2026-05-21T20:17:16","uid":"a38f8c0c9cb8","type":"schedule_load","mode":"📤 Upload schedule file","facility":"Henderson","rows":"193"}
+{"ts":"2026-05-21T20:17:15","uid":"fcf7149ff538","type":"session_start","facility":"Henderson","mode":"📤 Upload schedule file"}
+{"ts":"2026-05-21T20:17:17","uid":"fcf7149ff538","type":"schedule_load","mode":"📤 Upload schedule file","facility":"Henderson","rows":"193"}

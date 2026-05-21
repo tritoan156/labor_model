@@ -119,7 +119,7 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
 
 
 ITEM_MASTER_COLUMNS = [
-    "Abbr", "Description", "FG family",
+    "Abbr", "Description", "FG family", "Accessory SKU",
     "Time on Compressor (min)", "Time on Generator (min)", "Time on PM (min)",
     "Notes",
 ]
@@ -148,7 +148,7 @@ def load_item_master(path: Path | str | None = None) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = 0 if "Time" in c else ""
     # Force text columns to clean strings (handles NaN, mixed dtypes, etc.)
-    for c in ("Abbr", "Description", "FG family", "Notes"):
+    for c in ("Abbr", "Description", "FG family", "Accessory SKU", "Notes"):
         df[c] = df[c].map(_to_clean_str)
     for c in ("Time on Compressor (min)", "Time on Generator (min)", "Time on PM (min)"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)

@@ -3059,24 +3059,27 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
 
 
 def _render_item_master_view(item_master_df):
-    """Master list of installable items (abbreviation, description, times)."""
-    st.subheader("📒 Item master")
+    """Unified items table — master defaults, family variants, AND per-accessory
+    entries in one editor. Replaces the previous split between Item Master and
+    Accessory Item Details views."""
+    st.subheader("📒 Items")
     st.markdown(
-        "**Reference table** of every installable item, with the typical install "
-        "time on a Compressor unit (rolls up to Compressor station) and on a "
-        "Generator unit (rolls up to GenAcc station). Edit values inline and "
-        "click Save to persist."
+        "**Unified table** of every installable item — master defaults, "
+        "family variants, and per-accessory entries all in one place. Edit "
+        "inline and click Save to persist."
     )
     st.caption(
-        "**Default rows** have a blank `FG family`. **Variant rows** specify a "
-        "family prefix (e.g. `SDG13`, `PDS185EZ`) and override the default for "
-        "any accessory whose family starts with that value. Longest matching "
-        "prefix wins (so `SDG125` beats `SDG`)."
+        "Each row defines an item's labor times. Use the **FG family** and "
+        "**Accessory SKU** columns to scope the row:\n"
+        "- Both blank → **default row** (used when nothing more specific matches)\n"
+        "- `FG family` only (e.g. `SDG13`, `PDS185EZ`) → **family variant** (longest prefix wins)\n"
+        "- `Accessory SKU` populated → **per-accessory entry** (item belongs to that specific accessory)\n\n"
+        "Time columns are person-minutes on each side (Compressor / Generator / PM)."
     )
 
     # Normalize dtypes so st.data_editor's type checker doesn't complain
     seed = item_master_df.copy()
-    for c in ("Abbr", "Description", "FG family", "Notes"):
+    for c in ("Abbr", "Description", "FG family", "Accessory SKU", "Notes"):
         if c in seed.columns:
             seed[c] = seed[c].astype(str).replace({"nan": "", "None": ""})
     for c in ("Time on Compressor (min)", "Time on Generator (min)", "Time on PM (min)"):
@@ -3097,8 +3100,14 @@ def _render_item_master_view(item_master_df):
             "Description": st.column_config.TextColumn("Description", width="large"),
             "FG family": st.column_config.TextColumn(
                 "FG family",
-                help="Leave blank for the default row. Set to a prefix like "
-                     "SDG13 or PDS185EZ to make this row a variant.",
+                help="Leave blank for a default / per-accessory row. Set to a prefix "
+                     "like SDG13 or PDS185EZ to make this row a family variant.",
+                width="small",
+            ),
+            "Accessory SKU": st.column_config.TextColumn(
+                "Accessory SKU",
+                help="Leave blank for default/family rows. Populate (e.g. `BOSS25-A016`) "
+                     "to declare this item belongs to a specific accessory.",
                 width="small",
             ),
             "Time on Compressor (min)": st.column_config.NumberColumn(
@@ -3118,8 +3127,8 @@ def _render_item_master_view(item_master_df):
         },
     )
 
-    if st.button("💾 Save item master to GitHub", use_container_width=True):
-        _save_simple_csv(edited, "data/item_master.csv", "item master")
+    if st.button("💾 Save items to GitHub", use_container_width=True):
+        _save_simple_csv(edited, "data/item_master.csv", "items")
 
 
 def _render_item_packages_view(packages_df, item_master_df):
@@ -3310,15 +3319,14 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
             "Schedule",
             "Machine catalog",
             "Accessory catalog",
-            "Item master",
+            "Items",
             "Item packages",
             "Reconciliation & Apply",
-            "Accessory item details",
         ],
         horizontal=True,
     )
 
-    if sub == "Item master":
+    if sub == "Items":
         _render_item_master_view(item_master_df)
         return
     if sub == "Item packages":
@@ -3326,9 +3334,6 @@ def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
         return
     if sub == "Reconciliation & Apply":
         _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_acc)
-        return
-    if sub == "Accessory item details":
-        _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df)
         return
 
     if sub == "Schedule":

@@ -404,10 +404,20 @@ def load_schedule(
     if location:
         df = df[df["LOC"] == location.upper()]
 
-    # Detect carryover rows (YY-Mon format) vs current rows (Mon-YY format)
-    carryover_pattern = re.compile(r"^\d{2}-[A-Za-z]{3}$")
-    df["CARRYOVER"] = df["PRODUCTION MONTH"].astype(str).apply(
-        lambda m: bool(carryover_pattern.match(m))
+    # Detect carryover rows (YY-Mon format) vs current rows (Mon-YY format).
+    # Use vectorized .str.match() with na=False — robust against PyArrow-backed
+    # string columns (Python 3.14 + newer pandas default these), where Arrow
+    # NA scalars can leak through .apply() and break re.match(). Casting to
+    # object + fillna("") guarantees we feed real Python strings into the
+    # vectorized regex.
+    carryover_pattern_str = r"^\d{2}-[A-Za-z]{3}$"
+    df["CARRYOVER"] = (
+        df["PRODUCTION MONTH"]
+        .astype("object")
+        .fillna("")
+        .astype(str)
+        .str.match(carryover_pattern_str, na=False)
+        .astype(bool)
     )
 
     # Filter to detected months

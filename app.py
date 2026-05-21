@@ -4147,6 +4147,37 @@ def main():
     if empty_banner_msg:
         st.info(empty_banner_msg)
 
+    # Top-of-page warning when the schedule references SKUs the catalogs don't
+    # know about. `expand_schedule` quietly drops unknown FG rows and lets
+    # unknown accessories build with zero acc labor — without this banner a
+    # planner could trust analysis numbers that are missing units. Keep it
+    # compact; the full list lives in 📁 Data & Setup → 🔍 Data Quality.
+    _skipped_fg: list = []
+    _unknown_acc: list = []
+    if not units.empty and hasattr(units, "attrs"):
+        _skipped_fg = list(units.attrs.get("skipped_fg", []) or [])
+        _unknown_acc = list(units.attrs.get("unknown_acc", []) or [])
+    if _skipped_fg or _unknown_acc:
+        _preview_fg = ", ".join(f"`{s}`" for s in _skipped_fg[:5])
+        _preview_acc = ", ".join(f"`{s}`" for s in _unknown_acc[:5])
+        _bits = []
+        if _skipped_fg:
+            extra = f" (+{len(_skipped_fg) - 5} more)" if len(_skipped_fg) > 5 else ""
+            _bits.append(
+                f"**{len(_skipped_fg)} FG SKU(s) missing from machine catalog** — "
+                f"their rows were dropped from analysis: {_preview_fg}{extra}."
+            )
+        if _unknown_acc:
+            extra = f" (+{len(_unknown_acc) - 5} more)" if len(_unknown_acc) > 5 else ""
+            _bits.append(
+                f"**{len(_unknown_acc)} accessory SKU(s) missing from accessory catalog** — "
+                f"those units built with zero accessory labor: {_preview_acc}{extra}."
+            )
+        st.warning(
+            "⚠️ " + "  \n".join(_bits)
+            + "  \n→ Open **📁 Data & Setup** to add them so they're included in the analysis."
+        )
+
     # Tabs — 6 top-level tabs, ordered from executive summary → planner detail → admin.
     # Batteries content folded into Capacity. Update Labor + Data Quality + Source Data
     # consolidated into the single 📁 Data & Setup tab.

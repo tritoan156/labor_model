@@ -52,6 +52,14 @@ from core.process_flow_storage import (
     VALID_CLASSES as PROCESS_FLOW_VALID_CLASSES,
 )
 from core.data_validator import validate_all
+from core.usage_tracker import (
+    track_event,
+    flush_to_github as _flush_usage_to_github,
+    load_usage_log,
+    refresh_from_github as _refresh_usage_from_github,
+    get_buffer_snapshot as _usage_buffer_snapshot,
+    USAGE_LOG_PATH as _USAGE_LOG_PATH,
+)
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
@@ -133,6 +141,37 @@ def _load_scenarios_dict(_mtime: float):
 def _load_process_flow_edges(_mtime: float):
     """Load data/process_flow.json. Cached per file mtime."""
     return load_process_flow()
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def _load_usage_log_cached(_mtime: float):
+    """Load data/usage_log.jsonl. TTL=60s so the admin view auto-refreshes
+    within a minute of new events without polling too aggressively."""
+    return load_usage_log()
+
+
+def _usage_token() -> "str | None":
+    """Token lookup mirroring the catalog save handlers."""
+    try:
+        return st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    except Exception:
+        return None
+
+
+def _track_and_flush(event_type: str, *, force_flush: bool = True, **payload) -> None:
+    """Convenience wrapper: queue an event, then flush if we have a token.
+
+    Most callers use ``force_flush=True`` because they're already in a save
+    context (cheap to piggyback the GitHub round-trip). The session_start
+    and schedule_load callers also force-flush so the very first event in a
+    session always lands in the log within seconds.
+    """
+    try:
+        track_event(event_type, **payload)
+        _flush_usage_to_github(_usage_token(), force=force_flush)
+    except Exception:
+        # Tracking must never break the user's actual save flow.
+        pass
 
 
 
@@ -289,6 +328,7 @@ def _scenario_save(location: str, name: str, seed_key: str, existing_names: list
             st.cache_data.clear()
         except Exception:
             pass
+        _track_and_flush("scenario_save", facility=location, name=name)
         # Stash a one-shot success message that survives the upcoming rerun
         st.session_state[f"_scenario_toast_{location}"] = (
             "success",
@@ -313,6 +353,8 @@ def _scenario_load(location: str, name: str, seed_key: str, rev_key: str) -> Non
     seed["Qty"] = pd.to_numeric(seed["Qty"], errors="coerce").fillna(0).astype(int)
     st.session_state[seed_key] = seed
     st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
+    # Don't force-flush here — load is a read; let buffer accumulate.
+    track_event("scenario_load", facility=location, name=name)
     st.success(f"Loaded scenario **{name}** — {len(seed)} row(s).")
     st.rerun()
 
@@ -330,6 +372,7 @@ def _scenario_delete(location: str, name: str) -> None:
             st.cache_data.clear()
         except Exception:
             pass
+        _track_and_flush("scenario_delete", facility=location, name=name)
         st.session_state[f"_scenario_toast_{location}"] = (
             "success", f"🗑 Deleted scenario **{name}** for {location}.",
         )
@@ -567,6 +610,163 @@ def _render_acc_first(work, acc_df, location, fg_label_for_row, acc_label, commi
 # =============================================================
 # Sidebar — global inputs
 # =============================================================
+def _render_admin_dashboard() -> None:
+    """Hidden analytics view — KPIs from data/usage_log.jsonl.
+
+    Rendered inside an ``⚙️ Admin`` expander at the bottom of the sidebar.
+    No password gate: the expander label is intentionally generic so regular
+    users don't notice it; only read-only charts/tables are shown, so there's
+    nothing destructive even if a curious user opens it.
+    """
+    # Pull the on-disk log + any in-session un-flushed events
+    try:
+        mtime = _USAGE_LOG_PATH.stat().st_mtime if _USAGE_LOG_PATH.exists() else 0.0
+    except Exception:
+        mtime = 0.0
+    events: list = list(_load_usage_log_cached(mtime) or [])
+    events.extend(_usage_buffer_snapshot())
+
+    if not events:
+        st.caption("No usage events yet. Once people start using the tool, you'll see KPIs here.")
+        if st.button("🔄 Refresh from GitHub", key="_admin_refresh_empty"):
+            _refresh_usage_from_github(_usage_token())
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.rerun()
+        return
+
+    # ---- Build dataframe ----------------------------------------------
+    df = pd.DataFrame(events)
+    if "ts" not in df.columns:
+        st.caption("Usage log is malformed — no `ts` column.")
+        return
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts"]).copy()
+    if df.empty:
+        st.caption("No parseable events yet.")
+        return
+    df["date"] = df["ts"].dt.date
+    df["type"] = df.get("type", "").astype(str)
+    df["facility"] = df.get("facility", "").astype(str) if "facility" in df.columns else ""
+    df["uid"] = df.get("uid", "").astype(str) if "uid" in df.columns else ""
+    df["file"] = df.get("file", "").astype(str) if "file" in df.columns else ""
+
+    today = pd.Timestamp.today().date()
+    week_ago = today - pd.Timedelta(days=6)
+    fortnight_ago = today - pd.Timedelta(days=13)
+
+    sessions = df[df["type"] == "session_start"].copy()
+    sessions_today = int(((sessions["date"] == today)).sum())
+    sessions_week = int(((sessions["date"] >= week_ago)).sum())
+    sessions_all = int(len(sessions))
+
+    # ---- KPIs (compact metric row) ------------------------------------
+    st.markdown("**📈 Sessions**")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Today", sessions_today)
+    c2.metric("This week", sessions_week)
+    c3.metric("All-time", sessions_all)
+
+    # Last 14 days line chart
+    if not sessions.empty:
+        daily = (
+            sessions.assign(d=sessions["ts"].dt.date)
+                    .groupby("d").size().reset_index(name="sessions")
+        )
+        # Re-index over a full 14-day window so empty days appear as zero
+        full_range = pd.date_range(end=today, periods=14, freq="D").date
+        full_df = pd.DataFrame({"d": full_range})
+        merged = full_df.merge(daily, on="d", how="left").fillna({"sessions": 0})
+        fig = px.line(
+            merged, x="d", y="sessions", markers=True,
+            labels={"d": "", "sessions": "Sessions"},
+        )
+        fig.update_layout(
+            height=160, margin=dict(l=4, r=4, t=8, b=4),
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.caption("_No session events yet._")
+
+    # ---- Facility breakdown -------------------------------------------
+    st.markdown("**🏭 Sessions by facility**")
+    if sessions.empty or sessions["facility"].eq("").all():
+        st.caption("_No facility data yet._")
+    else:
+        fac = (
+            sessions[sessions["facility"] != ""]
+            .groupby("facility").size().reset_index(name="sessions")
+            .sort_values("sessions", ascending=False)
+        )
+        cols = st.columns(min(len(fac), 3) or 1)
+        for i, row in enumerate(fac.itertuples(index=False)):
+            cols[i % len(cols)].metric(row.facility, int(row.sessions))
+
+    # ---- Saves (last 14 days) -----------------------------------------
+    st.markdown("**💾 Saves (last 14 days)**")
+    save_types = {
+        "catalog_save", "catalog_add_sku", "catalog_add_placeholder",
+        "recon_apply", "scenario_save", "scenario_delete",
+        "flow_save", "flow_reset", "simple_save", "crew_save",
+    }
+    saves = df[(df["type"].isin(save_types)) & (df["date"] >= fortnight_ago)].copy()
+    if saves.empty:
+        st.caption("_No saves in the last 14 days._")
+    else:
+        # Group by file when present, else by event type
+        saves["bucket"] = saves["file"].where(saves["file"] != "", saves["type"])
+        agg = (
+            saves.groupby(["bucket", "type"]).size()
+            .reset_index(name="count").sort_values("count", ascending=False)
+        )
+        agg.columns = ["File / target", "Event", "Count"]
+        st.dataframe(agg, use_container_width=True, hide_index=True)
+
+    # ---- Top actions ---------------------------------------------------
+    st.markdown("**🎯 Top actions (last 14 days)**")
+    recent = df[df["date"] >= fortnight_ago].copy()
+    if recent.empty:
+        st.caption("_No events in the last 14 days._")
+    else:
+        top = (
+            recent.groupby("type").size().reset_index(name="count")
+                  .sort_values("count", ascending=False).head(10)
+        )
+        top.columns = ["Event type", "Count"]
+        st.dataframe(top, use_container_width=True, hide_index=True)
+
+    # ---- Recent activity table ----------------------------------------
+    st.markdown("**📋 Recent activity (last 20 events)**")
+    last20 = df.sort_values("ts", ascending=False).head(20).copy()
+    last20["When"] = last20["ts"].dt.strftime("%m-%d %H:%M")
+    last20["UID"] = last20["uid"].str[-6:]
+    cols_to_show = ["When", "UID", "type", "facility", "file"]
+    cols_to_show = [c for c in cols_to_show if c in last20.columns]
+    st.dataframe(
+        last20[cols_to_show].rename(
+            columns={"type": "Event", "facility": "Facility", "file": "File"}
+        ),
+        use_container_width=True, hide_index=True,
+    )
+
+    # ---- Refresh button ------------------------------------------------
+    st.markdown("---")
+    cc1, cc2 = st.columns([3, 2])
+    cc1.caption(
+        f"Buffered (un-flushed) this session: {len(_usage_buffer_snapshot())} event(s)"
+    )
+    if cc2.button("🔄 Refresh from GitHub", key="_admin_refresh", use_container_width=True):
+        _refresh_usage_from_github(_usage_token())
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
+
+
 def render_sidebar() -> dict:
     st.sidebar.title("🏭 Labor Planning")
     st.sidebar.caption("Set up your scenario, then review tabs on the right.")
@@ -743,6 +943,7 @@ def render_sidebar() -> dict:
                 try:
                     with st.spinner(f"Saving {location} crew to GitHub..."):
                         save_facility_crew_to_github(location, edited, token)
+                    _track_and_flush("crew_save", facility=location)
                     st.success(
                         f"✅ Saved! Everyone sees the new {location} values "
                         "after the app redeploys (~1 min)."
@@ -824,6 +1025,13 @@ If you see "GitHub token not configured" when saving, ask the app's admin to add
 Hover any column header in a table to see its specific tooltip.
             """
         )
+
+    # ----------------------------------------------------------------
+    # Hidden admin analytics — discoverable but visually unobtrusive.
+    # Sits at the very bottom of the sidebar; regular users won't notice.
+    # ----------------------------------------------------------------
+    with st.sidebar.expander("⚙️ Admin", expanded=False):
+        _render_admin_dashboard()
 
     return {
         "uploaded": uploaded,
@@ -1989,6 +2197,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
             st.cache_data.clear()
         except Exception:
             pass
+        _track_and_flush("catalog_add_placeholder", file=file_path, sku=new_sku)
         st.success(
             f"✅ Added XXX placeholder accessory `{new_sku}` "
             + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
@@ -2133,6 +2342,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
             st.cache_data.clear()
         except Exception:
             pass
+        _track_and_flush("catalog_add_sku", file=file_path, label=label, sku=new_sku)
         st.success(
             f"✅ Added `{new_sku}` to `{file_path}` "
             + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
@@ -2335,6 +2545,8 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
         st.cache_data.clear()
     except Exception:
         pass
+
+    _track_and_flush("catalog_save", file=file_path, label=label, cells=n_diffs)
 
     st.success(
         f"✅ Saved {n_diffs} cell change(s) to `{file_path}` "
@@ -2856,6 +3068,7 @@ def _flow_save(edited_df) -> None:
             st.cache_data.clear()
         except Exception:
             pass
+        _track_and_flush("flow_save")
         st.session_state["_flow_toast"] = (
             "success",
             f"✅ Process flow saved"
@@ -2878,6 +3091,7 @@ def _flow_reset() -> None:
             st.cache_data.clear()
         except Exception:
             pass
+        _track_and_flush("flow_reset")
         st.session_state["_flow_toast"] = (
             "success", "🔄 Process flow reset to default.",
         )
@@ -3327,6 +3541,7 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
                 csv_text, "data/acc_clean.csv", token,
                 message=f"Apply reconciliation: update {changed} accessory cell(s)",
             )
+        _track_and_flush("recon_apply", file="data/acc_clean.csv", cells=changed)
         st.success(
             f"✅ Wrote {changed} updated cell(s) to acc_clean.csv. "
             "New values apply after the app redeploys (~1 min)."
@@ -3480,6 +3695,7 @@ def _save_simple_csv(df, file_path, label):
                 csv_text, file_path, token,
                 message=f"Update {label} via app",
             )
+        _track_and_flush("simple_save", file=file_path, label=label)
         st.success(f"✅ Saved {label}! New values apply after the app redeploys (~1 min).")
     except Exception as e:
         st.error(f"Save failed: {e}")
@@ -3623,6 +3839,16 @@ def main():
 
     inputs = render_sidebar()
 
+    # Once-per-session "user opened the tool" event. Force-flush so it lands
+    # in usage_log.jsonl within seconds of the first interaction.
+    if not st.session_state.get("_session_logged"):
+        _track_and_flush(
+            "session_start",
+            facility=inputs.get("location"),
+            mode=inputs.get("schedule_mode"),
+        )
+        st.session_state["_session_logged"] = True
+
     # Load data with cache
     machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
     acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"))
@@ -3677,6 +3903,26 @@ def main():
                 "⚠️ Could not expand schedule into units. Check that FG / Accessory SKUs "
                 "match the catalog. You can edit catalogs in **📁 Data & Setup**."
             )
+
+        # Track one schedule_load event per unique (mode, location, row-count)
+        # signature within the session — keeps the log lean even when the user
+        # toggles sliders that trigger reruns.
+        try:
+            _sig = (
+                str(inputs.get("schedule_mode") or ""),
+                str(inputs.get("location") or ""),
+                int(len(schedule_df)),
+            )
+            if st.session_state.get("_schedule_load_sig") != _sig:
+                _track_and_flush(
+                    "schedule_load",
+                    mode=inputs.get("schedule_mode"),
+                    facility=inputs.get("location"),
+                    rows=len(schedule_df),
+                )
+                st.session_state["_schedule_load_sig"] = _sig
+        except Exception:
+            pass
 
     if units.empty:
         capacity = pd.DataFrame()

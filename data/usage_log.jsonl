@@ -39,3 +39,4 @@
 {"ts":"2026-05-21T22:54:40","uid":"5c926760f21a","type":"scenario_load","facility":"Henderson","name":"Hen 2026 June"}
 {"ts":"2026-05-21T22:54:40","uid":"5c926760f21a","type":"schedule_load","mode":"✏️ Type a few SKUs","facility":"Henderson","rows":"4"}
 {"ts":"2026-05-21T23:06:24","uid":"5c926760f21a","type":"crew_save","facility":"Henderson"}
+{"ts":"2026-05-21T23:06:28","uid":"2cd2c3457cb0","type":"session_start","facility":"Henderson","mode":"📤 Upload schedule file"}

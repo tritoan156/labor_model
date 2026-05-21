@@ -4,9 +4,8 @@ Reads CSV inputs and returns clean DataFrames:
   - load_machine_labor()    → machine SKU labor table
   - load_acc_labor()        → accessory SKU labor table
   - load_schedule()         → work order schedule (auto-detects month, any location)
-  - load_item_master()      → reference items + family variants in one table
+  - load_item_master()      → unified items table (defaults + family variants + per-accessory)
   - load_item_packages()    → bundled packages (e.g. CWP, AWP)
-  - load_accessory_items()  → per-SKU item composition (analytical)
   - resolve_item_time()     → family-aware lookup for one (item, family, side)
   - unique_abbrs()          → unique item abbreviations from the master
 """
@@ -25,12 +24,10 @@ __all__ = [
     "load_acc_labor",
     "load_schedule",
     "build_manual_schedule",
-    "load_accessory_items",
     "load_item_master",
     "load_item_packages",
     "resolve_item_time",
     "unique_abbrs",
-    "accessory_item_rollup",
     "collapse_customer_suffix",
 ]
 
@@ -274,63 +271,6 @@ def load_item_packages(path: Path | str | None = None) -> pd.DataFrame:
     if "Total Time (min)" in df.columns:
         df["Total Time (min)"] = pd.to_numeric(df["Total Time (min)"], errors="coerce").fillna(0)
     return df.reset_index(drop=True)
-
-
-def load_accessory_items(path: Path | str | None = None) -> pd.DataFrame:
-    """Load the optional per-item breakdown of accessory labor.
-
-    Returns a DataFrame with columns:
-      `Accessory SKU`, `Category`, `Item`, `Time (min)`, `Notes`.
-
-    Category values: "Gen", "PM", or "Compressor".
-
-    When this file is present and has rows for a given accessory, the per-category
-    sums override the aggregate PMAcc / GenAcc / Compressor values in acc_clean.csv.
-    Returns an empty frame if the file is missing or empty.
-    """
-    if path is None:
-        path = DATA_DIR / "accessory_items.csv"
-    if not Path(path).exists():
-        return pd.DataFrame(columns=[
-            "Accessory SKU", "Category", "Item", "Time (min)", "Notes",
-        ])
-    try:
-        df = pd.read_csv(path)
-    except pd.errors.EmptyDataError:
-        return pd.DataFrame(columns=[
-            "Accessory SKU", "Category", "Item", "Time (min)", "Notes",
-        ])
-    if df.empty:
-        return df
-    # Tidy types
-    for c in df.select_dtypes(include="object").columns:
-        df[c] = df[c].astype(str).str.strip()
-    df["Time (min)"] = pd.to_numeric(df["Time (min)"], errors="coerce").fillna(0).astype(float)
-    # Drop empty rows
-    df = df[df["Accessory SKU"].notna() & (df["Accessory SKU"] != "")
-            & df["Category"].notna() & (df["Category"] != "")]
-    return df.reset_index(drop=True)
-
-
-def accessory_item_rollup(items_df: pd.DataFrame) -> pd.DataFrame:
-    """Sum item times per (Accessory SKU, Category). Pure computation — no override.
-
-    Returns a wide DataFrame indexed by Accessory SKU with columns:
-      `items_sum_Gen`, `items_sum_PM`, `items_sum_Compressor`.
-    Missing categories are 0. Used for comparison against the aggregate in
-    acc_clean.csv (we do NOT override the aggregate — analysis only).
-    """
-    if items_df is None or items_df.empty:
-        return pd.DataFrame(columns=[
-            "items_sum_Gen", "items_sum_PM", "items_sum_ComAcc",
-        ])
-    grouped = items_df.groupby(["Accessory SKU", "Category"])["Time (min)"].sum().unstack(fill_value=0)
-    rename = {"Gen": "items_sum_Gen", "PM": "items_sum_PM", "Compressor": "items_sum_ComAcc"}
-    grouped = grouped.rename(columns=rename)
-    for col in ("items_sum_Gen", "items_sum_PM", "items_sum_ComAcc"):
-        if col not in grouped.columns:
-            grouped[col] = 0.0
-    return grouped[["items_sum_Gen", "items_sum_PM", "items_sum_ComAcc"]]
 
 
 def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:

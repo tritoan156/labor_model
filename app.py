@@ -17,7 +17,7 @@ import streamlit as st
 
 from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
-    load_accessory_items, load_item_master, load_item_packages,
+    load_item_master, load_item_packages,
     resolve_item_time, unique_abbrs,
 )
 from core.labor_calculator import (
@@ -98,7 +98,7 @@ def _csv_mtime(filename: str) -> float:
 # Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
 # renames, new columns, etc.) so the cache invalidates even if the underlying
 # CSV file's mtime hasn't changed.
-_LOADER_SCHEMA_VERSION = 3
+_LOADER_SCHEMA_VERSION = 4
 
 
 @st.cache_data(show_spinner=False)
@@ -107,17 +107,10 @@ def _load_machine_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
 
 
 @st.cache_data(show_spinner=False)
-def _load_acc_df(_mtime: float, _items_mtime: float = 0.0,
-                 _schema_ver: int = _LOADER_SCHEMA_VERSION):
-    """The acc DataFrame depends on BOTH acc_clean.csv and accessory_items.csv,
-    so we take both mtimes as cache keys. `_schema_ver` lets us force a
-    refresh after a column rename even when the file mtime is unchanged."""
+def _load_acc_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
+    """Load acc_clean.csv. `_schema_ver` forces a cache refresh after schema
+    changes even when the file mtime is unchanged."""
     return load_acc_labor()
-
-
-@st.cache_data(show_spinner=False)
-def _load_accessory_items_df(_mtime: float):
-    return load_accessory_items()
 
 
 @st.cache_data(show_spinner=False)
@@ -1011,7 +1004,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = ""):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def tab_capacity_vs_demand(capacity, inputs):
+def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None):
     st.header("📊 Capacity vs Demand")
     st.markdown(
         "**Are stations comfortably staffed for this plan?** "
@@ -1117,6 +1110,23 @@ def tab_capacity_vs_demand(capacity, inputs):
             "**Raw** = theoretical maximum, no buffers applied. "
             "Battery row reports BATTERIES/day, not units/day."
         )
+
+    # ----------------------------------------------------------------
+    # 🔋 Battery throughput section (was a top-level tab before)
+    # ----------------------------------------------------------------
+    if batt_sku is not None and batt_type is not None:
+        total_batt = int(batt_sku["total_batteries"].sum()) if not batt_sku.empty else 0
+        if total_batt == 0:
+            st.markdown("---")
+            st.markdown("#### 🔋 Battery throughput")
+            st.info(
+                f"**No batteries needed for this plan at {inputs.get('location', '')}.** "
+                "(Either the schedule has no BOSS units, or this facility doesn't build batteries.)"
+            )
+        else:
+            st.markdown("---")
+            with st.expander("🔋 Battery throughput detail", expanded=False):
+                tab_battery_throughput(batt_sku, batt_type, capacity, inputs)
 
 
 def tab_battery_throughput(batt_sku, batt_type, capacity, inputs):
@@ -1335,6 +1345,231 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     )
 
 
+def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_packages_df):
+    """Consolidated data + admin tab.
+
+    Replaces three previous top-level tabs (Update Labor, Data Quality, Source
+    Data) with a single tab containing radio sub-views. Sub-views in order:
+
+      📋 Schedule              — read-only schedule view
+      🗂 Machine catalog       — editable catalog + add-new-SKU form
+      🗂 Accessory catalog     — editable catalog + add-new + XXX placeholder forms
+      🔩 Items                 — unified items table editor
+      📦 Item packages         — package definitions editor
+      🔬 Reconciliation & Apply — items-vs-aggregate diff + write-back
+      🔍 Data Quality          — validation report
+    """
+    st.header("📁 Data & Setup")
+    st.caption(
+        "All data inputs in one place. Switch views below to browse the schedule, "
+        "edit the catalogs, manage items / packages, reconcile, or run data quality checks."
+    )
+
+    sub = st.radio(
+        "View",
+        [
+            "📋 Schedule",
+            "🗂 Machine catalog",
+            "🗂 Accessory catalog",
+            "🔩 Items",
+            "📦 Item packages",
+            "🔬 Reconciliation & Apply",
+            "🔍 Data Quality",
+        ],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    # Used-in-schedule maps (shared by some sub-views)
+    used_fg = schedule_df.groupby("FG_BASE")["BUILD QTY"].sum().to_dict() \
+        if not schedule_df.empty else {}
+    used_acc = schedule_df[schedule_df["ACC"] != ""].groupby("ACC")["BUILD QTY"].sum().to_dict() \
+        if not schedule_df.empty else {}
+
+    if sub == "📋 Schedule":
+        st.subheader("📋 Schedule")
+        st.caption("Read-only view of the schedule currently driving the analysis tabs.")
+        if schedule_df.empty:
+            st.info("No schedule rows. Upload a CSV in the sidebar or switch to manual entry.")
+        else:
+            st.dataframe(schedule_df, use_container_width=True, height=600)
+
+    elif sub == "🗂 Machine catalog":
+        tab_floor_verification_machine(machine_df, schedule_df, used_fg)
+
+    elif sub == "🗂 Accessory catalog":
+        tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df)
+
+    elif sub == "🔩 Items":
+        _render_item_master_view(item_master_df)
+
+    elif sub == "📦 Item packages":
+        _render_item_packages_view(item_packages_df, item_master_df)
+
+    elif sub == "🔬 Reconciliation & Apply":
+        _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_acc)
+
+    elif sub == "🔍 Data Quality":
+        tab_data_validation(machine_df, acc_df)
+
+
+def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
+    """The Machine-catalog editor — extracted from the old tab_floor_verification
+    so it can be embedded as a sub-view of Data & Setup."""
+    st.subheader("🗂 Machine catalog")
+    _render_stale_data_banner("data/machine_clean.csv")
+    st.caption(
+        "Edit labor times in the table below. SKUs used in the current schedule "
+        "are highlighted. Click **💾 Save** to push changes to GitHub — all users "
+        "see new values after redeploy (~1 min)."
+    )
+
+    editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "Bat"]
+    display_df = machine_df.reset_index(drop=True).copy()
+    # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
+    if "FN_Assy_old" in display_df.columns and "FN_Assy" not in display_df.columns:
+        display_df = display_df.rename(columns={"FN_Assy_old": "FN_Assy"})
+    if "Last Modified" not in display_df.columns:
+        display_df["Last Modified"] = ""
+    display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_fg.get(s, 0)))
+    display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
+
+    only_used = st.checkbox(
+        "Show only SKUs used in current schedule", value=False, key="fv_m_only_used"
+    )
+    if only_used:
+        display_df = display_df[display_df["In schedule"]].copy()
+    display_df = display_df.sort_values(
+        by=["In schedule", "Used (qty)"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+    col_cfg = {
+        "SKU": st.column_config.TextColumn("SKU", disabled=True),
+        "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+        "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
+        "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
+        "Last Modified": st.column_config.TextColumn(
+            "Last Modified", disabled=True,
+            help="Date this row was last updated through the app. Blank = never edited.",
+        ),
+    }
+    for c in editable_cols:
+        col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
+
+    edited = st.data_editor(
+        display_df,
+        use_container_width=True, num_rows="fixed",
+        key="fv_machine_editor", height=600,
+        column_config=col_cfg, hide_index=True,
+    )
+
+    _render_pending_changes(edited, machine_df, editable_cols)
+
+    if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
+        _save_catalog_csv(
+            edited=edited, source_df=machine_df,
+            editable_cols=editable_cols,
+            file_path="data/machine_clean.csv", label="machine",
+        )
+
+    _render_add_new_sku(
+        source_df=machine_df, editable_cols=editable_cols,
+        file_path="data/machine_clean.csv", label="machine",
+    )
+
+
+def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
+    """The Accessory-catalog editor — extracted from tab_floor_verification."""
+    st.subheader("🗂 Accessory catalog")
+    _render_stale_data_banner("data/acc_clean.csv")
+    st.caption(
+        "Edit labor times in the table below. SKUs used in the current schedule "
+        "are highlighted. Click **💾 Save** to push changes to GitHub."
+    )
+
+    editable_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
+                     "PMAcc", "GenAcc", "ComAcc"]
+    display_df = acc_df.reset_index(drop=True).copy()
+    # Backward-compat: alias "Compressor" → "ComAcc" if cache is stale
+    if "Compressor" in display_df.columns and "ComAcc" not in display_df.columns:
+        display_df = display_df.rename(columns={"Compressor": "ComAcc"})
+    if "Last Modified" not in display_df.columns:
+        display_df["Last Modified"] = ""
+    display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_acc.get(s, 0)))
+    display_df.insert(1, "In schedule", display_df["Used (qty)"] > 0)
+
+    only_used = st.checkbox(
+        "Show only SKUs used in current schedule", value=False, key="fv_a_only_used"
+    )
+    if only_used:
+        display_df = display_df[display_df["In schedule"]].copy()
+    display_df = display_df.sort_values(
+        by=["In schedule", "Used (qty)"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+    # Live computed columns: Bat from machine catalog + Total per unit
+    bat_counts = display_df["SKU"].astype(str).apply(
+        lambda s: _family_battery_count(machine_df, _accessory_family_hint(s))
+    )
+    non_batt_cols = [c for c in editable_cols if c != "BattSubRaw"]
+    base = display_df[non_batt_cols].fillna(0).sum(axis=1)
+    per_batt = display_df["BattSubRaw"].fillna(0) if "BattSubRaw" in display_df.columns else 0
+    display_df["Bat"] = bat_counts.astype(int)
+    display_df["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
+
+    col_cfg = {
+        "SKU": st.column_config.TextColumn("SKU", disabled=True),
+        "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+        "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
+        "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
+        "Bat": st.column_config.NumberColumn(
+            "Bat", disabled=True,
+            help="Battery count for this accessory's FG family — from machine_clean.csv.",
+        ),
+        "Total per unit (p-min)": st.column_config.NumberColumn(
+            "Total per unit (p-min)", disabled=True,
+            help="Non-battery labor + BattSubRaw × Bat.",
+        ),
+        "Last Modified": st.column_config.TextColumn(
+            "Last Modified", disabled=True,
+            help="Date this row was last updated through the app. Blank = never edited.",
+        ),
+    }
+    for c in editable_cols:
+        col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
+
+    edited = st.data_editor(
+        display_df,
+        use_container_width=True, num_rows="fixed",
+        key="fv_acc_editor", height=600,
+        column_config=col_cfg, hide_index=True,
+    )
+    st.caption(
+        "💡 **Total per unit** = non-battery labor + `BattSubRaw × Bat`. "
+        "`Bat` is the exact count from the machine catalog (max within the family)."
+    )
+
+    _render_pending_changes(edited, acc_df, editable_cols)
+
+    if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
+        _save_catalog_csv(
+            edited=edited, source_df=acc_df,
+            editable_cols=editable_cols,
+            file_path="data/acc_clean.csv", label="accessory",
+        )
+
+    _render_add_new_sku(
+        source_df=acc_df, editable_cols=editable_cols,
+        file_path="data/acc_clean.csv", label="accessory",
+    )
+
+    # XXX-style placeholder helper (replaces the old A999 family placeholder)
+    _render_add_xxx_placeholder(
+        acc_df=acc_df, editable_cols=editable_cols,
+        file_path="data/acc_clean.csv",
+    )
+
+
 def tab_floor_verification(machine_df, acc_df, schedule_df):
     st.header("✅ Floor Verification — Update Labor Catalogs")
     st.caption(
@@ -1521,7 +1756,7 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         )
 
         # Family-level placeholder helper (e.g. BOSS25-A999)
-        _render_add_family_placeholder(
+        _render_add_xxx_placeholder(
             acc_df=acc_df,
             editable_cols=editable_cols,
             file_path="data/acc_clean.csv",
@@ -1569,34 +1804,35 @@ def _render_pending_changes(edited, source_df, editable_cols):
         st.dataframe(pd.DataFrame(diffs), use_container_width=True, hide_index=True)
 
 
-def _render_add_family_placeholder(acc_df, editable_cols, file_path):
-    """Quick form to add a family-level placeholder accessory (e.g. BOSS25-A999).
+def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
+    """Quick form to add an estimation placeholder accessory (e.g. `BOSS25 AXXX`).
 
-    Convenience wrapper around the regular new-SKU save flow that:
-      • Pre-fills the SKU as `{family}-A999` (read-only)
-      • Pre-fills the Description as "Family-level placeholder for {family}"
-      • Provides reasonable default labor times the user can override
-      • Rejects if `{family}-A999` already exists
+    Mirrors the machine-catalog `XXX` convention: pick a family, generate
+    `{family} AXXX` (with space), and save with default labor times you can
+    adjust. Existing examples already in the catalog include `PDS100 AXXX`,
+    `BOSS25PM AXXX`, `BOSS220PM AXXX`, etc.
 
     Note: the model does NOT auto-fall-back to this placeholder when an
-    accessory is missing. Some real orders have no accessory; a silent
-    fallback would inflate labor. The placeholder is a regular row that the
-    user can OPT to use by typing its SKU in the manual entry.
+    accessory is missing. Some real orders have no accessory component; a
+    silent fallback would inflate labor. The placeholder is a regular row
+    that the user can OPT to use by typing its SKU in the manual entry. The
+    Data Quality view automatically flags any `XXX` SKU as `⚠ Estimation placeholder`.
     """
-    with st.expander("➕ Add a family placeholder accessory", expanded=False):
+    with st.expander("➕ Add placeholder accessory (XXX)", expanded=False):
         st.caption(
-            "Creates a `{family}-A999` accessory row with the times you provide. "
-            "This is **not** used as an automatic fallback — it's just a "
-            "conventionally-named accessory you can reference explicitly."
+            "Creates a `{family} AXXX` placeholder accessory row, matching the "
+            "machine-catalog XXX naming convention. This is **not** used as an "
+            "automatic fallback — it's a conventionally-named accessory you can "
+            "reference explicitly."
         )
 
         family = st.selectbox(
             "FG family",
             options=KNOWN_FAMILIES,
-            help="The new placeholder SKU will be `{family}-A999`.",
+            help="The placeholder SKU will be `{family} AXXX`.",
             key="placeholder_family",
         )
-        new_sku = f"{family}-A999"
+        new_sku = f"{family} AXXX"
         st.text(f"SKU → {new_sku}")
 
         # Defaults — sensible numbers for the typical family placeholder
@@ -1610,10 +1846,10 @@ def _render_add_family_placeholder(acc_df, editable_cols, file_path):
             "ComAcc": 0,
         }
 
-        with st.form("add_family_placeholder", clear_on_submit=True):
+        with st.form("add_xxx_placeholder", clear_on_submit=True):
             new_desc = st.text_input(
                 "Description",
-                value=f"Family-level placeholder for {family}",
+                value=f"{family} ESTIMATION ACCESSORY PACKAGE",
                 key="placeholder_desc",
             )
 
@@ -1693,7 +1929,7 @@ def _render_add_family_placeholder(acc_df, editable_cols, file_path):
 
                     response = save_catalog_to_github(
                         csv_text, file_path, token,
-                        message=f"Add family placeholder {new_sku} via app",
+                        message=f"Add XXX placeholder accessory '{new_sku}' via app",
                         sha=fresh_sha,
                     )
                 break
@@ -1713,7 +1949,7 @@ def _render_add_family_placeholder(acc_df, editable_cols, file_path):
         except Exception:
             pass
         st.success(
-            f"✅ Added family placeholder `{new_sku}` "
+            f"✅ Added XXX placeholder accessory `{new_sku}` "
             + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
             + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
         )
@@ -3208,98 +3444,7 @@ def _save_simple_csv(df, file_path, label):
         st.error(f"Save failed: {e}")
 
 
-def _render_acc_items_view(acc_items_df, acc_df, used_acc, item_master_df):
-    """Editable view of per-item accessory labor that rolls up into GenAcc/PMAcc/Compressor."""
-    st.subheader("🧩 Individual accessory items")
-    st.markdown(
-        "Track each item that makes up an accessory (e.g. brake kit, decals, "
-        "filters). The **sum of items per category** replaces the aggregate "
-        "value in the accessory catalog when calculating labor."
-    )
-    st.caption(
-        "**Category** must be one of: `Gen` (rolls up to GenAcc) · "
-        "`PM` (rolls up to PMAcc) · `Compressor` (rolls up to Compressor station)."
-    )
-
-    # Helpful preview: per-SKU + Category sums vs the catalog aggregates
-    if not acc_items_df.empty:
-        roll = (
-            acc_items_df.groupby(["Accessory SKU", "Category"])["Time (min)"]
-            .sum().reset_index(name="Sum of items")
-        )
-        cat_to_col = {"Gen": "GenAcc", "PM": "PMAcc", "Compressor": "ComAcc"}
-        roll["Catalog value"] = roll.apply(
-            lambda r: float(acc_df.at[r["Accessory SKU"], cat_to_col[r["Category"]]])
-                      if r["Accessory SKU"] in acc_df.index and r["Category"] in cat_to_col
-                      else 0.0,
-            axis=1,
-        )
-        roll["Used in schedule"] = roll["Accessory SKU"].map(lambda s: used_acc.get(s, 0) > 0)
-        roll = roll.sort_values(by=["Used in schedule", "Accessory SKU", "Category"],
-                                 ascending=[False, True, True]).reset_index(drop=True)
-
-        with st.expander("📊 Roll-up preview — sum of items per accessory & category", expanded=False):
-            st.caption(
-                "Items override the catalog aggregate when present. Mismatch is OK if you "
-                "have not yet entered every item for a given accessory."
-            )
-            st.dataframe(roll, use_container_width=True, hide_index=True, height=320)
-
-    st.markdown("#### ✏️ Item rows")
-    st.caption("Add, edit, or remove rows. Click **Save** to push changes to GitHub.")
-
-    # Editable table
-    editor_seed = acc_items_df.copy() if not acc_items_df.empty else pd.DataFrame(
-        columns=["Accessory SKU", "Category", "Item", "Time (min)", "Notes"]
-    )
-
-    edited = st.data_editor(
-        editor_seed,
-        use_container_width=True,
-        num_rows="dynamic",
-        key="acc_items_editor",
-        height=520,
-        column_config={
-            "Accessory SKU": st.column_config.TextColumn(
-                "Accessory SKU", help="e.g. BOSS25-A016",
-            ),
-            "Category": st.column_config.TextColumn(
-                "Category",
-                help="Which station this item rolls up to: Gen, PM, or Compressor.",
-            ),
-            "Item": st.column_config.TextColumn("Item", help="e.g. Brake kit, Decals, Air filter"),
-            "Time (min)": st.column_config.NumberColumn(
-                "Time (min)", min_value=0, step=1,
-                help="Labor time for this single item (person-minutes).",
-            ),
-            "Notes": st.column_config.TextColumn("Notes", help="Optional notes."),
-        },
-    )
-
-    if st.button("💾 Save accessory items to GitHub", use_container_width=True):
-        token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
-        if not token:
-            st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
-        else:
-            try:
-                # Clean up: drop empty rows
-                clean = edited.copy()
-                clean["Accessory SKU"] = clean["Accessory SKU"].astype(str).str.strip()
-                clean["Category"] = clean["Category"].astype(str).str.strip()
-                clean = clean[(clean["Accessory SKU"] != "") & (clean["Category"] != "")
-                              & (clean["Accessory SKU"] != "nan")]
-                csv_text = clean.to_csv(index=False)
-                with st.spinner("Saving accessory items to GitHub..."):
-                    save_catalog_to_github(
-                        csv_text, "data/accessory_items.csv", token,
-                        message=f"Update accessory items via app ({len(clean)} rows)",
-                    )
-                st.success("✅ Saved! New values apply after the app redeploys (~1 min).")
-            except Exception as e:
-                st.error(f"Save failed: {e}")
-
-
-def tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
+def tab_source_data(machine_df, acc_df, schedule_df,
                      item_master_df, item_packages_df):
     st.header("📁 Source Data")
     st.caption(
@@ -3439,8 +3584,7 @@ def main():
 
     # Load data with cache
     machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
-    acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"), _csv_mtime("accessory_items.csv"))
-    acc_items_df = _load_accessory_items_df(_csv_mtime("accessory_items.csv"))
+    acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"))
     item_master_df = _load_item_master_df(_csv_mtime("item_master.csv"))
     item_packages_df = _load_item_packages_df(_csv_mtime("item_packages.csv"))
 
@@ -3482,38 +3626,33 @@ def main():
     current_months = schedule_df.loc[~schedule_df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
     schedule_month = current_months[0] if current_months else ""
 
-    # Tabs — ordered from executive summary → planner detail → admin
+    # Tabs — 6 top-level tabs, ordered from executive summary → planner detail → admin.
+    # Batteries content folded into Capacity. Update Labor + Data Quality + Source Data
+    # consolidated into the single 📁 Data & Setup tab.
     tabs = st.tabs([
         "🏠 Overview",
         "📊 Capacity",
-        "🔋 Batteries",
         "🔧 Recommendations",
         "⏱ Build Time",
         "🔀 Process Flow",
-        "✅ Update Labor",
-        "🔍 Data Quality",
-        "📁 Source Data",
+        "📁 Data & Setup",
     ])
 
     with tabs[0]:
         tab_overview(units, capacity, batt_type, inputs, schedule_month)
     with tabs[1]:
-        tab_capacity_vs_demand(capacity, inputs)
+        tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type)
     with tabs[2]:
-        tab_battery_throughput(batt_sku, batt_type, capacity, inputs)
-    with tabs[3]:
         tab_mitigation(capacity, batt_sku, units, inputs)
-    with tabs[4]:
+    with tabs[3]:
         tab_cycle_time(units, inputs)
-    with tabs[5]:
+    with tabs[4]:
         tab_process_flow(units, machine_df, acc_df, inputs)
-    with tabs[6]:
-        tab_floor_verification(machine_df, acc_df, schedule_df)
-    with tabs[7]:
-        tab_data_validation(machine_df, acc_df)
-    with tabs[8]:
-        tab_source_data(machine_df, acc_df, schedule_df, acc_items_df,
-                         item_master_df, item_packages_df)
+    with tabs[5]:
+        tab_data_setup(
+            machine_df=machine_df, acc_df=acc_df, schedule_df=schedule_df,
+            item_master_df=item_master_df, item_packages_df=item_packages_df,
+        )
 
 
 if __name__ == "__main__":

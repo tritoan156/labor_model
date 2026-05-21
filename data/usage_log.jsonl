@@ -42,3 +42,4 @@
 {"ts":"2026-05-21T23:06:28","uid":"2cd2c3457cb0","type":"session_start","facility":"Henderson","mode":"📤 Upload schedule file"}
 {"ts":"2026-05-21T23:06:29","uid":"2cd2c3457cb0","type":"schedule_load","mode":"📤 Upload schedule file","facility":"Henderson","rows":"156"}
 {"ts":"2026-05-21T23:06:33","uid":"d12797fd803d","type":"session_start","facility":"Henderson","mode":"📤 Upload schedule file"}
+{"ts":"2026-05-21T23:06:34","uid":"d12797fd803d","type":"schedule_load","mode":"📤 Upload schedule file","facility":"Henderson","rows":"156"}

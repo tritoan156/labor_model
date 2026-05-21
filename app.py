@@ -19,6 +19,7 @@ from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
     load_item_master, load_item_packages,
     resolve_item_time, unique_abbrs,
+    ScheduleColumnError,
 )
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
@@ -43,6 +44,14 @@ from core.scenario_storage import (
     get_scenario,
     save_scenario_to_github,
     delete_scenario_on_github,
+)
+from core.uploaded_schedule_storage import (
+    load_all_uploaded_schedules,
+    list_uploaded_schedules,
+    get_uploaded_schedule,
+    save_uploaded_schedule_to_github,
+    delete_uploaded_schedule_on_github,
+    SCHEDULES_PATH as _UPLOADED_SCHEDULES_PATH,
 )
 from core.process_flow_storage import (
     load_process_flow,
@@ -138,6 +147,12 @@ def _load_scenarios_dict(_mtime: float):
 
 
 @st.cache_data(show_spinner=False)
+def _load_uploaded_schedules_dict(_mtime: float):
+    """Load data/uploaded_schedules.json. Cached per file mtime."""
+    return load_all_uploaded_schedules()
+
+
+@st.cache_data(show_spinner=False)
 def _load_process_flow_edges(_mtime: float):
     """Load data/process_flow.json. Cached per file mtime."""
     return load_process_flow()
@@ -177,16 +192,75 @@ def _track_and_flush(event_type: str, *, force_flush: bool = True, **payload) ->
 
 
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
-    """Schedule loader — accepts an uploaded CSV or falls back to bundled data.
+    """Schedule loader — accepts an uploaded CSV, a saved-schedule buffer, or
+    falls back to the bundled May 2026 sample.
 
-    Passes the file as a BytesIO object so no temp file is written to disk,
-    which prevents race conditions when multiple users upload simultaneously.
+    Resolution order (first non-None wins):
+      1. A ``st.session_state['_loaded_schedule_buffer']`` value — produced by
+         "📂 Load saved schedule" in the sidebar. **One-shot**: the key is
+         cleared after consumption so the next rerun doesn't keep reloading
+         the same saved CSV when the planner just wants a fresh upload.
+      2. ``uploaded_file`` from the ``st.file_uploader`` widget.
+      3. The bundled ``data/may_schedule.csv``.
+
+    Passes file-like content as ``io.BytesIO`` so no temp file is written to
+    disk — protects against race conditions when multiple users upload
+    simultaneously and preserves the privacy guarantee that browser-only
+    uploads stay browser-only unless the planner explicitly saves them.
+
+    On a successful load the function stashes a tiny summary dict in
+    ``st.session_state['_last_upload_summary']`` so the sidebar can render
+    a "✅ Loaded N rows from X, month Y" confirmation.
+
+    Re-raises ``ScheduleColumnError`` so the caller can surface a clean,
+    planner-friendly message via ``st.warning``.
     """
     machine_skus = set(_load_machine_df(_csv_mtime("machine_clean.csv"))["SKU"])
+
+    # 1) Saved-schedule replay (one-shot)
+    buf = st.session_state.pop("_loaded_schedule_buffer", None)
+    if buf is not None:
+        df = load_schedule(buf, location=location, machine_skus=machine_skus)
+        _stash_upload_summary(df, location, source="saved")
+        return df
+
+    # 2) Live file upload
     if uploaded_file is not None:
-        buf = io.BytesIO(uploaded_file.getvalue())
-        return load_schedule(buf, location=location, machine_skus=machine_skus)
-    return load_schedule(location=location, machine_skus=machine_skus)
+        buf2 = io.BytesIO(uploaded_file.getvalue())
+        df = load_schedule(buf2, location=location, machine_skus=machine_skus)
+        _stash_upload_summary(df, location, source="upload")
+        return df
+
+    # 3) Bundled sample
+    df = load_schedule(location=location, machine_skus=machine_skus)
+    _stash_upload_summary(df, location, source="bundled")
+    return df
+
+
+def _stash_upload_summary(df: pd.DataFrame, location: str, source: str) -> None:
+    """Save a one-line description of the just-loaded schedule into session
+    state so the sidebar can echo it back to the planner as a green
+    confirmation pill. No-op when the DataFrame is empty (caller already
+    surfaces an empty-state banner)."""
+    try:
+        if df is None or df.empty:
+            st.session_state.pop("_last_upload_summary", None)
+            return
+        months = (
+            df.loc[~df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
+            if "CARRYOVER" in df.columns else []
+        )
+        month_label = months[0] if months else (
+            df["PRODUCTION MONTH"].iloc[0] if "PRODUCTION MONTH" in df.columns else ""
+        )
+        st.session_state["_last_upload_summary"] = {
+            "rows": int(len(df)),
+            "location": str(location),
+            "month": str(month_label or "—"),
+            "source": source,
+        }
+    except Exception:
+        st.session_state.pop("_last_upload_summary", None)
 
 
 # =============================================================
@@ -384,6 +458,213 @@ def _scenario_delete(location: str, name: str) -> None:
         _track_and_flush("scenario_delete", facility=location, name=name)
         st.session_state[f"_scenario_toast_{location}"] = (
             "success", f"🗑 Deleted scenario **{name}** for {location}.",
+        )
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Delete failed: {e}")
+
+
+# =============================================================
+# Uploaded-schedule save/load/delete — sidebar expander.
+# Mirrors the scenarios pattern (_scenario_save/load/delete) but stores
+# the raw CSV bytes in data/uploaded_schedules.json so a teammate can
+# reload the exact same schedule later. Per-facility keyed.
+# =============================================================
+def _render_uploaded_schedules_panel(location: str, uploaded_file) -> None:
+    """Sidebar expander for saving / loading named uploaded schedules.
+
+    ``uploaded_file`` is the live ``st.file_uploader`` widget value (or None).
+    When the planner clicks Save, we serialize those bytes to text and push
+    to GitHub. When they click Load, we stash a BytesIO in session_state
+    that ``_load_schedule_df`` consumes one-shot on the next rerun.
+    """
+    all_schedules = _load_uploaded_schedules_dict(_csv_mtime("uploaded_schedules.json"))
+    by_loc = all_schedules.get(location, {}) if isinstance(all_schedules, dict) else {}
+    schedule_names = sorted(by_loc.keys()) if isinstance(by_loc, dict) else []
+
+    with st.sidebar.expander("📂 Save / load uploaded schedules", expanded=False):
+        # Replay any one-shot toast stashed before rerun
+        toast_key = f"_uploaded_schedule_toast_{location}"
+        toast = st.session_state.pop(toast_key, None)
+        if toast:
+            level, msg = toast
+            if level == "success":
+                st.success(msg)
+            elif level == "info":
+                st.info(msg)
+            else:
+                st.error(msg)
+
+        st.caption(
+            f"Saved schedules for **{location}** only. "
+            "Pushed to `data/uploaded_schedules.json` on GitHub — shared "
+            "with the whole team."
+        )
+
+        # ------------------------------------------------------------------
+        # SAVE — uses the live uploader bytes if present, otherwise the
+        # bundled sample (so a planner can save the "current view" they're
+        # working with without re-uploading).
+        # ------------------------------------------------------------------
+        st.markdown("**Save current upload as**")
+        save_name = st.text_input(
+            "Schedule name",
+            key=f"uploaded_schedule_save_name_{location}",
+            placeholder="e.g. May 2026 production plan",
+            label_visibility="collapsed",
+        )
+        if st.button(
+            "💾 Save schedule",
+            key=f"uploaded_schedule_save_btn_{location}",
+            use_container_width=True,
+            disabled=(uploaded_file is None),
+            help=(
+                "Saves the file you uploaded above to GitHub under this "
+                "facility, so teammates can reload it. Upload a file first."
+                if uploaded_file is None else
+                "Pushes your current uploaded CSV to GitHub. Teammates can "
+                "reload it from the dropdown below."
+            ),
+        ):
+            _uploaded_schedule_save(location, save_name, uploaded_file, schedule_names)
+
+        # ------------------------------------------------------------------
+        # LOAD + DELETE
+        # ------------------------------------------------------------------
+        st.markdown("**Load saved**")
+        if not schedule_names:
+            st.caption("_No saved schedules for this facility yet._")
+        else:
+            chosen = st.selectbox(
+                "Saved schedule",
+                schedule_names,
+                key=f"uploaded_schedule_load_pick_{location}",
+                label_visibility="collapsed",
+            )
+            block = by_loc.get(chosen) or {}
+            saved_at = block.get("saved_at", "?")
+            rows = block.get("rows", "?")
+            st.caption(f"Last saved: **{saved_at}** · **{rows}** rows")
+            c1, c2 = st.columns([3, 1])
+            if c1.button(
+                "📥 Load", key=f"uploaded_schedule_load_btn_{location}",
+                use_container_width=True,
+            ):
+                _uploaded_schedule_load(location, chosen)
+            if c2.button(
+                "🗑 Delete", key=f"uploaded_schedule_del_btn_{location}",
+                use_container_width=True,
+            ):
+                _uploaded_schedule_delete(location, chosen)
+
+
+def _uploaded_schedule_save(
+    location: str, name: str, uploaded_file, existing_names: list,
+) -> None:
+    """Save the planner's currently-uploaded CSV under ``name`` to GitHub.
+
+    Mirrors ``_scenario_save`` — same overwrite-confirmation pattern (per-
+    location key carrying the name we warned about, cleared on save) so a
+    stale flag can't fire an unconfirmed overwrite later.
+    """
+    name = (name or "").strip()
+    if not name:
+        st.warning("Please enter a schedule name before saving.")
+        return
+    if uploaded_file is None:
+        st.warning("Upload a CSV first, then save it.")
+        return
+
+    confirm_key = f"_uploaded_schedule_overwrite_pending_{location}"
+    if name in existing_names:
+        if st.session_state.get(confirm_key) != name:
+            st.session_state[confirm_key] = name
+            st.warning(
+                f"A schedule named **{name}** already exists for {location}. "
+                "Click **💾 Save schedule** again to overwrite it."
+            )
+            return
+        st.session_state.pop(confirm_key, None)
+    else:
+        st.session_state.pop(confirm_key, None)
+
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return
+
+    # Decode the upload bytes to text. The loader handles latin-1 / UTF-8 /
+    # UTF-8-with-BOM transparently; here we just need *some* text encoding
+    # we can re-parse. Try utf-8 first, fall back to latin-1.
+    try:
+        raw = uploaded_file.getvalue()
+        try:
+            csv_text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            csv_text = raw.decode("latin-1")
+    except Exception as e:
+        st.error(f"❌ Couldn't read the uploaded file: {e}")
+        return
+
+    try:
+        with st.spinner(f"Saving schedule '{name}' for {location}..."):
+            response = save_uploaded_schedule_to_github(location, name, csv_text, token)
+        commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
+        commit_url = (response or {}).get("commit", {}).get("html_url", "")
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        _track_and_flush(
+            "schedule_save", facility=location, name=name,
+            rows=len(csv_text.splitlines()) - 1,
+        )
+        st.session_state.pop(confirm_key, None)
+        st.session_state[f"_uploaded_schedule_toast_{location}"] = (
+            "success",
+            f"✅ Saved schedule **{name}** for {location}"
+            + (f" (commit [`{commit_sha}`]({commit_url}))." if commit_url else "."),
+        )
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Save failed: {e}")
+
+
+def _uploaded_schedule_load(location: str, name: str) -> None:
+    """Load a saved schedule by stashing its CSV bytes into session_state.
+
+    ``_load_schedule_df`` picks the buffer up on the next rerun and feeds it
+    to ``load_schedule`` as if the planner had just uploaded the file. The
+    buffer is cleared once consumed, so a fresh upload still wins on the
+    rerun after that.
+    """
+    block = get_uploaded_schedule(location, name) or {}
+    csv_text = block.get("csv_content", "")
+    if not csv_text:
+        st.warning(f"Saved schedule '{name}' is empty.")
+        return
+    st.session_state["_loaded_schedule_buffer"] = io.BytesIO(csv_text.encode("utf-8"))
+    _track_and_flush("schedule_load_saved", facility=location, name=name)
+    st.success(f"Loaded saved schedule **{name}** for {location}.")
+    st.rerun()
+
+
+def _uploaded_schedule_delete(location: str, name: str) -> None:
+    """Handler for the Delete button."""
+    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    if not token:
+        st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+        return
+    try:
+        with st.spinner(f"Deleting saved schedule '{name}'..."):
+            delete_uploaded_schedule_on_github(location, name, token)
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        _track_and_flush("schedule_delete", facility=location, name=name)
+        st.session_state[f"_uploaded_schedule_toast_{location}"] = (
+            "success", f"🗑 Deleted saved schedule **{name}** for {location}.",
         )
         st.rerun()
     except Exception as e:
@@ -814,7 +1095,12 @@ def render_sidebar() -> dict:
         uploaded = st.sidebar.file_uploader(
             "Choose a CSV",
             type=["csv"],
-            help="Expected columns: LOCATION, FG SKU ID, FG ACCRY SKU ID, BUILD QTY, PRODUCTION MONTH.",
+            help=(
+                "Required columns (any of these names will match): LOCATION / "
+                "Facility, FG SKU ID / FG SKU, FG ACCRY SKU ID / Accessory SKU, "
+                "BUILD QTY / Qty, PRODUCTION MONTH / Month. Extra columns are "
+                "ignored. Optional: CUSTOMER NAME."
+            ),
             label_visibility="collapsed",
         )
         # Blank template — gives the planner a ready-to-fill CSV with exactly
@@ -833,15 +1119,34 @@ def render_sidebar() -> dict:
             mime="text/csv",
             use_container_width=True,
             help=(
-                "Empty CSV with the 5 columns the app needs. Fill in your "
+                "Empty CSV with the columns the app needs. Fill in your "
                 "schedule and re-upload."
             ),
         )
         st.sidebar.caption(
-            "🔒 Uploaded schedules stay in your browser. They aren't saved "
-            "on the server, pushed to GitHub, or shared with other users."
+            "🔒 Uploaded schedules stay in your browser by default. "
+            "Use the 📂 panel below to save one to GitHub for the team."
         )
-        if uploaded is None:
+
+        # Save / load / delete uploaded schedules (per-facility, shared)
+        _render_uploaded_schedules_panel(location, uploaded)
+
+        # Validation summary — shows once a schedule has actually loaded.
+        # Cleared automatically when the next schedule load attempt happens.
+        _summary = st.session_state.get("_last_upload_summary")
+        if _summary and isinstance(_summary, dict):
+            _src_label = {
+                "upload":  "uploaded CSV",
+                "saved":   "saved schedule",
+                "bundled": "bundled sample",
+            }.get(_summary.get("source", ""), "schedule")
+            st.sidebar.success(
+                f"✅ Loaded **{_summary.get('rows', '?')}** rows from "
+                f"**{_summary.get('location', '?')}** "
+                f"· month **{_summary.get('month', '—')}** "
+                f"({_src_label})"
+            )
+        elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
     else:
         st.sidebar.caption(
@@ -4092,8 +4397,16 @@ def main():
                     "the sidebar. You can still use **📁 Data & Setup** to edit catalogs."
                 )
     else:
-        schedule_df = _load_schedule_df(inputs["uploaded"], location=inputs["location"])
-        if schedule_df.empty:
+        try:
+            schedule_df = _load_schedule_df(inputs["uploaded"], location=inputs["location"])
+        except ScheduleColumnError as e:
+            # Planner-friendly message with no internals leaked.
+            empty_banner_msg = (
+                f"📤 **We couldn't read your uploaded schedule.**  \n{e}  \n"
+                "You can still use **📁 Data & Setup** to browse and edit catalogs."
+            )
+            schedule_df = pd.DataFrame()
+        if schedule_df.empty and not empty_banner_msg:
             empty_banner_msg = (
                 f"⚠️ No schedule rows found for **{inputs['location']}**. "
                 "Upload a CSV that contains this location, or select a different location. "

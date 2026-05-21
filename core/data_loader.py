@@ -58,6 +58,35 @@ __all__ = [
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
+# ---------------------------------------------------------------------------
+# Column-name fuzzy matcher (shared across loaders)
+# ---------------------------------------------------------------------------
+def _find_column(df_cols, *patterns: str) -> str | None:
+    """Case-insensitive substring match: return the first DataFrame column
+    whose header contains any of the given ``patterns`` (themselves
+    case-insensitive).
+
+    The match is robust to whitespace, line breaks, and prefixes/suffixes the
+    user's ERP export might add — e.g. ``"PRODUCTION MONTH"`` matches a header
+    cell named ``"Production Month "``, ``"PROD\\nMONTH"`` or ``"production_month"``.
+    """
+    norm_cols = [(c, str(c).strip().upper().replace("\n", " ")) for c in df_cols]
+    for pat in patterns:
+        pat_norm = pat.strip().upper().replace("\n", " ")
+        for orig, norm in norm_cols:
+            if pat_norm in norm:
+                return orig
+    return None
+
+
+class ScheduleColumnError(ValueError):
+    """Raised by ``load_schedule`` when a required column can't be matched.
+
+    The exception's ``args[0]`` is a human-friendly message that the upload
+    UI surfaces verbatim (no token / no internals leak).
+    """
+
+
 def _safe_get(df: pd.DataFrame, possible_columns: list, default=0):
     """Return the first column name from possible_columns that exists in df."""
     for col in possible_columns:
@@ -398,6 +427,80 @@ def _detect_schedule_months(df: pd.DataFrame, include_carryover: bool) -> list[s
     return keep
 
 
+_REQUIRED_SCHEDULE_COLUMNS = [
+    # (canonical_name, [acceptable patterns for fuzzy matching], friendly label)
+    ("LOCATION",         ["LOCATION", "FACILITY", "SITE", "PLANT"],                              "Location"),
+    ("FG SKU ID",        ["FG SKU ID", "FG SKU", "FG_SKU", "FINISHED GOOD", "SKU ID"],           "FG SKU ID"),
+    ("FG ACCRY SKU ID",  ["FG ACCRY", "FG ACC SKU", "ACCESSORY SKU", "ACCRY SKU", "ACC SKU"],    "Accessory SKU ID"),
+    ("BUILD QTY",        ["BUILD QTY", "BUILD QUANTITY", "BUILD_QTY", "QUANTITY", "QTY"],        "Build Qty"),
+    ("PRODUCTION MONTH", ["PRODUCTION MONTH", "PROD MONTH", "PRODUCTION DATE", "MONTH"],         "Production Month"),
+]
+_OPTIONAL_SCHEDULE_COLUMNS = [
+    ("CUSTOMER NAME", ["CUSTOMER NAME", "CUSTOMER", "CUST"]),
+]
+
+
+def _resolve_schedule_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename the user's columns to the canonical names the rest of the loader
+    expects. Raises ``ScheduleColumnError`` with a clear, actionable message
+    if a required column can't be matched (case-insensitive substring).
+
+    Extra columns are preserved untouched — pandas treats them as ignored.
+    """
+    rename_map: dict[str, str] = {}
+    for canonical, patterns, label in _REQUIRED_SCHEDULE_COLUMNS:
+        if canonical in df.columns:
+            continue  # already named correctly
+        found = _find_column(df.columns, *patterns)
+        if found is None:
+            tried = ", ".join(f"`{p}`" for p in patterns)
+            raise ScheduleColumnError(
+                f"Your CSV is missing a column for **{label}**. "
+                f"We tried matching: {tried}. "
+                "Rename or add this column and re-upload."
+            )
+        if found != canonical:
+            rename_map[found] = canonical
+    for canonical, patterns in _OPTIONAL_SCHEDULE_COLUMNS:
+        if canonical in df.columns:
+            continue
+        found = _find_column(df.columns, *patterns)
+        if found is not None and found != canonical:
+            rename_map[found] = canonical
+    return df.rename(columns=rename_map) if rename_map else df
+
+
+def _coerce_production_month(s: pd.Series) -> pd.Series:
+    """Normalize a `PRODUCTION MONTH` column to the canonical ``Mon-YY``
+    format (e.g. ``May-26``) where possible.
+
+    Accepts the original formats (``Mon-YY``, ``YY-Mon``) plus US-slash
+    (``5/8/2026``), ISO (``2026-05-08``), and any value pandas can coerce
+    via ``pd.to_datetime``. Unrecognized values pass through unchanged so
+    the planner can still see the literal text in error contexts.
+
+    Carryover rows (``YY-Mon``) are intentionally left alone so the
+    downstream ``CARRYOVER`` flag still fires correctly.
+    """
+    s = s.astype("object").fillna("").astype(str).str.strip()
+
+    carryover_re = re.compile(r"^\d{2}-[A-Za-z]{3}$")
+    current_re = re.compile(r"^[A-Za-z]{3}-\d{2}$")
+
+    def _normalize(val: str) -> str:
+        if not val:
+            return ""
+        if carryover_re.match(val) or current_re.match(val):
+            return val  # already canonical
+        # Try parsing as a date — pd.to_datetime accepts most common formats.
+        ts = pd.to_datetime(val, errors="coerce")
+        if pd.notna(ts):
+            return ts.strftime("%b-%y")
+        return val  # leave as-is; downstream filter will surface the issue
+
+    return s.map(_normalize)
+
+
 def load_schedule(
     path: Union[Path, str, io.IOBase, None] = None,
     location: str = "HENDERSON",
@@ -412,23 +515,55 @@ def load_schedule(
     Filters to the given location. Month filtering is auto-detected from the
     data so any schedule month works without code changes.
     Strips customer suffixes (HRC/UR/ES/HERC) when machine_skus is provided.
+
+    Robust to real-world Excel exports:
+    - Case-insensitive substring matching on the 5 required column names so
+      ``"Location"``, ``"FG SKU"``, ``"Qty"`` etc. all resolve.
+    - Strips UTF-8 BOM (Excel 2016+ Windows default) from column headers.
+    - Accepts ``Mon-YY`` / ``YY-Mon`` / US-slash / ISO / pandas-parseable
+      production-month formats.
+    - Drops rows with ``BUILD QTY <= 0`` so zero-qty phantoms can't sneak
+      through.
+
+    Raises ``ScheduleColumnError`` (a ValueError subclass) with a planner-
+    friendly message when a required column simply isn't present.
     """
     if path is None:
         path = DATA_DIR / "may_schedule.csv"
     df = pd.read_csv(path, encoding="latin-1")
-    # Drop empty/junk rows
-    df = df[df["FG SKU ID"].notna() & df["BUILD QTY"].notna()].copy()
-    # Normalise text cols
+
+    # 1) Strip UTF-8 BOM and stray whitespace from column headers so an Excel
+    # export (which often saves as UTF-8 with BOM on Windows) doesn't
+    # mysteriously fail the column lookup.
+    df.columns = [str(c).lstrip("﻿").strip() for c in df.columns]
+
+    # 2) Resolve fuzzy column names to the canonical names downstream code
+    # expects. Raises ScheduleColumnError on missing required columns.
+    df = _resolve_schedule_columns(df)
+
+    # 3) Coerce BUILD QTY to integer before filtering, so non-numeric junk
+    # (section divider rows, empty strings) becomes NaN → dropped, and 0-qty
+    # rows don't sneak through as phantom units.
+    df["__qty_num"] = pd.to_numeric(df["BUILD QTY"], errors="coerce")
+    df = df[df["FG SKU ID"].notna() & df["__qty_num"].notna() & (df["__qty_num"] > 0)].copy()
+    df["BUILD QTY"] = df["__qty_num"].astype(int)
+    df.drop(columns=["__qty_num"], inplace=True)
+
+    # 4) Normalise text cols
     df["LOC"] = df["LOCATION"].astype(str).str.upper().str.strip()
     df["FG_RAW"] = df["FG SKU ID"].astype(str).str.strip()
     df["ACC"] = df["FG ACCRY SKU ID"].astype(str).str.strip().replace("nan", "")
-    df["BUILD QTY"] = df["BUILD QTY"].astype(int)
 
-    # Filter location first so month detection is scoped to the right rows
+    # 5) Normalise PRODUCTION MONTH to canonical Mon-YY where possible so the
+    # downstream regex-based filter and the CARRYOVER flag work whether the
+    # source uses Mon-YY, 5/8/2026, 2026-05-08, etc.
+    df["PRODUCTION MONTH"] = _coerce_production_month(df["PRODUCTION MONTH"])
+
+    # 6) Filter location first so month detection is scoped to the right rows
     if location:
         df = df[df["LOC"] == location.upper()]
 
-    # Detect carryover rows (YY-Mon format) vs current rows (Mon-YY format).
+    # 7) Detect carryover rows (YY-Mon format) vs current rows (Mon-YY format).
     # Use vectorized .str.match() with na=False — robust against PyArrow-backed
     # string columns (Python 3.14 + newer pandas default these), where Arrow
     # NA scalars can leak through .apply() and break re.match(). Casting to
@@ -444,7 +579,7 @@ def load_schedule(
         .astype(bool)
     )
 
-    # Filter to detected months
+    # 8) Filter to detected months
     months = _detect_schedule_months(df, include_carryover)
     if months:
         df = df[df["PRODUCTION MONTH"].isin(months)]

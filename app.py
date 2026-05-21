@@ -1321,6 +1321,30 @@ def render_sidebar() -> dict:
 - **Effective capacity** = `HC × shift × days × efficiency × safety` person-minutes/period.
 - **Utilization %** — `demand ÷ effective capacity`. >100% means over capacity.
 
+### Labor vs Throughput utilization
+
+Each station has **two** utilization checks. The overall flag (🟢/🟡/🟠/🔴) is the worst of the two — because either one can be the actual bottleneck, and the fix is different.
+
+**Labor utilization** — *"Do I have enough people?"*
+- `labor_util = labor_demand ÷ labor_capacity`
+- `labor_capacity = HC × shift × days × efficiency × safety` (person-minutes available).
+- **Fix when red:** hire more, run overtime, extend the work week. Tuned by the **HC** sidebar control.
+
+**Throughput utilization** — *"Do I have enough stations/fixtures/bays?"*
+- `thru_util = units_per_day ÷ thru_capacity`
+- `thru_capacity = Stations/Cells × (shift ÷ avg_cycle) × efficiency × safety` (units/day the station can physically push through).
+- **Fix when red:** add more cells, shorten cycle time, extend working days. **Adding people doesn't help** — the constraint is the work footprint, not the workforce. Tuned by the **Stations/Cells** sidebar control.
+
+**The classic example: Battery Assembly.** Each battery cell takes ~170 calendar minutes to build, regardless of how many people you put around it. If you have 4 cells but the plan needs 50 batteries/day, throughput maxes out at ~11/day — hiring more people does nothing. You need more cells.
+
+The Overview's **🎯 Recommended actions** splits these two cases so you don't waste a hiring request on a throughput bottleneck.
+
+| If this is red | What's pinching | Where to look |
+|---|---|---|
+| Labor util | Headcount | Sidebar → **People (HC)** |
+| Throughput util | Physical capacity | Sidebar → **Stations/Cells** |
+| Both | Both — fix the cells first, hire to fill them | Both controls |
+
 ### Unit classes
 - **STD** — Standard trailer (full assembly with marry)
 - **HS** — Head Skid only (no trailer)

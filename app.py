@@ -3622,43 +3622,79 @@ def main():
     item_master_df = _load_item_master_df(_csv_mtime("item_master.csv"))
     item_packages_df = _load_item_packages_df(_csv_mtime("item_packages.csv"))
 
+    # ----------------------------------------------------------------
+    # Load schedule (manual or CSV). If empty / invalid, we don't return —
+    # instead we fall through with empty placeholders so the tabs still
+    # render and the user can edit data via the 📁 Data & Setup tab.
+    # ----------------------------------------------------------------
+    schedule_df = pd.DataFrame()
+    empty_banner_msg = None
+
     if inputs.get("schedule_mode") == "✏️ Type a few SKUs":
         manual_entries = inputs.get("manual_entries")
         if manual_entries is None or manual_entries.empty:
-            st.info("✏️ **Manual entry mode** — fill in FG SKU and Quantity in the sidebar to begin.")
-            return
-        machine_skus = set(machine_df["SKU"])
-        schedule_df = build_manual_schedule(
-            manual_entries, location=inputs["location"], machine_skus=machine_skus,
-        )
-        if schedule_df.empty:
-            st.info("✏️ **Manual entry mode** — please fill in at least one row (FG SKU + Quantity > 0) in the sidebar.")
-            return
+            empty_banner_msg = (
+                "✏️ **Manual entry mode** — fill in FG SKU and Quantity in the sidebar to populate "
+                "the analysis tabs. You can still use **📁 Data & Setup** to edit catalogs."
+            )
+        else:
+            machine_skus = set(machine_df["SKU"])
+            schedule_df = build_manual_schedule(
+                manual_entries, location=inputs["location"], machine_skus=machine_skus,
+            )
+            if schedule_df.empty:
+                empty_banner_msg = (
+                    "✏️ **Manual entry mode** — fill in at least one row (FG SKU + Quantity > 0) in "
+                    "the sidebar. You can still use **📁 Data & Setup** to edit catalogs."
+                )
     else:
         schedule_df = _load_schedule_df(inputs["uploaded"], location=inputs["location"])
         if schedule_df.empty:
-            st.error(
-                f"No schedule rows found for **{inputs['location']}**. "
-                "Upload a schedule CSV that contains this location, or select a different location."
+            empty_banner_msg = (
+                f"⚠️ No schedule rows found for **{inputs['location']}**. "
+                "Upload a CSV that contains this location, or select a different location. "
+                "You can still use **📁 Data & Setup** to edit catalogs."
             )
-            return
 
-    # Compute everything
-    units = expand_schedule(schedule_df, machine_df, acc_df)
+    # ----------------------------------------------------------------
+    # Compute analysis frames. Empty-safe: when there are no units, we
+    # construct empty placeholders so downstream tabs can detect the
+    # empty state and show their own banner instead of crashing.
+    # ----------------------------------------------------------------
+    if schedule_df.empty:
+        units = pd.DataFrame()
+    else:
+        units = expand_schedule(schedule_df, machine_df, acc_df)
+        if units.empty:
+            empty_banner_msg = (
+                "⚠️ Could not expand schedule into units. Check that FG / Accessory SKUs "
+                "match the catalog. You can edit catalogs in **📁 Data & Setup**."
+            )
+
     if units.empty:
-        st.error("Could not expand schedule into units. Check FG/Acc SKUs match the catalog.")
-        return
-
-    capacity = build_capacity_table(
-        units, inputs["crew_config"], inputs["shift"], inputs["days"],
-        inputs["safety"], inputs["efficiency"],
-    )
-    batt_sku = battery_demand_by_sku(units)
-    batt_type = battery_demand_by_type(units)
+        capacity = pd.DataFrame()
+        batt_sku = pd.DataFrame(columns=["fg_base", "batt_type", "units", "batt_per_unit",
+                                           "total_batteries", "pct_of_total"])
+        batt_type = pd.DataFrame(columns=["batt_type", "total_batteries", "units_count",
+                                           "pct_of_total"])
+    else:
+        capacity = build_capacity_table(
+            units, inputs["crew_config"], inputs["shift"], inputs["days"],
+            inputs["safety"], inputs["efficiency"],
+        )
+        batt_sku = battery_demand_by_sku(units)
+        batt_type = battery_demand_by_type(units)
 
     # Detect schedule month for display (Mon-YY format rows, not carryover)
-    current_months = schedule_df.loc[~schedule_df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
-    schedule_month = current_months[0] if current_months else ""
+    if schedule_df.empty or "CARRYOVER" not in schedule_df.columns:
+        schedule_month = ""
+    else:
+        current_months = schedule_df.loc[~schedule_df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
+        schedule_month = current_months[0] if current_months else ""
+
+    # Top-of-page banner when there's no schedule loaded
+    if empty_banner_msg:
+        st.info(empty_banner_msg)
 
     # Tabs — 6 top-level tabs, ordered from executive summary → planner detail → admin.
     # Batteries content folded into Capacity. Update Labor + Data Quality + Source Data
@@ -3672,15 +3708,37 @@ def main():
         "📁 Data & Setup",
     ])
 
+    # Helper — show an "empty state" message inside analysis tabs when there's no schedule
+    def _empty_state(tab_name: str):
+        st.info(
+            f"📭 **{tab_name} needs a schedule to populate.**  \n"
+            "• In the sidebar, switch to **📤 Upload schedule file** or **✏️ Type a few SKUs**.  \n"
+            "• You can still edit catalogs, items, packages, and the process flow from the "
+            "**📁 Data & Setup** tab without a schedule."
+        )
+
     with tabs[0]:
-        tab_overview(units, capacity, batt_type, inputs, schedule_month)
+        if units.empty:
+            _empty_state("Overview")
+        else:
+            tab_overview(units, capacity, batt_type, inputs, schedule_month)
     with tabs[1]:
-        tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type)
+        if units.empty:
+            _empty_state("Capacity")
+        else:
+            tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type)
     with tabs[2]:
-        tab_mitigation(capacity, batt_sku, units, inputs)
+        if units.empty:
+            _empty_state("Recommendations")
+        else:
+            tab_mitigation(capacity, batt_sku, units, inputs)
     with tabs[3]:
-        tab_cycle_time(units, inputs)
+        if units.empty:
+            _empty_state("Build Time")
+        else:
+            tab_cycle_time(units, inputs)
     with tabs[4]:
+        # Process Flow can show the editable flow even without a schedule
         tab_process_flow(units, machine_df, acc_df, inputs)
     with tabs[5]:
         tab_data_setup(

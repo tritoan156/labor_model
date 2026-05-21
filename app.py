@@ -618,7 +618,7 @@ def render_sidebar() -> dict:
 
         # Cached loaders — same path as main(), no extra I/O
         machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
-        acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"), _csv_mtime("accessory_items.csv"))
+        acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"))
 
         # Per-location state keys: a seed DataFrame and a revision counter
         # that we bump every time we programmatically inject a row.
@@ -812,6 +812,13 @@ def render_sidebar() -> dict:
 
 ### Status colors
 🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility · 🆕 Recently added
+
+### GitHub Save (for admins)
+Most of the **💾 Save** buttons push CSVs/JSON back to the project's GitHub repo so changes apply to everyone after the next ~1 min Streamlit Cloud redeploy. This requires a **GitHub Personal Access Token** with the `repo` scope, stored in **Streamlit Cloud → Settings → Secrets** as:
+```toml
+github_token = "ghp_xxxxxxxxxxxxxxxxxxxxxxxx"
+```
+If you see "GitHub token not configured" when saving, ask the app's admin to add the token. Read-only browsing works without it.
 
 ### Tip
 Hover any column header in a table to see its specific tooltip.

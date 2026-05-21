@@ -17,6 +17,30 @@ from pathlib import Path
 from typing import Union
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# Compatibility shim — newer pandas (the one Streamlit Cloud's Python 3.14
+# image ships with) defaults string columns to a PyArrow-backed dtype. That
+# causes two distinct breakages in this codebase:
+#   1. .apply(lambda) on the column may leak Arrow <NA> scalars into pure-
+#      Python callbacks like re.match, raising TypeError.
+#   2. Arithmetic on a column the loader *thought* it had coerced to numeric
+#      (`pd.to_numeric(...)` can still preserve the Arrow backend in newer
+#      pandas) raises "Can only string multiply by an integer" when the
+#      result is multiplied by another Series.
+# Switching the future option off restores the old object-dtype behavior so
+# every loader + arithmetic op in the project behaves like it always has.
+# Guarded with try/except so older pandas (where the option doesn't exist)
+# silently keeps working.
+# ---------------------------------------------------------------------------
+try:
+    pd.set_option("future.infer_string", False)
+except Exception:
+    pass
+try:
+    pd.set_option("mode.string_storage", "python")
+except Exception:
+    pass
+
 from .constants import CUSTOMER_SUFFIXES, BATTERY_COUNT_OVERRIDES
 
 __all__ = [

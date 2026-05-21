@@ -1853,13 +1853,26 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
         by=["In schedule", "Used (qty)"], ascending=[False, False]
     ).reset_index(drop=True)
 
-    # Live computed columns: Bat from machine catalog + Total per unit
-    bat_counts = display_df["SKU"].astype(str).apply(
-        lambda s: _family_battery_count(machine_df, _accessory_family_hint(s))
-    )
+    # Live computed columns: Bat from machine catalog + Total per unit.
+    # Wrap every operand in pd.to_numeric so an Arrow-backed string column
+    # (newer pandas default) can't trigger "Can only string multiply by an
+    # integer." Each column is coerced through float, NA-filled, before any
+    # arithmetic touches it.
+    bat_counts = pd.to_numeric(
+        display_df["SKU"].astype(str).map(
+            lambda s: _family_battery_count(machine_df, _accessory_family_hint(s))
+        ),
+        errors="coerce",
+    ).fillna(0).astype(int)
     non_batt_cols = [c for c in editable_cols if c != "BattSubRaw"]
-    base = display_df[non_batt_cols].fillna(0).sum(axis=1)
-    per_batt = display_df["BattSubRaw"].fillna(0) if "BattSubRaw" in display_df.columns else 0
+    base_numeric = display_df[non_batt_cols].apply(
+        lambda col: pd.to_numeric(col, errors="coerce").fillna(0)
+    )
+    base = base_numeric.sum(axis=1)
+    if "BattSubRaw" in display_df.columns:
+        per_batt = pd.to_numeric(display_df["BattSubRaw"], errors="coerce").fillna(0)
+    else:
+        per_batt = pd.Series(0, index=display_df.index)
     display_df["Bat"] = bat_counts.astype(int)
     display_df["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
 

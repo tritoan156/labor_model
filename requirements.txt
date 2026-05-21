@@ -1,7 +1,7 @@
-# Pinned for reproducible Streamlit Cloud deploys.
-# To upgrade: bump a version, run the app locally to verify, then push.
-streamlit==1.38.0
-pandas==2.2.2
-plotly==5.22.0
-openpyxl==3.1.5
-requests==2.32.3
+# Floor versions — Streamlit Cloud picks compatible patch/minor releases.
+# Bump the floors when the team validates a newer combination locally.
+streamlit>=1.30
+pandas>=2.0
+plotly>=5.20
+openpyxl>=3.1
+requests>=2.31

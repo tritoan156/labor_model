@@ -764,25 +764,57 @@ def render_sidebar() -> dict:
     with st.sidebar.expander("ℹ️ Help & glossary", expanded=False):
         st.markdown(
             """
-**Common terms**
+### Time units
+- **Person-minutes (p-min)** — labor *effort*. 1 person working 1 min = 1 p-min. 2 people working 30 min = 60 p-min. Independent of how many people you assign.
+- **Calendar minutes (cal-min)** — wall-clock *elapsed* time. With 1 person doing 60 p-min, cycle time is 60 cal-min. With 2 people working in parallel, the cycle is 30 cal-min.
+- **Cycle time** — calendar minutes a unit physically spends at a station = `p-min ÷ Crew per unit`.
+- **Lead time (days)** — total calendar days for **one** person to build the whole unit alone = `Total p-min ÷ (shift × efficiency)`.
 
-- **Headcount (HC)** — number of people assigned to a station.
-- **Stations/Cells (Conc)** — how many units can be worked on at the same time at one station.
-- **Crew per unit** — number of people working together on one unit at a station.
-- **Person-minutes (p-min)** — labor effort. 1 person working 1 min = 1 p-min.
-- **Cycle time** — calendar minutes a unit physically spends at a station.
-- **Lead time** — total calendar days for one person to build a unit alone.
-- **Required HC** — number of people needed to meet the schedule.
-- **Safety factor** — planning buffer applied to capacity.
-- **Efficiency factor** — fraction of the shift that is actually productive.
+### Crew terms
+- **Headcount (HC) / People** — number of people assigned to a station for the whole shift.
+- **Stations/Cells (Conc)** — how many units can be worked on at the same time at one station (parallel bays/cells).
+- **Crew per unit** — number of people working together on one unit at a station. Drives cycle time.
+- **Required HC** — number of people needed to meet the schedule given safety + efficiency.
 
-**Unit classes**
-- **STD** — standard trailer (full assembly with marry)
+### Capacity factors
+- **Safety factor** — planning buffer applied to capacity. `0.85` = leave 15% slack.
+- **Efficiency factor** — fraction of the shift that is actually productive. `1.00` = no loss; `0.625` ≈ VSM standard.
+- **Effective capacity** = `HC × shift × days × efficiency × safety` person-minutes/period.
+- **Utilization %** — `demand ÷ effective capacity`. >100% means over capacity.
+
+### Unit classes
+- **STD** — Standard trailer (full assembly with marry)
 - **HS** — Head Skid only (no trailer)
 - **HT** — Head + Trailer (mount only, no marry)
 
-**Status colors**
-- 🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility
+### Catalog terms
+- **FG SKU** — finished-good SKU from `machine_clean.csv` (e.g. `BOSS25-006`).
+- **Accessory SKU** — accessory kit from `acc_clean.csv` (e.g. `BOSS25-A016`).
+- **Bat** — battery count for that FG SKU. PDS/SDG = 0.
+- **Last Modified** — date the row was last edited through the app (blank = never).
+
+### Stations (key → display name)
+- `Warehouse` = Warehouse (Pick) — pull parts
+- `Wire` = Wire Assembly — pre-wiring sub-assembly
+- `Battery` = Battery Assembly — battery cells (BOSS only)
+- `PMAcc` = PM Acc (Headunit) — PM/Head-unit accessories
+- `GenAcc` = Gen Accessories — generator-side accessories
+- `ComAcc` = Com Accessories — compressor-side accessories
+- `Trailer` = Trailer Assembly — trailer sub-assembly (STD/HT only)
+- `AccKIT` = Accessories KIT — kit prep
+- `ETO` = Engineering To Order — special engineering (BOSS220/BOSS400)
+- `Final` = Final Assembly — mount + marry (where used)
+- `PDI / QC / Ship` — Pre-Delivery Inspection · Quality Check · Shipping
+
+### Placeholders & estimates
+- **`XXX` in SKU** — estimation placeholder. Labor is an estimate, not measured. E.g. `BOSS220PM XXX`, `BOSS25 AXXX`.
+- **`-A999`** — legacy family-level accessory placeholder.
+
+### Status colors
+🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility · 🆕 Recently added
+
+### Tip
+Hover any column header in a table to see its specific tooltip.
             """
         )
 
@@ -1035,6 +1067,8 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None):
         y=chart_data["thru_util_safe"] * 100,
         name="Throughput utilization",
         marker_color="#ED7D31",
+        text=[f"{v*100:.0f}%" for v in chart_data["thru_util_safe"]],
+        textposition="outside",
     ))
     fig.add_hline(y=100, line_dash="dash", line_color="red", annotation_text="100% (over capacity)")
     fig.add_hline(y=90, line_dash="dot", line_color="orange", annotation_text="90% (near cap)")

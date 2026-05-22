@@ -1301,25 +1301,62 @@ def render_sidebar() -> dict:
     # Help / Glossary — always last
     # ----------------------------------------------------------------
     with st.sidebar.expander("ℹ️ Help & glossary", expanded=False):
-        st.markdown(
-            """
+        # Five focused tabs replace the previous 85-line wall of markdown.
+        # Tabs render cleanly inside expanders and give planners a way to
+        # jump straight to the section they need.
+        _help_quick, _help_model, _help_catalog, _help_save, _help_admin = st.tabs([
+            "🚀 Quick start",
+            "📐 How the model works",
+            "🏷 Catalog & stations",
+            "💾 Saving your work",
+            "🔧 For admins",
+        ])
+
+        with _help_quick:
+            st.markdown(
+                """
+**Status colors**
+🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility
+
+**Sidebar in three steps**
+1. **Pick a facility** — Henderson, Spartanburg, or Cypress. Each has its own crew config.
+2. **Tell us what to build** — upload your monthly schedule CSV, or type a few SKUs for a quick what-if.
+3. **Tune** — working days, shift length, safety, efficiency, and per-station headcount under the expanders below.
+
+**Where to find common features**
+
+| Want to… | Go to |
+|---|---|
+| Save your manual build plan | Sidebar → **📂 Save / load scenarios** (when in "Type a few SKUs" mode) |
+| Save your uploaded schedule | Sidebar → **📂 Save / load uploaded schedules** (when in "Upload schedule file" mode) |
+| Get a blank upload template | Sidebar → **📥 Download blank template** (under the file uploader) |
+| Edit labor times | **📁 Data & Setup** tab → Machine / Accessory catalog |
+| Add a missing SKU | **📁 Data & Setup** → catalog → **➕ Add a new SKU** |
+| See bottlenecks + suggested fixes | **🏠 Overview** → 🎯 Recommended actions, or **🔧 Recommendations** tab |
+
+**Tip:** hover any column header in a table to see its specific tooltip.
+                """
+            )
+
+        with _help_model:
+            st.markdown(
+                """
 ### Time units
 - **Person-minutes (p-min)** — labor *effort*. 1 person working 1 min = 1 p-min. 2 people working 30 min = 60 p-min. Independent of how many people you assign.
 - **Calendar minutes (cal-min)** — wall-clock *elapsed* time. With 1 person doing 60 p-min, cycle time is 60 cal-min. With 2 people working in parallel, the cycle is 30 cal-min.
 - **Cycle time** — calendar minutes a unit physically spends at a station = `p-min ÷ Crew per unit`.
 - **Lead time (days)** — total calendar days for **one** person to build the whole unit alone = `Total p-min ÷ (shift × efficiency)`.
 
-### Crew terms
+### People & stations
 - **Headcount (HC) / People** — number of people assigned to a station for the whole shift.
 - **Stations/Cells (Conc)** — how many units can be worked on at the same time at one station (parallel bays/cells).
 - **Crew per unit** — number of people working together on one unit at a station. Drives cycle time.
 - **Required HC** — number of people needed to meet the schedule given safety + efficiency.
 
-### Capacity factors
+### Safety & efficiency
 - **Safety factor** — planning buffer applied to capacity. `0.85` = leave 15% slack.
 - **Efficiency factor** — fraction of the shift that is actually productive. `1.00` = no loss; `0.625` ≈ VSM standard.
-- **Effective capacity** = `HC × shift × days × efficiency × safety` person-minutes/period.
-- **Utilization %** — `demand ÷ effective capacity`. >100% means over capacity.
+- **Effective capacity** = `HC × shift × days × efficiency × safety` person-minutes per period.
 
 ### Labor vs Throughput utilization
 
@@ -1344,17 +1381,26 @@ The Overview's **🎯 Recommended actions** splits these two cases so you don't 
 | Labor util | Headcount | Sidebar → **People (HC)** |
 | Throughput util | Physical capacity | Sidebar → **Stations/Cells** |
 | Both | Both — fix the cells first, hire to fill them | Both controls |
+                """
+            )
 
+        with _help_catalog:
+            st.markdown(
+                """
 ### Unit classes
 - **STD** — Standard trailer (full assembly with marry)
 - **HS** — Head Skid only (no trailer)
 - **HT** — Head + Trailer (mount only, no marry)
 
-### Catalog terms
+### SKU naming
 - **FG SKU** — finished-good SKU from `machine_clean.csv` (e.g. `BOSS25-006`).
 - **Accessory SKU** — accessory kit from `acc_clean.csv` (e.g. `BOSS25-A016`).
 - **Bat** — battery count for that FG SKU. PDS/SDG = 0.
 - **Last Modified** — date the row was last edited through the app (blank = never).
+
+### Placeholders
+- **`XXX` in a SKU** — estimation placeholder. Labor is an estimate, not measured. E.g. `BOSS220PM XXX`, `BOSS25 AXXX`. The Data Quality view flags any `XXX` row automatically.
+- Older `-A999` style placeholders may still appear in a few legacy catalog rows; they've been superseded by `XXX` for any new entries.
 
 ### Stations (key → display name)
 - `Warehouse` = Warehouse (Pick) — pull parts
@@ -1368,25 +1414,67 @@ The Overview's **🎯 Recommended actions** splits these two cases so you don't 
 - `ETO` = Engineering To Order — special engineering (BOSS220/BOSS400)
 - `Final` = Final Assembly — mount + marry (where used)
 - `PDI / QC / Ship` — Pre-Delivery Inspection · Quality Check · Shipping
+                """
+            )
 
-### Placeholders & estimates
-- **`XXX` in SKU** — estimation placeholder. Labor is an estimate, not measured. E.g. `BOSS220PM XXX`, `BOSS25 AXXX`.
-- **`-A999`** — legacy family-level accessory placeholder.
+        with _help_save:
+            st.markdown(
+                """
+Answers the question planners ask once they care: *"will the team see what I just did?"*
 
-### Status colors
-🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility · 🆕 Recently added
+### Save / load scenarios (manual mode)
+When you're in **✏️ Type a few SKUs** mode, the sidebar's **📂 Save / load scenarios** expander lets you name and save your manual SKU list. Saved per facility to `data/scenarios.json` on GitHub — anyone planning for the same facility can reload them.
 
-### GitHub Save (for admins)
-Most of the **💾 Save** buttons push CSVs/JSON back to the project's GitHub repo so changes apply to everyone after the next ~1 min Streamlit Cloud redeploy. This requires a **GitHub Personal Access Token** with the `repo` scope, stored in **Streamlit Cloud → Settings → Secrets** as:
+### Save / load uploaded schedules (upload mode)
+When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / load uploaded schedules** expander lets you save your uploaded CSV under a name. Saved per facility to `data/uploaded_schedules.json` on GitHub. The **raw CSV** is preserved, so any columns the app currently ignores still survive the round-trip for future use.
+
+### Catalog edits
+Every **💾 Save** button in **📁 Data & Setup** (Machine catalog, Accessory catalog, Items, Item packages, Reconciliation, Process flow) pushes to GitHub. Other users see the new values after the next ~1 minute Streamlit Cloud redeploy.
+
+### Confirmation pill
+After every successful schedule load, the sidebar shows a green ✅ confirmation like *"Loaded 193 rows from HENDERSON · month May-26"* so you can verify the loader understood your file correctly.
+
+### Unknown-SKU warning banner
+If your schedule references FG or accessory SKUs that aren't in the catalogs, a yellow banner appears at the **top of the page** listing them. Add the missing SKUs via **📁 Data & Setup → 🗂 Machine catalog → ➕ Add a new machine SKU** (or the equivalent for accessories) and they'll be picked up on the next reload.
+
+### Privacy
+Uploaded CSVs stay **only in your browser** unless you explicitly click **💾 Save schedule**. They aren't written to disk on the server or pushed to GitHub by default.
+                """
+            )
+
+        with _help_admin:
+            st.markdown(
+                """
+### GitHub token
+The 💾 Save buttons require a **GitHub Personal Access Token** with the `repo` scope. Add it to **Streamlit Cloud → Settings → Secrets**:
+
 ```toml
 github_token = "ghp_xxxxxxxxxxxxxxxxxxxxxxxx"
 ```
-If you see "GitHub token not configured" when saving, ask the app's admin to add the token. Read-only browsing works without it.
 
-### Tip
-Hover any column header in a table to see its specific tooltip.
-            """
-        )
+If a planner sees *"GitHub token not configured"* when saving, the token is missing or expired. Read-only browsing works without it.
+
+### Wild-CSV upload behavior
+The loader auto-matches column names so the team can upload their normal Excel export without reformatting:
+- **Required columns** (any of these naming patterns will match): `LOCATION` / `Facility` / `Site`; `FG SKU ID` / `FG SKU` / `Finished Good`; `FG ACCRY SKU ID` / `Accessory SKU` / `Acc SKU`; `BUILD QTY` / `Qty` / `Quantity`; `PRODUCTION MONTH` / `Prod Month` / `Production Date` / `Month`.
+- **Optional:** `CUSTOMER NAME` / `Customer` / `Cust`.
+- **Extra columns are ignored** — pandas reads them all but the loader only uses the ones it recognises.
+- **UTF-8 BOM is stripped** automatically — Excel's default save format on Windows just works.
+- **Date formats:** `Mon-YY` (e.g. `May-26`), `YY-Mon` carryover (e.g. `26-Apr`), US slash (`5/8/2026`), and ISO (`2026-05-08`) all parse correctly.
+- **Zero-qty rows** are dropped automatically.
+
+If a required column truly isn't there, the planner sees a yellow banner naming the missing column and listing the aliases the loader tried.
+
+### Blank template
+The **📥 Download blank template** button under the file uploader hands the planner an empty CSV with the 5 required headers + 2 example rows. Quickest way to ensure formatting is right.
+
+### Usage analytics
+At the very bottom of the sidebar, the **⚙️ Admin** expander shows session counts, top actions, save events, and recent activity pulled from `data/usage_log.jsonl`. Anonymous UUID per browser — no PII collected.
+
+### Redeploy timing
+Every catalog / scenario / schedule / flow save triggers a Streamlit Cloud rebuild (~1 minute). Other users see the new values when their browsers reload after that. The 🔄 Refresh banner at the top of the relevant tab tells you when there's an updated copy to pull in mid-session.
+                """
+            )
 
     # ----------------------------------------------------------------
     # Hidden admin analytics — discoverable but visually unobtrusive.

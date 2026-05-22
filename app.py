@@ -918,7 +918,7 @@ def _render_admin_dashboard() -> None:
 
     if not events:
         st.caption("No usage events yet. Once people start using the tool, you'll see KPIs here.")
-        if st.button("🔄 Refresh from GitHub", key="_admin_refresh_empty"):
+        if st.button("🔄 Refresh", key="_admin_refresh_empty"):
             _refresh_usage_from_github(_usage_token())
             try:
                 st.cache_data.clear()
@@ -1048,7 +1048,7 @@ def _render_admin_dashboard() -> None:
     cc1.caption(
         f"Buffered (un-flushed) this session: {len(_usage_buffer_snapshot())} event(s)"
     )
-    if cc2.button("🔄 Refresh from GitHub", key="_admin_refresh", use_container_width=True):
+    if cc2.button("🔄 Refresh", key="_admin_refresh", use_container_width=True):
         _refresh_usage_from_github(_usage_token())
         try:
             st.cache_data.clear()
@@ -4669,11 +4669,10 @@ def main():
 
     # --- Footer ---------------------------------------------------------
     # Lightweight provenance + support line at the bottom of every page.
-    # Replace the email below with the real team contact before publishing.
     st.markdown("---")
     st.caption(
         "Last updated: May 2026 · Questions or issues? Contact "
-        "[your-team@example.com](mailto:your-team@example.com)"
+        "[tnguyen@anacorp.com](mailto:tnguyen@anacorp.com)"
     )
 
 

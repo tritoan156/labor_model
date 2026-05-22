@@ -1,0 +1,183 @@
+# Maintaining the Labor Capacity Tool
+
+A short ops checklist for whoever is keeping this app running. If you're
+just using the app, you don't need anything in here — that's the
+sidebar's **ℹ️ Help & glossary** expander.
+
+---
+
+## Before sharing the URL with the team
+
+1. **Footer email / contact.** `app.py` — search for `tnguyen@anacorp.com`.
+   Update if the maintainer changes.
+2. **GitHub PAT in Streamlit Secrets.** Confirm it exists and isn't expired.
+   See "Rotating the GitHub PAT" below.
+3. **Bus-factor admin.** At least one other person should be a
+   **Streamlit Cloud workspace admin** (Settings → Sharing). If only you
+   have access and you get hit by a bus, nobody can rotate the token.
+4. **Repo visibility decision.** The repo (`tritoan156/labor_model`) is
+   currently **public**. Customer data has been scrubbed; usage telemetry
+   no longer commits. If you ever push real customer schedules, flip it
+   private first.
+
+---
+
+## Rotating the GitHub PAT
+
+The 💾 Save buttons write to GitHub via a Personal Access Token. When
+the token expires, every save in the app silently fails with
+*"GitHub token not configured"*. **There is no automatic warning** — you
+notice when a planner reports the error.
+
+When to rotate:
+- Every 12 months (matches the longest fine-grained PAT lifetime).
+- Immediately if the token is leaked (committed to the repo by mistake,
+  shared in a screenshot, etc.).
+
+How to rotate:
+1. https://github.com/settings/personal-access-tokens — generate a new
+   **fine-grained PAT** scoped to **just this repo** (`tritoan156/labor_model`).
+   Permissions: `Contents` → `Read and write`. Set the longest expiration
+   you're comfortable with.
+2. Copy the token (`github_pat_…`).
+3. Streamlit Cloud → app **⋮** → **Manage app** → **Settings** → **Secrets**.
+   Paste:
+   ```toml
+   github_token = "github_pat_…"
+   ```
+4. Save secrets → app auto-reboots within a minute.
+5. Test by editing one labor cell and clicking 💾 Save.
+6. Revoke the old PAT on GitHub once the new one works.
+
+---
+
+## When you change a CSV column
+
+`app.py:_LOADER_SCHEMA_VERSION` (currently `4`) is a cache-buster. Every
+cached DataFrame loader includes this constant as a `@st.cache_data`
+argument, so bumping it forces every user's browser session to re-read
+the CSV with the new schema.
+
+**Bump the constant whenever you:**
+- Rename a column (e.g. `Compressor` → `ComAcc`).
+- Add a column.
+- Remove a column.
+- Change the type / unit of a column (e.g. minutes → hours).
+
+If you forget, the team will see stale data with the old column name
+until they hard-refresh the browser or the Streamlit Cloud container
+recycles.
+
+---
+
+## Common save failures and what they mean
+
+| Message | Cause | Fix |
+|---|---|---|
+| "GitHub token not configured" | Token missing or expired in Streamlit Secrets | Rotate the PAT (see above) |
+| "❌ Save failed: another user committed concurrently" | Two users edited the same file in the same ~5 seconds | The user clicks 🔄 Refresh in the stale-data banner and re-applies their edits |
+| "❌ Save failed: 403" | Token doesn't have `Contents: write` on the repo | Re-generate PAT with the right scope |
+| Local file changed but no GitHub commit | A redeploy hasn't happened yet | Wait ~1 min; Streamlit Cloud picks up the commit and rebuilds |
+
+---
+
+## Recovering from a bad commit
+
+If someone pushes a broken CSV or JSON to `main` and the app starts
+crashing:
+
+```bash
+# Find the bad commit
+git log --oneline data/the-file.csv | head -5
+
+# Revert it (creates a new "Revert ..." commit)
+git revert <bad-sha>
+git push origin main
+```
+
+Streamlit Cloud will redeploy within ~1 minute with the prior version.
+The revert is itself a new commit — git history shows both the bad commit
+and the revert, so the audit trail is preserved.
+
+Avoid `git push --force` on `main` unless you really know what you're
+doing — it rewrites history and can lose other people's commits.
+
+---
+
+## Adding a new facility
+
+If the company spins up a fourth manufacturing facility:
+
+1. **`core/constants.LOCATIONS`** — add the facility name (e.g. `"Phoenix"`).
+2. **`data/facility_crew.json`** — add a new top-level key with the new
+   facility's per-station HC / Conc / Crew. Easiest is to copy an existing
+   facility's block and tweak the numbers.
+3. **`data/scenarios.json`** and **`data/uploaded_schedules.json`** —
+   automatically supports the new facility once the constant is added;
+   the per-location dict structure scales freely.
+4. Commit + push. New facility appears in the sidebar dropdown after the
+   next redeploy.
+
+---
+
+## Where the admin usage analytics live
+
+Sidebar → very bottom → **⚙️ Admin** expander. Shows:
+- Sessions today / this week / all-time
+- 14-day sessions line chart
+- Sessions by facility
+- Save events (last 14 days)
+- Top actions (last 14 days)
+- Last 20 events (table)
+
+The events come from `data/usage_log.jsonl`, which is **local to the
+Streamlit Cloud container** (not committed to the repo as of the
+pre-publish hygiene round). Implications:
+- Events accumulate within one deploy (~1 min container lifetime
+  between redeploys).
+- Every redeploy resets the log to the empty seed.
+- Anonymous UUIDs only — no PII, no IPs.
+
+If you need persistent cross-redeploy analytics, point
+`core/usage_tracker.flush_to_github` at a **private** repo or a private
+gist. Currently it's local-only by design.
+
+---
+
+## Dependency pins
+
+`requirements.txt` uses `>=` floor specifiers (not exact pins) so
+Streamlit Cloud picks the latest compatible version. This has bitten
+us twice with Python 3.14 + new pandas combinations.
+
+If you know a major release is coming and want to verify before the
+team's deploy:
+1. Create a branch `staging` and push there.
+2. Configure a second Streamlit Cloud app pointing at the `staging`
+   branch. Test there.
+3. Merge to `main` when happy.
+
+If you want stricter pinning, edit `requirements.txt` with version
+ranges like `streamlit<2,>=1.30` and re-deploy.
+
+---
+
+## File map (where things live)
+
+| File | Purpose |
+|---|---|
+| `app.py` | Streamlit UI, sidebar, all tabs |
+| `core/data_loader.py` | CSV/JSON readers, fuzzy schedule column matching |
+| `core/labor_calculator.py` | Per-unit labor, capacity table, status flags |
+| `core/constants.py` | Stations, defaults, utilization thresholds, families |
+| `core/catalog_storage.py` | GitHub PUT/GET (shared by all storage modules) |
+| `core/scenario_storage.py` | Save/load manual scenarios |
+| `core/uploaded_schedule_storage.py` | Save/load uploaded CSVs |
+| `core/facility_storage.py` | Per-facility crew config |
+| `core/process_flow_storage.py` | Manufacturing flow graph |
+| `core/usage_tracker.py` | Anonymous telemetry (local-only) |
+| `core/data_validator.py` | Catalog quality checks |
+| `data/*.csv`, `data/*.json` | All persisted data |
+| `.streamlit/config.toml` | Page config, max upload size |
+| `.streamlit/secrets.toml` | **Not in repo** — holds `github_token` on Streamlit Cloud |
+| `requirements.txt` | Python deps |

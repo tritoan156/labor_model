@@ -131,57 +131,61 @@ def _write_local(content: str) -> None:
 
 
 def flush_to_github(token: Optional[str], force: bool = False) -> int:
-    """Push buffered events to GitHub. Returns count of events flushed.
+    """Append buffered events to the on-container usage log. Returns count
+    flushed.
 
-    - If ``token`` is None/empty → buffer is cleared (silent no-op) so long
-      sessions without a token don't accumulate forever in memory.
+    Despite the historical name (kept so existing callers don't need to
+    update), this function does **not** push to GitHub anymore. The
+    public-repo exposure of operational telemetry (facility tempo, save
+    cadence) outweighed the benefit of cross-redeploy persistence, so events
+    now live only in the Streamlit Cloud container's filesystem at
+    ``data/usage_log.jsonl``. They survive across sessions within one deploy
+    and are reset by the next redeploy.
+
+    The ``token`` parameter is accepted but ignored. Callers keep passing
+    it because they don't know (and shouldn't have to) whether the back-end
+    is local-only or remote.
+
+    Behavior:
     - If buffer is empty → returns 0.
     - If buffer size < ``FLUSH_THRESHOLD`` and ``force`` is False → returns 0.
-    - Retries once on ``GitHubConflict``.
+    - On any filesystem error → keeps the buffer for the next attempt.
     """
+    _ = token  # accepted for API compatibility; intentionally unused
     buffer: List[dict] = st.session_state.get(_BUFFER_KEY, [])
     if not buffer:
-        return 0
-
-    if not token:
-        # No token → drop buffered events so memory doesn't grow unbounded.
-        st.session_state[_BUFFER_KEY] = []
         return 0
 
     if not force and len(buffer) < FLUSH_THRESHOLD:
         return 0
 
-    # Build new lines and try to push. We always fetch the latest remote
-    # contents first and concatenate so we don't drop anyone else's events.
     new_lines = "\n".join(_serialize_event(e) for e in buffer)
 
-    for attempt in (1, 2):
-        existing_text, sha = _fetch_remote_log(token)
+    try:
+        # Read whatever's already on disk and append our buffer to it. The
+        # admin dashboard reads the same file, so the new events show up in
+        # the next render.
+        existing_text = ""
+        if USAGE_LOG_PATH.exists():
+            try:
+                with open(USAGE_LOG_PATH, "r", encoding="utf-8") as f:
+                    existing_text = f.read()
+            except Exception:
+                existing_text = ""
+
         if existing_text and not existing_text.endswith("\n"):
             combined = existing_text + "\n" + new_lines + "\n"
         else:
             combined = (existing_text or "") + new_lines + "\n"
-        try:
-            save_catalog_to_github(
-                combined, GITHUB_FILE_PATH, token,
-                message=f"Append {len(buffer)} usage event(s)",
-                sha=sha,
-            )
-            _write_local(combined)
-            count = len(buffer)
-            st.session_state[_BUFFER_KEY] = []
-            return count
-        except GitHubConflict:
-            if attempt == 2:
-                # Give up cleanly — keep buffer for next attempt rather than
-                # losing events.
-                return 0
-            continue
-        except Exception:
-            # Network / auth issue — keep the buffer so we can retry later.
-            return 0
 
-    return 0
+        _write_local(combined)
+        count = len(buffer)
+        st.session_state[_BUFFER_KEY] = []
+        return count
+    except Exception:
+        # Filesystem might be read-only on some hosts — keep the buffer so
+        # we can retry later (next save, end of session, etc.).
+        return 0
 
 
 def load_usage_log() -> List[dict]:
@@ -212,17 +216,13 @@ def load_usage_log() -> List[dict]:
 
 
 def refresh_from_github(token: Optional[str]) -> List[dict]:
-    """Force a pull from GitHub, overwrite the local mirror, and return parsed events.
+    """Re-read the on-container usage log and return parsed events.
 
-    Used by the admin view's ``🔄 Refresh from GitHub`` button so admins on
-    a stale Streamlit container can pull fresh log content without waiting
-    for the next redeploy.
+    Historically pulled from GitHub; now that the log is local-only this is
+    just an alias for :func:`load_usage_log`. The ``token`` argument is
+    accepted for API stability and ignored.
     """
-    if not token:
-        return load_usage_log()
-    text, _sha = _fetch_remote_log(token)
-    if text:
-        _write_local(text)
+    _ = token
     return load_usage_log()
 
 

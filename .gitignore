@@ -28,6 +28,12 @@ data/_uploaded_schedule.csv
 data/floor_actuals.csv
 *.log
 
+# Anonymous usage telemetry — kept local-only so the public repo
+# doesn't leak operational tempo (facility activity, save frequency).
+# Each Streamlit Cloud container writes this for the admin dashboard;
+# it's reset on every redeploy. Do NOT add this back to the tracked set.
+data/usage_log.jsonl
+
 # Excel temp files
 ~$*.xlsx
 ~$*.xls

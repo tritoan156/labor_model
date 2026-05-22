@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -47,6 +46,7 @@ from .catalog_storage import (
     save_catalog_to_github,
     GitHubConflict,
 )
+from .constants import now_local
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 USAGE_LOG_PATH = DATA_DIR / "usage_log.jsonl"
@@ -84,7 +84,9 @@ def track_event(event_type: str, **payload) -> None:
         return
     buffer = st.session_state.setdefault(_BUFFER_KEY, [])
     event = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
+        # Las Vegas wall-clock with explicit offset (e.g. "-07:00") so the
+        # admin dashboard can render times that match the planner's clock.
+        "ts": now_local().isoformat(timespec="seconds"),
         "uid": get_or_create_uid(),
         "type": str(event_type),
     }

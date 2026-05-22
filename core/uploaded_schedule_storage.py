@@ -29,7 +29,6 @@ Top-level schema (``data/uploaded_schedules.json`` on GitHub):
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +37,7 @@ from .catalog_storage import (
     save_catalog_to_github,
     GitHubConflict,
 )
+from .constants import now_local
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SCHEDULES_PATH = DATA_DIR / "uploaded_schedules.json"
@@ -141,7 +141,9 @@ def save_uploaded_schedule_to_github(
         raise ValueError("Cannot save an empty schedule.")
 
     new_block = {
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        # Las Vegas wall-clock with explicit offset so "Last saved: ..." in
+        # the Load dropdown matches the planner's clock.
+        "saved_at": now_local().isoformat(timespec="seconds"),
         "rows": _count_csv_data_rows(csv_text),
         "csv_content": csv_text,
     }

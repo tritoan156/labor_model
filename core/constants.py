@@ -3,6 +3,51 @@
 All business rules from the v17 model. Edit here, not in the UI.
 """
 
+from datetime import datetime
+
+# ---------------------------------------------------------------------------
+# Time helpers — Las Vegas / Pacific time
+# ---------------------------------------------------------------------------
+# Streamlit Cloud's containers run in UTC. If we call ``datetime.now()`` we
+# get UTC wall-clock with no timezone info, which then renders as if it were
+# Las Vegas time in the admin dashboard and on "Last Modified" cells — but
+# is actually 7-8 hours ahead. Confusing for planners who glance at the log
+# and see saves "from the future".
+#
+# ``now_local()`` returns a timezone-aware ``datetime`` in
+# America/Los_Angeles. ``.isoformat()`` on the result automatically appends
+# the offset (``-07:00`` for PDT, ``-08:00`` for PST), so timestamps are
+# unambiguous in the log.
+#
+# zoneinfo first (stdlib, Python 3.9+); fall back to dateutil.tz on hosts
+# that don't ship the OS TZ database (rare). Both are bundled with pandas
+# transitively so this never adds a missing-dependency error in practice.
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    LAS_VEGAS_TZ = _ZoneInfo("America/Los_Angeles")
+except Exception:  # pragma: no cover — Windows without tzdata, etc.
+    from dateutil import tz as _dateutil_tz
+    LAS_VEGAS_TZ = _dateutil_tz.gettz("America/Los_Angeles")
+
+
+def now_local() -> datetime:
+    """Current wall-clock time in Las Vegas, as a tz-aware ``datetime``.
+
+    Use this instead of ``datetime.now()`` anywhere a user-facing timestamp
+    is generated (usage log, "saved_at" fields, "Last Modified" stamps).
+    """
+    return datetime.now(LAS_VEGAS_TZ)
+
+
+def today_local_str() -> str:
+    """Today's date in Las Vegas time as ``YYYY-MM-DD``.
+
+    Used as the value for "Last Modified" cells when the user saves a
+    catalog row.
+    """
+    return now_local().strftime("%Y-%m-%d")
+
+
 # === Locations ===
 LOCATIONS = ["Henderson", "Spartanburg", "Cypress"]
 

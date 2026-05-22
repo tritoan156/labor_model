@@ -20,7 +20,6 @@ Top-level schema:
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +30,7 @@ from .catalog_storage import (
     save_catalog_to_github,
     GitHubConflict,
 )
+from .constants import now_local
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SCENARIOS_PATH = DATA_DIR / "scenarios.json"
@@ -141,7 +141,9 @@ def save_scenario_to_github(
         clean_rows = rows
 
     new_block = {
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        # Las Vegas wall-clock with explicit offset so "Last saved: ..." in
+        # the Load dropdown matches the planner's clock.
+        "saved_at": now_local().isoformat(timespec="seconds"),
         "entries": clean_rows,
     }
 

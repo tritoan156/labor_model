@@ -28,6 +28,7 @@ from core.labor_calculator import (
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
     DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
+    now_local, today_local_str,
 )
 from core.facility_storage import (
     load_facility_crew_df, save_facility_crew_to_github,
@@ -932,7 +933,14 @@ def _render_admin_dashboard() -> None:
     if "ts" not in df.columns:
         st.caption("Usage log is malformed — no `ts` column.")
         return
-    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    # Parse timestamps with utc=True so old naive entries (which were UTC
+    # wall-clock from Streamlit Cloud) and new tz-aware LA entries land in
+    # the same column. Convert to Las Vegas so the rendered "When" matches
+    # the planner's clock regardless of which generation wrote the row.
+    df["ts"] = (
+        pd.to_datetime(df["ts"], errors="coerce", utc=True)
+          .dt.tz_convert("America/Los_Angeles")
+    )
     df = df.dropna(subset=["ts"]).copy()
     if df.empty:
         st.caption("No parseable events yet.")
@@ -943,7 +951,9 @@ def _render_admin_dashboard() -> None:
     df["uid"] = df.get("uid", "").astype(str) if "uid" in df.columns else ""
     df["file"] = df.get("file", "").astype(str) if "file" in df.columns else ""
 
-    today = pd.Timestamp.today().date()
+    # Admin time buckets in Las Vegas wall-clock so they match the timestamps
+    # the rest of the app writes (Streamlit Cloud's servers run UTC).
+    today = now_local().date()
     week_ago = today - pd.Timedelta(days=6)
     fortnight_ago = today - pd.Timedelta(days=13)
 
@@ -2662,7 +2672,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
             st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
             return
 
-        today = pd.Timestamp.today().strftime("%Y-%m-%d")
+        today = today_local_str()
         new_sku_upper = new_sku.upper()
         response = None
         for attempt in (1, 2):
@@ -2805,7 +2815,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
             st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
             return
 
-        today = pd.Timestamp.today().strftime("%Y-%m-%d")
+        today = today_local_str()
         new_sku_upper = new_sku.upper()
 
         # Fetch + append + push, with one retry on SHA conflict.
@@ -2972,7 +2982,7 @@ def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols):
 
     Stamps Last Modified for any row that had a change.
     """
-    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    today = today_local_str()
     if "Last Modified" not in fresh_df.columns:
         fresh_df["Last Modified"] = ""
 
@@ -4120,7 +4130,7 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
         st.info("No actual changes detected (selected rows already match the catalog).")
         return
 
-    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    today = today_local_str()
     n_diffs = len(diffs)
     response = None
     for attempt in (1, 2):

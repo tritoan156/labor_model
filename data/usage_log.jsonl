@@ -53,3 +53,5 @@
 {"ts":"2026-05-22T19:34:32","uid":"21589574eda6","type":"schedule_load","mode":"📤 Upload schedule file","facility":"Henderson","rows":"156"}
 {"ts":"2026-05-22T19:34:40","uid":"34b7dca353cf","type":"session_start","facility":"Henderson","mode":"📤 Upload schedule file"}
 {"ts":"2026-05-22T19:34:41","uid":"34b7dca353cf","type":"schedule_load","mode":"📤 Upload schedule file","facility":"Henderson","rows":"156"}
+{"ts":"2026-05-22T19:35:47","uid":"a80769597517","type":"scenario_load","facility":"Henderson","name":"Hen 2026 June"}
+{"ts":"2026-05-22T19:35:47","uid":"a80769597517","type":"schedule_load","mode":"✏️ Type a few SKUs","facility":"Henderson","rows":"4"}

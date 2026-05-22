@@ -16,12 +16,42 @@ Requires a GitHub Personal Access Token in `st.secrets["github_token"]`
 from __future__ import annotations
 
 import base64
+import os
 from typing import Optional, Tuple
 
 import requests
 
 GITHUB_REPO = "tritoan156/labor_model"
-GITHUB_BRANCH = "main"
+
+
+def _resolve_branch() -> str:
+    """Pick which git branch the save helpers read from / write to.
+
+    Resolution order:
+      1. ``st.secrets["github_branch"]`` if a Streamlit context is available
+         (preferred on Streamlit Cloud — set this in the secrets panel).
+      2. ``GITHUB_BRANCH`` environment variable.
+      3. Default ``"main"``.
+
+    The staging Streamlit Cloud app sets ``github_branch = "staging"`` in
+    its secrets so every save it does targets the ``staging`` branch on the
+    same repo — keeping experimental data completely isolated from the
+    live ``main`` branch the team uses.
+    """
+    try:
+        import streamlit as st  # local import to keep this module Streamlit-optional
+        try:
+            val = st.secrets.get("github_branch")
+            if val:
+                return str(val).strip()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
+
+
+GITHUB_BRANCH = _resolve_branch()
 
 
 def _api_url(file_path: str) -> str:

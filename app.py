@@ -1158,7 +1158,29 @@ def render_sidebar() -> dict:
             )
         elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
+
+        # Time window — only meaningful when the loaded schedule has a
+        # PRODUCTION DAY column. We always show the selector; if the schedule
+        # has no day data, picking anything other than "Whole month" will
+        # simply yield an empty filter (the existing empty-state banner
+        # already handles that).
+        time_window = st.sidebar.radio(
+            "Time window",
+            ["Whole month", "This week", "Remaining (from today)"],
+            index=0,
+            horizontal=True,
+            help=(
+                "Slice the analysis to a sub-week of the month so the "
+                "recommendations stay relevant as the month progresses. "
+                "Requires a PRODUCTION DAY column in your schedule. "
+                "Reduce 'Working days' below to match if you switch from "
+                "Whole month → This week (typically 5)."
+            ),
+        )
     else:
+        # Manual mode — no PRODUCTION DAY, so the time window is implicitly
+        # "the whole window of however many days the planner specifies".
+        time_window = "Whole month"
         st.sidebar.caption(
             "Enter FG SKU, Accessory SKU (optional), and Quantity for each row. "
             "Use **Browse catalog** below to pick from the known SKUs."
@@ -1503,13 +1525,65 @@ Every catalog / scenario / schedule / flow save triggers a Streamlit Cloud rebui
         "days": days,
         "shift": shift,
         "crew_config": edited,
+        "time_window": time_window,
     }
 
 
 # =============================================================
 # Tab renderers
 # =============================================================
-def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = ""):
+def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
+    """Return a station × week matrix of labor utilization %.
+
+    Used by the Overview tab's weekly heatmap so a planner can spot which
+    week of the month is the actual pressure point — even when the
+    currently-selected Time window is "Whole month" and would otherwise
+    average the pressure out across all 4 weeks.
+
+    Returns None when the schedule has no PRODUCTION DAY data or no rows
+    that successfully expand into units.
+    """
+    if schedule_df_full is None or schedule_df_full.empty:
+        return None
+    if "WEEK_OF_MONTH" not in schedule_df_full.columns:
+        return None
+    weeks = sorted(
+        int(w) for w in schedule_df_full["WEEK_OF_MONTH"].dropna().unique()
+    )
+    if not weeks:
+        return None
+
+    # Capacity for one week ≈ 5 working days (the standard). We deliberately
+    # don't pull this from inputs["days"] because the planner may have set
+    # that for the *whole-month* window; we want the heatmap to always show
+    # weekly intensity at a fixed reference rate.
+    week_days = 5
+    out = {}
+    for w in weeks:
+        slice_df = schedule_df_full[schedule_df_full["WEEK_OF_MONTH"] == w]
+        if slice_df.empty:
+            continue
+        try:
+            units_w = expand_schedule(slice_df, machine_df, acc_df)
+        except Exception:
+            continue
+        if units_w.empty:
+            continue
+        try:
+            cap_w = build_capacity_table(
+                units_w, inputs["crew_config"], inputs["shift"], week_days,
+                inputs["safety"], inputs["efficiency"],
+            )
+        except Exception:
+            continue
+        out[f"Wk {w}"] = cap_w["labor_util_safe"]
+
+    if not out:
+        return None
+    return pd.DataFrame(out).fillna(0)
+
+
+def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", weekly_util=None):
     # =============================================================
     # Compute headline numbers
     # =============================================================
@@ -1609,6 +1683,43 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = ""):
     )
 
     st.markdown("---")
+
+    # =============================================================
+    # Weekly utilization heatmap — STAGING / Step 1 of the time-dimension
+    # work. Renders only when the schedule has a PRODUCTION DAY column;
+    # otherwise the helper returns None and we skip it cleanly.
+    # =============================================================
+    if weekly_util is not None and not weekly_util.empty:
+        st.markdown("#### 📅 Weekly pressure")
+        st.caption(
+            "Labor utilization per station × week (at a 5-working-days-per-week "
+            "reference). Spot which week is the bottleneck even when the "
+            "whole-month view averages the pressure out."
+        )
+        # Clip the color scale at 1.5× so spikes don't wash out the lower end.
+        # zmin=0 keeps green visible; zmax=1.5 means anything ≥150% looks
+        # the same deep red — which is fine since that's "definitely red".
+        _hm = px.imshow(
+            weekly_util,
+            text_auto=".0%",
+            color_continuous_scale=[
+                (0.00, "#16A34A"),  # green
+                (0.60, "#A3E635"),  # light green
+                (0.75, "#FACC15"),  # yellow
+                (0.90, "#F97316"),  # orange
+                (1.00, "#DC2626"),  # red
+            ],
+            zmin=0, zmax=1.5,
+            aspect="auto",
+            labels={"x": "Week", "y": "Station", "color": "Util %"},
+        )
+        _hm.update_layout(
+            height=min(400, 60 + 28 * len(weekly_util.index)),
+            margin=dict(l=4, r=4, t=8, b=4),
+            coloraxis_showscale=False,
+        )
+        st.plotly_chart(_hm, use_container_width=True)
+        st.markdown("---")
 
     # =============================================================
     # Recommended actions — auto-generated from data
@@ -4536,6 +4647,40 @@ def main():
             )
 
     # ----------------------------------------------------------------
+    # Time-window filter (Step 1 of the actuals/time-dimension work).
+    # When the planner picks "This week" or "Remaining (from today)", we
+    # subset the schedule to just the rows whose PRODUCTION DAY falls in
+    # that window. The full schedule is preserved on `schedule_df_full`
+    # for the weekly heatmap rendering.
+    # ----------------------------------------------------------------
+    schedule_df_full = schedule_df.copy() if not schedule_df.empty else schedule_df
+    if not schedule_df.empty and "PRODUCTION DAY" in schedule_df.columns:
+        window = inputs.get("time_window", "Whole month")
+        if window == "This week":
+            current_week = 1 + (now_local().day - 1) // 7
+            schedule_df = schedule_df[
+                schedule_df["WEEK_OF_MONTH"] == current_week
+            ].copy()
+            if schedule_df.empty and not empty_banner_msg:
+                empty_banner_msg = (
+                    f"📅 **No units scheduled for week {current_week}** "
+                    f"in {inputs['location']}'s plan. Switch the **Time window** "
+                    "selector in the sidebar back to *Whole month* to see the full plan."
+                )
+        elif window == "Remaining (from today)":
+            today_ts = pd.Timestamp(now_local().date())
+            schedule_df = schedule_df[
+                schedule_df["PRODUCTION DAY"].notna()
+                & (schedule_df["PRODUCTION DAY"] >= today_ts)
+            ].copy()
+            if schedule_df.empty and not empty_banner_msg:
+                empty_banner_msg = (
+                    "📅 **No remaining units scheduled from today onward.** "
+                    "Switch the **Time window** selector to *Whole month* "
+                    "to see the full plan."
+                )
+
+    # ----------------------------------------------------------------
     # Compute analysis frames. Empty-safe: when there are no units, we
     # construct empty placeholders so downstream tabs can detect the
     # empty state and show their own banner instead of crashing.
@@ -4583,6 +4728,14 @@ def main():
         )
         batt_sku = battery_demand_by_sku(units)
         batt_type = battery_demand_by_type(units)
+
+    # Build the station × week heatmap input — uses the FULL schedule (not
+    # the time-window slice) so the planner can spot weekly hotspots even
+    # while looking at a sub-window. Returns None when there's no
+    # PRODUCTION DAY data, in which case the Overview just skips the chart.
+    weekly_util = _compute_weekly_utilization(
+        schedule_df_full, machine_df, acc_df, inputs,
+    )
 
     # Detect schedule month for display (Mon-YY format rows, not carryover)
     if schedule_df.empty or "CARRYOVER" not in schedule_df.columns:
@@ -4651,7 +4804,7 @@ def main():
         if units.empty:
             _empty_state("Overview")
         else:
-            tab_overview(units, capacity, batt_type, inputs, schedule_month)
+            tab_overview(units, capacity, batt_type, inputs, schedule_month, weekly_util=weekly_util)
     with tabs[1]:
         if units.empty:
             _empty_state("Capacity")

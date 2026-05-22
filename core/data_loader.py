@@ -436,7 +436,11 @@ _REQUIRED_SCHEDULE_COLUMNS = [
     ("PRODUCTION MONTH", ["PRODUCTION MONTH", "PROD MONTH", "PRODUCTION DATE", "MONTH"],         "Production Month"),
 ]
 _OPTIONAL_SCHEDULE_COLUMNS = [
-    ("CUSTOMER NAME", ["CUSTOMER NAME", "CUSTOMER", "CUST"]),
+    ("CUSTOMER NAME",  ["CUSTOMER NAME", "CUSTOMER", "CUST"]),
+    # Day-level scheduling — when present we expose a Week selector in the
+    # sidebar so the planner can see "this week" vs "remaining weeks". Absent
+    # ⇒ the analysis collapses back to the whole-month behavior, unchanged.
+    ("PRODUCTION DAY", ["PRODUCTION DAY", "PROD DAY", "BUILD DATE", "DATE"]),
 ]
 
 
@@ -583,6 +587,22 @@ def load_schedule(
     months = _detect_schedule_months(df, include_carryover)
     if months:
         df = df[df["PRODUCTION MONTH"].isin(months)]
+
+    # 9) Parse PRODUCTION DAY → real datetime + derive WEEK_OF_MONTH.
+    # The column is OPTIONAL; if it's not in the CSV (or every value is
+    # blank) we attach all-NaT and downstream code treats the schedule as
+    # whole-month-only. Week 1 = days 1-7, Week 2 = 8-14, ..., Week 5 = 29-end.
+    if "PRODUCTION DAY" in df.columns:
+        parsed_day = pd.to_datetime(
+            df["PRODUCTION DAY"].astype("object"),
+            errors="coerce",
+        )
+    else:
+        parsed_day = pd.Series([pd.NaT] * len(df), index=df.index)
+    df["PRODUCTION DAY"] = parsed_day
+    df["WEEK_OF_MONTH"] = parsed_day.dt.day.apply(
+        lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+    ).astype("Int64")
 
     # Apply customer-suffix collapse if we have a catalog
     if machine_skus is not None:

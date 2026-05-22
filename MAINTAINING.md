@@ -104,6 +104,76 @@ doing — it rewrites history and can lose other people's commits.
 
 ---
 
+## Staging branch workflow (testing new features safely)
+
+The repo has two long-lived branches:
+
+- **`main`** — what the team uses every day. Streamlit Cloud's live app
+  reads/writes here.
+- **`staging`** — your experimentation branch. A second Streamlit Cloud
+  app reads/writes here. The two apps share the same repo but never
+  touch each other's data, because catalog/scenario/schedule saves are
+  branch-aware (`core/catalog_storage.GITHUB_BRANCH` is resolved from
+  `st.secrets["github_branch"]`).
+
+### Set this up once
+
+1. Create the branch (already done — `staging` exists on GitHub).
+2. share.streamlit.io → **New app** → repo `tritoan156/labor_model`,
+   branch `staging`, file `app.py`. Give it a distinct URL like
+   `labor-model-staging.streamlit.app`.
+3. In the new app's **Settings → Secrets**:
+   ```toml
+   github_token  = "<your PAT>"
+   github_branch = "staging"
+   ```
+4. Deploy. The staging app now reads `data/*.csv` from the `staging`
+   branch and writes saves back to the `staging` branch.
+
+### Experiment-then-promote loop
+
+```bash
+# Make sure your local staging is current
+git checkout staging
+git pull origin staging
+
+# (optionally) bring in the latest main work first
+git merge main
+
+# Code, commit, push to staging — only the staging Streamlit Cloud
+# app sees these changes. Live users are untouched.
+git push origin staging
+
+# Once you're happy with the experiment, promote to main:
+git checkout main
+git pull
+git merge staging
+git push origin main
+```
+
+### Keep staging in sync with main
+
+If the team commits to `main` (e.g. catalog edits land via the live
+app), pull those into staging so the two stay close in step:
+
+```bash
+git checkout staging
+git pull origin main   # brings main's commits into staging
+git push origin staging
+```
+
+### Hard rules
+
+- **Never** point the staging app's `github_branch` secret at `"main"`.
+  That would route experimental saves into the live data file.
+- **Never** push experimental commits directly to `main`. Always commit
+  on `staging` first, verify on the staging URL, then merge.
+- If you need to throw away an experiment, just reset the staging
+  branch back to main: `git checkout staging && git reset --hard
+  origin/main && git push --force-with-lease origin staging`.
+
+---
+
 ## Adding a new facility
 
 If the company spins up a fourth manufacturing facility:

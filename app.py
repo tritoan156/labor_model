@@ -7,8 +7,11 @@ in the sidebar, and shows 8 dashboards as tabs.
 """
 from __future__ import annotations
 
-from pathlib import Path
+import calendar
 import io
+import re
+from datetime import date
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -24,10 +27,12 @@ from core.data_loader import (
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
+    compute_unit_labor,
 )
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
     DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
+    STATION_KEYS,
     now_local, today_local_str,
 )
 from core.facility_storage import (
@@ -192,6 +197,176 @@ def _track_and_flush(event_type: str, *, force_flush: bool = True, **payload) ->
 
 
 
+# ---------------------------------------------------------------------------
+# Auto-spread (LPT level-loading)
+# ---------------------------------------------------------------------------
+# Month-label parsers ("May-26" / "26-Apr") for the target-month detection.
+_MONTH_NAMES = ["jan", "feb", "mar", "apr", "may", "jun",
+                "jul", "aug", "sep", "oct", "nov", "dec"]
+_CURRENT_MONTH_RE = re.compile(r"^([A-Za-z]{3})-(\d{2})$")
+_CARRYOVER_MONTH_RE = re.compile(r"^(\d{2})-([A-Za-z]{3})$")
+
+
+def _parse_target_month(month_label: str) -> "tuple[int, int] | None":
+    """Convert a PRODUCTION MONTH cell value to (year, month_num) or None.
+
+    Accepts the two formats the existing loader produces:
+      "May-26"  → (2026, 5)   (current-month style)
+      "26-Apr"  → (2026, 4)   (carryover style)
+    """
+    if not month_label:
+        return None
+    s = str(month_label).strip()
+    m = _CURRENT_MONTH_RE.match(s)
+    if m:
+        mon_str, yy = m.group(1), m.group(2)
+    else:
+        m = _CARRYOVER_MONTH_RE.match(s)
+        if not m:
+            return None
+        yy, mon_str = m.group(1), m.group(2)
+    try:
+        mon_idx = _MONTH_NAMES.index(mon_str.lower()) + 1
+        year = 2000 + int(yy)
+    except (ValueError, IndexError):
+        return None
+    return year, mon_idx
+
+
+def _working_days_in_month(year: int, month: int) -> list[date]:
+    """M–F dates in the given month, ordered chronologically.
+
+    No holiday awareness — if the team has a known company holiday, the
+    heatmap surfaces the resulting overload and the planner can re-date
+    the affected rows by hand.
+    """
+    last = calendar.monthrange(year, month)[1]
+    out = []
+    for d in range(1, last + 1):
+        dt = date(year, month, d)
+        if dt.weekday() < 5:  # Monday=0 … Friday=4
+            out.append(dt)
+    return out
+
+
+def _row_labor_weight(row: pd.Series, machine_df, acc_df) -> float:
+    """Approximate per-row labor (person-minutes × qty).
+
+    Falls back to ``BUILD QTY × 100`` when ``compute_unit_labor`` can't
+    resolve the SKU — still gets the row a non-zero weight so LPT can
+    place it somewhere reasonable.
+    """
+    fg = row.get("FG_BASE") or row.get("FG SKU ID")
+    acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or None
+    qty = float(row.get("BUILD QTY", 0) or 0)
+    try:
+        labor = compute_unit_labor(fg, acc, machine_df, acc_df)
+        if labor is None:
+            return max(qty, 1.0) * 100.0
+        per_unit = sum(float(labor.get(s, 0) or 0) for s in STATION_KEYS)
+        return max(qty, 1.0) * per_unit
+    except Exception:
+        return max(qty, 1.0) * 100.0
+
+
+def _auto_spread_dates(df: pd.DataFrame, machine_df, acc_df, location: str) -> pd.DataFrame:
+    """Fill blank PRODUCTION DAY cells with auto-leveled dates.
+
+    Uses the **Longest Processing Time** heuristic for the parallel-
+    machine scheduling problem: sort blank rows by labor weight, descending,
+    and place each into the working day with the smallest running total.
+    Provably gives ≤ 4/3× optimal makespan and runs in O(n log n).
+
+    Mixed-mode aware: rows that already have a valid PRODUCTION DAY are
+    preserved, and their labor weight seeds that day's running total so
+    the blank rows are level-loaded **on top** of the existing pinned plan.
+
+    Side effects:
+      • Sets ``df["PRODUCTION DAY"]`` for previously-blank rows to a real
+        ``pd.Timestamp`` in the target month.
+      • Recomputes ``df["WEEK_OF_MONTH"]`` for all rows from the new
+        PRODUCTION DAY values.
+      • Attaches ``df.attrs["auto_spread"]`` = a small dict with metadata
+        for the UI to surface: ``{count, total_rows, target_month_label,
+        working_days}``.
+
+    Returns the (mutated) df. Guards against the obvious edge cases — empty
+    schedule, no working days, undetectable target month — by returning the
+    df unchanged with no ``auto_spread`` attribute set.
+    """
+    if df is None or df.empty:
+        return df
+
+    # Identify which rows need a date assigned. Anything that isn't a real
+    # Timestamp counts as "blank" (handles NaT, empty strings, etc.).
+    if "PRODUCTION DAY" in df.columns:
+        day_series = pd.to_datetime(df["PRODUCTION DAY"], errors="coerce")
+    else:
+        day_series = pd.Series([pd.NaT] * len(df), index=df.index)
+    blank_mask = day_series.isna()
+    if not blank_mask.any():
+        return df  # nothing to do — every row is already dated
+
+    # Detect the target (year, month). Prefer the first non-null
+    # PRODUCTION MONTH; fall back to today's month in Vegas time.
+    target = None
+    if "PRODUCTION MONTH" in df.columns:
+        for v in df["PRODUCTION MONTH"].dropna():
+            target = _parse_target_month(v)
+            if target:
+                break
+    if target is None:
+        _now = now_local()
+        target = (_now.year, _now.month)
+    year, month = target
+
+    working = _working_days_in_month(year, month)
+    if not working:
+        return df  # defensive — never happens for real months
+
+    # Seed each day's running load from the rows that ARE already dated.
+    day_load: dict[date, float] = {d: 0.0 for d in working}
+    for idx in df.index[~blank_mask]:
+        d = day_series.loc[idx].date()
+        if d in day_load:
+            day_load[d] += _row_labor_weight(df.loc[idx], machine_df, acc_df)
+        # If a pinned date falls outside the target month's working days,
+        # we don't add it to any bucket — auto-spread still works, the
+        # heatmap just won't show that pin.
+
+    # Compute labor weights for the blank rows once, then walk them
+    # largest-first and drop each into the currently-lightest day.
+    blank_idxs = list(df.index[blank_mask])
+    weights = {idx: _row_labor_weight(df.loc[idx], machine_df, acc_df)
+               for idx in blank_idxs}
+    blank_idxs.sort(key=lambda i: weights[i], reverse=True)
+
+    assigned: dict = {}
+    for idx in blank_idxs:
+        d = min(day_load, key=day_load.get)
+        assigned[idx] = d
+        day_load[d] += weights[idx]
+
+    # Write the new dates back. Preserve the pinned rows untouched.
+    new_days = day_series.copy()
+    for idx, d in assigned.items():
+        new_days.loc[idx] = pd.Timestamp(d)
+    df["PRODUCTION DAY"] = new_days
+
+    # Recompute WEEK_OF_MONTH from the (now-complete) PRODUCTION DAY.
+    df["WEEK_OF_MONTH"] = new_days.dt.day.apply(
+        lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+    ).astype("Int64")
+
+    df.attrs["auto_spread"] = {
+        "count": int(blank_mask.sum()),
+        "total_rows": int(len(df)),
+        "target_month_label": f"{calendar.month_name[month]} {year}",
+        "working_days": len(working),
+    }
+    return df
+
+
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
     """Schedule loader — accepts an uploaded CSV, a saved-schedule buffer, or
     falls back to the bundled May 2026 sample.
@@ -218,24 +393,35 @@ def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.Dat
     """
     machine_skus = set(_load_machine_df(_csv_mtime("machine_clean.csv"))["SKU"])
 
+    # Auto-spread needs the full machine + accessory frames so it can weight
+    # each row by labor (per-station p-min × qty) before running LPT. Both
+    # come from the same cached loaders the rest of main() uses.
+    machine_df_full = _load_machine_df(_csv_mtime("machine_clean.csv"))
+    acc_df_full = _load_acc_df(_csv_mtime("acc_clean.csv"))
+
+    def _finalize(df: pd.DataFrame, source: str) -> pd.DataFrame:
+        """Common post-load step: auto-spread blank PRODUCTION DAY rows so
+        the weekly heatmap has something to chart, then stash the summary."""
+        if df is not None and not df.empty:
+            _auto_spread_dates(df, machine_df_full, acc_df_full, location)
+        _stash_upload_summary(df, location, source=source)
+        return df
+
     # 1) Saved-schedule replay (one-shot)
     buf = st.session_state.pop("_loaded_schedule_buffer", None)
     if buf is not None:
         df = load_schedule(buf, location=location, machine_skus=machine_skus)
-        _stash_upload_summary(df, location, source="saved")
-        return df
+        return _finalize(df, "saved")
 
     # 2) Live file upload
     if uploaded_file is not None:
         buf2 = io.BytesIO(uploaded_file.getvalue())
         df = load_schedule(buf2, location=location, machine_skus=machine_skus)
-        _stash_upload_summary(df, location, source="upload")
-        return df
+        return _finalize(df, "upload")
 
     # 3) Bundled sample
     df = load_schedule(location=location, machine_skus=machine_skus)
-    _stash_upload_summary(df, location, source="bundled")
-    return df
+    return _finalize(df, "bundled")
 
 
 def _stash_upload_summary(df: pd.DataFrame, location: str, source: str) -> None:
@@ -259,6 +445,8 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str) -> None:
             "location": str(location),
             "month": str(month_label or "—"),
             "source": source,
+            "auto_spread": (df.attrs.get("auto_spread")
+                            if hasattr(df, "attrs") else None),
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
@@ -1118,9 +1306,9 @@ def render_sidebar() -> dict:
         # CUSTOMER NAME is optional and intentionally omitted so the template
         # stays minimal; the loader treats it as a `.get` with empty fallback.
         _template_csv = (
-            "LOCATION,FG SKU ID,FG ACCRY SKU ID,BUILD QTY,PRODUCTION MONTH\n"
-            "HENDERSON,BOSS25-010,BOSS25-A016,5,May-26\n"
-            "CYPRESS,SDG25,,2,May-26\n"
+            "LOCATION,FG SKU ID,FG ACCRY SKU ID,BUILD QTY,PRODUCTION MONTH,PRODUCTION DAY\n"
+            "HENDERSON,BOSS25-010,BOSS25-A016,5,May-26,\n"
+            "CYPRESS,SDG25,,2,May-26,\n"
         )
         st.sidebar.download_button(
             "📥 Download blank template",
@@ -1130,7 +1318,10 @@ def render_sidebar() -> dict:
             use_container_width=True,
             help=(
                 "Empty CSV with the columns the app needs. Fill in your "
-                "schedule and re-upload."
+                "schedule and re-upload. **PRODUCTION DAY** is optional — "
+                "leave it blank to let the tool auto-spread units across "
+                "the month's working days, or fill in dates like "
+                "`5/8/2026` to pin your own sequence."
             ),
         )
         st.sidebar.caption(
@@ -1150,11 +1341,20 @@ def render_sidebar() -> dict:
                 "saved":   "saved schedule",
                 "bundled": "bundled sample",
             }.get(_summary.get("source", ""), "schedule")
+            _auto = _summary.get("auto_spread")
+            _auto_suffix = ""
+            if isinstance(_auto, dict) and _auto.get("count"):
+                _auto_suffix = (
+                    f"  \n📅 _Auto-leveled {_auto['count']} of "
+                    f"{_auto['total_rows']} rows across "
+                    f"{_auto['working_days']} working days._"
+                )
             st.sidebar.success(
                 f"✅ Loaded **{_summary.get('rows', '?')}** rows from "
                 f"**{_summary.get('location', '?')}** "
                 f"· month **{_summary.get('month', '—')}** "
                 f"({_src_label})"
+                + _auto_suffix
             )
         elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
@@ -1489,13 +1689,22 @@ If a planner sees *"GitHub token not configured"* when saving, the token is miss
 ### Wild-CSV upload behavior
 The loader auto-matches column names so the team can upload their normal Excel export without reformatting:
 - **Required columns** (any of these naming patterns will match): `LOCATION` / `Facility` / `Site`; `FG SKU ID` / `FG SKU` / `Finished Good`; `FG ACCRY SKU ID` / `Accessory SKU` / `Acc SKU`; `BUILD QTY` / `Qty` / `Quantity`; `PRODUCTION MONTH` / `Prod Month` / `Production Date` / `Month`.
-- **Optional:** `CUSTOMER NAME` / `Customer` / `Cust`.
+- **Optional:** `CUSTOMER NAME` / `Customer` / `Cust`; `PRODUCTION DAY` / `Prod Day` / `Build Date` / `Date`.
 - **Extra columns are ignored** — pandas reads them all but the loader only uses the ones it recognises.
 - **UTF-8 BOM is stripped** automatically — Excel's default save format on Windows just works.
 - **Date formats:** `Mon-YY` (e.g. `May-26`), `YY-Mon` carryover (e.g. `26-Apr`), US slash (`5/8/2026`), and ISO (`2026-05-08`) all parse correctly.
 - **Zero-qty rows** are dropped automatically.
 
 If a required column truly isn't there, the planner sees a yellow banner naming the missing column and listing the aliases the loader tried.
+
+### Auto-spread (level-loading dates)
+When a planner uploads a schedule without `PRODUCTION DAY` values (or with some rows dated and others blank), the tool **auto-assigns dates** to the blanks so the weekly heatmap has a meaningful baseline.
+
+The algorithm — Longest Processing Time (LPT) — sorts the blank rows by labor weight (sum of per-station p-min × `BUILD QTY`), largest first, then drops each onto the working day with the currently lightest running total. Result: weekly labor is roughly even, no week takes a disproportionate share of heavy units. Existing dated rows are preserved and their load seeds the day totals so the level-loading respects them.
+
+A yellow banner at the top of the page tells the planner when auto-spread fired and how many rows it touched. The pill in the sidebar gets a `📅 Auto-leveled …` suffix.
+
+**To override:** add real dates to your CSV's `PRODUCTION DAY` column and re-upload. Auto-spread won't touch rows that already have a date.
 
 ### Blank template
 The **📥 Download blank template** button under the file uploader hands the planner an empty CSV with the 5 required headers + 2 example rows. Quickest way to ensure formatting is right.
@@ -4753,6 +4962,27 @@ def main():
     # unknown accessories build with zero acc labor — without this banner a
     # planner could trust analysis numbers that are missing units. Keep it
     # compact; the full list lives in 📁 Data & Setup → 🔍 Data Quality.
+    # Auto-spread banner — fires when _auto_spread_dates filled in blank
+    # PRODUCTION DAY rows. We surface it prominently so the planner knows
+    # the dates driving the heatmap are *synthetic* (a level-load baseline),
+    # not what their ERP told them.
+    _auto = (
+        schedule_df_full.attrs.get("auto_spread")
+        if (hasattr(schedule_df_full, "attrs") and not schedule_df_full.empty)
+        else None
+    )
+    if isinstance(_auto, dict) and _auto.get("count"):
+        st.warning(
+            "📅 **No PRODUCTION DAY in your schedule** — we auto-leveled "
+            f"**{_auto['count']} of {_auto['total_rows']} units** across "
+            f"**{_auto['target_month_label']}** "
+            f"({_auto['working_days']} working days) so weekly labor is "
+            "roughly balanced. The Overview heatmap reflects this "
+            "synthetic sequence. To pin your own dates, add a "
+            "**PRODUCTION DAY** column to your CSV (any date format works) "
+            "and re-upload."
+        )
+
     _skipped_fg: list = []
     _unknown_acc: list = []
     if not units.empty and hasattr(units, "attrs"):

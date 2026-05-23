@@ -367,6 +367,177 @@ def _auto_spread_dates(df: pd.DataFrame, machine_df, acc_df, location: str) -> p
     return df
 
 
+def _suggest_schedule_dates(
+    schedule_df: pd.DataFrame, machine_df, acc_df, inputs: dict,
+) -> "tuple[pd.DataFrame, list[dict]]":
+    """Constraint-aware version of auto-spread.
+
+    Different from ``_auto_spread_dates`` in three ways:
+      1. **Overrides** existing PRODUCTION DAY values — the planner clicked
+         "Suggest" so they want a fresh re-spread, not an additive one.
+      2. **Per-station capacity check** — for each candidate day, the placer
+         verifies that putting this unit's labor into that week wouldn't
+         tip any station above ``UTIL_THRESHOLD_OVER`` (1.0). If every day
+         fails, the unit lands on the least-loaded day and the offending
+         station(s) are recorded in the returned overload list.
+      3. **Returns a new DataFrame** rather than mutating the original, so
+         the UI can preview the proposal alongside the current schedule.
+
+    Returns ``(new_schedule_df, overloads)`` where ``overloads`` is a list
+    of dicts: ``{"row_idx", "fg", "week", "stations"}``.
+    """
+    if schedule_df is None or schedule_df.empty:
+        return schedule_df, []
+
+    new_df = schedule_df.copy()
+
+    # ---- Target month detection (same as _auto_spread_dates) ------------
+    target = None
+    if "PRODUCTION MONTH" in new_df.columns:
+        for v in new_df["PRODUCTION MONTH"].dropna():
+            target = _parse_target_month(v)
+            if target:
+                break
+    if target is None:
+        _now = now_local()
+        target = (_now.year, _now.month)
+    year, month = target
+
+    working = _working_days_in_month(year, month)
+    if not working:
+        return new_df, []
+
+    # ---- Per-station weekly capacity (5-day reference) ------------------
+    from core.constants import STATION_KEY_TO_DISPLAY, UTIL_THRESHOLD_OVER
+    crew_config = inputs["crew_config"]
+    shift = float(inputs["shift"])
+    eff = float(inputs["efficiency"])
+    safety = float(inputs["safety"])
+    week_days = 5
+
+    station_capacity: dict[str, float] = {}
+    for st_key in STATION_KEYS:
+        st_disp = STATION_KEY_TO_DISPLAY.get(st_key)
+        if not st_disp or st_disp not in crew_config.index:
+            station_capacity[st_key] = 0.0
+            continue
+        try:
+            hc = int(crew_config.loc[st_disp, "HC"])
+        except Exception:
+            hc = 0
+        station_capacity[st_key] = (
+            hc * shift * week_days * eff * safety if hc > 0 else 0.0
+        )
+
+    # Map each working day → its week
+    day_to_week = {d: 1 + (d.day - 1) // 7 for d in working}
+    weeks = sorted(set(day_to_week.values()))
+
+    # Running per-station-per-week load + total per-day load
+    station_load: dict = {(st, w): 0.0 for st in STATION_KEYS for w in weeks}
+    day_total_load: dict = {d: 0.0 for d in working}
+
+    # Per-row labor breakdown
+    def _row_breakdown(row) -> "tuple[dict, float]":
+        fg = row.get("FG_BASE") or row.get("FG SKU ID")
+        acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or None
+        try:
+            qty = float(row.get("BUILD QTY", 0) or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            labor = compute_unit_labor(fg, acc, machine_df, acc_df)
+            if labor is None:
+                return {}, max(qty, 1.0) * 100.0
+            breakdown = {
+                s: float(labor.get(s, 0) or 0) * qty for s in STATION_KEYS
+            }
+            total = sum(breakdown.values())
+            return breakdown, total
+        except Exception:
+            return {}, max(qty, 1.0) * 100.0
+
+    # Compute all breakdowns up front and sort largest-first (LPT)
+    rows = []
+    for idx in new_df.index:
+        br, total = _row_breakdown(new_df.loc[idx])
+        rows.append((idx, br, total))
+    rows.sort(key=lambda r: r[2], reverse=True)
+
+    overloads: list[dict] = []
+    assigned: dict = {}
+    for idx, breakdown, total in rows:
+        # Walk candidate days from lightest to heaviest
+        candidates = sorted(working, key=lambda d: day_total_load[d])
+        placed_day = None
+        for cand in candidates:
+            w = day_to_week[cand]
+            ok = True
+            for st_key, cost in breakdown.items():
+                if cost <= 0:
+                    continue
+                cap = station_capacity.get(st_key, 0.0)
+                if cap <= 0:
+                    # Station doesn't exist here — skip the constraint check
+                    # (treat it like infinite capacity for this purpose).
+                    continue
+                if (station_load[(st_key, w)] + cost) / cap > UTIL_THRESHOLD_OVER:
+                    ok = False
+                    break
+            if ok:
+                placed_day = cand
+                break
+
+        if placed_day is None:
+            # Fall back to the lightest day; record which stations are over.
+            placed_day = min(day_total_load, key=day_total_load.get)
+            w = day_to_week[placed_day]
+            offenders = []
+            for st_key, cost in breakdown.items():
+                if cost <= 0:
+                    continue
+                cap = station_capacity.get(st_key, 0.0)
+                if cap > 0 and (station_load[(st_key, w)] + cost) / cap > UTIL_THRESHOLD_OVER:
+                    offenders.append(st_key)
+            if offenders:
+                fg_label = (
+                    new_df.loc[idx].get("FG_BASE")
+                    or new_df.loc[idx].get("FG SKU ID")
+                    or "?"
+                )
+                overloads.append({
+                    "row_idx": idx,
+                    "fg": str(fg_label),
+                    "week": int(w),
+                    "stations": offenders,
+                })
+
+        # Commit the placement
+        assigned[idx] = placed_day
+        day_total_load[placed_day] += total
+        wk = day_to_week[placed_day]
+        for st_key, cost in breakdown.items():
+            station_load[(st_key, wk)] = station_load.get((st_key, wk), 0.0) + cost
+
+    # ---- Write the proposed dates back ---------------------------------
+    new_days = pd.Series(
+        [pd.Timestamp(assigned[i]) for i in new_df.index],
+        index=new_df.index,
+        dtype="datetime64[ns]",
+    )
+    new_df["PRODUCTION DAY"] = new_days
+    new_df["WEEK_OF_MONTH"] = new_days.dt.day.apply(
+        lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+    ).astype("Int64")
+    new_df.attrs["suggested"] = {
+        "target_month_label": f"{calendar.month_name[month]} {year}",
+        "working_days": len(working),
+        "total_rows": int(len(new_df)),
+        "overloads_count": len(overloads),
+    }
+    return new_df, overloads
+
+
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
     """Schedule loader — accepts an uploaded CSV, a saved-schedule buffer, or
     falls back to the bundled May 2026 sample.
@@ -450,6 +621,432 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str) -> None:
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
+
+
+# =============================================================
+# Sequencer — Suggest button + Accept/Discard proposal flow
+# =============================================================
+def _render_sequencer_controls(
+    schedule_df: pd.DataFrame, machine_df, acc_df, inputs: dict,
+) -> pd.DataFrame:
+    """Top-of-page control bar for the Sequencer.
+
+    Provides a 💡 Suggest button (level-loaded re-spread that respects
+    per-station weekly capacity) plus accept/discard buttons when a
+    proposal is pending. Returns the schedule_df that should drive the
+    rest of main() — either the original, or the accepted proposal.
+
+    Pending proposal state lives in ``st.session_state["_proposed_schedule"]``
+    and ``st.session_state["_proposed_schedule_overloads"]``.
+    """
+    if schedule_df is None or schedule_df.empty:
+        return schedule_df
+
+    # If a proposal is pending, render the accept/discard bar and the
+    # diagnosis. Otherwise render the Suggest trigger.
+    proposal = st.session_state.get("_proposed_schedule")
+    overloads = st.session_state.get("_proposed_schedule_overloads", [])
+
+    if isinstance(proposal, pd.DataFrame) and not proposal.empty:
+        meta = proposal.attrs.get("suggested", {})
+        with st.container():
+            st.info(
+                f"💡 **Proposed level-loaded schedule** — {meta.get('total_rows', '?')} "
+                f"units across {meta.get('working_days', '?')} working days of "
+                f"**{meta.get('target_month_label', '?')}**. "
+                "Review the comparison heatmap on the **🏠 Overview** tab. "
+                "Accept to switch the analysis to this sequence, or Discard to keep your current one."
+            )
+            if overloads:
+                _ol_summary = ", ".join(
+                    f"{o['fg']} (Wk {o['week']}: {', '.join(o['stations'])})"
+                    for o in overloads[:5]
+                )
+                if len(overloads) > 5:
+                    _ol_summary += f" … (+{len(overloads) - 5} more)"
+                st.warning(
+                    f"⚠️ **{len(overloads)} unit(s) couldn't fit without overload:** "
+                    f"{_ol_summary}. Consider adding HC at the named stations, "
+                    "deferring units to next month, or accepting a tighter plan."
+                )
+            c1, c2, _ = st.columns([1, 1, 4])
+            if c1.button("✅ Accept proposal", use_container_width=True, type="primary"):
+                # Replace the working schedule and clear proposal state.
+                accepted = st.session_state.pop("_proposed_schedule")
+                st.session_state.pop("_proposed_schedule_overloads", None)
+                # Push the accepted CSV through the upload buffer so the
+                # standard loader path picks it up on the next rerun.
+                csv_text = accepted.to_csv(index=False)
+                st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
+                    csv_text.encode("utf-8")
+                )
+                _track_and_flush(
+                    "sequencer_accept",
+                    facility=inputs.get("location"),
+                    rows=int(len(accepted)),
+                    overloads=len(overloads),
+                )
+                st.success("Proposal accepted — refreshing the analysis…")
+                st.rerun()
+            if c2.button("🚫 Discard", use_container_width=True):
+                st.session_state.pop("_proposed_schedule", None)
+                st.session_state.pop("_proposed_schedule_overloads", None)
+                _track_and_flush("sequencer_discard", facility=inputs.get("location"))
+                st.rerun()
+        return schedule_df
+
+    # No proposal pending — show the Suggest trigger inside an expander so
+    # it's discoverable but doesn't dominate the page.
+    with st.expander("💡 Suggest a level-loaded schedule", expanded=False):
+        st.caption(
+            "Re-spreads every unit across this month's working days using the "
+            "**Longest Processing Time** heuristic, with a per-station weekly "
+            "capacity check so no station goes over 100% in any one week. "
+            "Existing PRODUCTION DAY values are **overridden** — the planner "
+            "explicitly asked for a fresh sequence. You'll review a side-by-"
+            "side preview before committing."
+        )
+        if st.button(
+            "💡 Generate proposal",
+            use_container_width=True,
+            help=(
+                "Runs the constraint-aware LPT scheduler on your current "
+                "schedule. Result shows on the Overview tab as a side-by-side "
+                "heatmap with accept/discard buttons."
+            ),
+        ):
+            with st.spinner("Running constraint-aware LPT scheduler…"):
+                try:
+                    new_df, ol = _suggest_schedule_dates(
+                        schedule_df, machine_df, acc_df, inputs,
+                    )
+                    st.session_state["_proposed_schedule"] = new_df
+                    st.session_state["_proposed_schedule_overloads"] = ol
+                    _track_and_flush(
+                        "sequencer_suggest",
+                        facility=inputs.get("location"),
+                        rows=int(len(new_df)),
+                        overloads=len(ol),
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Suggester failed: {e}")
+    return schedule_df
+
+
+def _render_sequencer_view(schedule_df: pd.DataFrame) -> None:
+    """The 🗓 Sequence sub-section under Data & Setup.
+
+    Two side-by-side controls that together form the manual-reshape UX:
+      • Editable table with PRODUCTION DAY as a date-picker column. Edit
+        rows inline, click Apply to write back into the session schedule.
+      • Bulk move form: shift N units of SKU X from Week A → Week B in
+        one operation.
+
+    Both write the reshaped CSV through ``st.session_state["_loaded_schedule_buffer"]``
+    so the standard loader picks it up on the next rerun and the analysis
+    tabs immediately reflect the new sequence.
+    """
+    st.subheader("🗓 Sequence — manual reshape")
+    if schedule_df is None or schedule_df.empty:
+        st.info(
+            "No schedule loaded yet. Upload a CSV in the sidebar, then come "
+            "back here to reshape the dates."
+        )
+        return
+
+    st.caption(
+        "Edit individual `PRODUCTION DAY` cells in the table, OR use the "
+        "**Bulk move** form below to shift many units at once. Changes "
+        "live in your browser session — use **📥 Download** to save a copy "
+        "you can re-upload later (or save via the sidebar's 📂 Save panel)."
+    )
+
+    # Reset button — toss any reshape edits so the table reflects the
+    # canonical schedule again.
+    if st.button("↩️ Revert to current sequence", help="Drops any unsaved reshape edits."):
+        st.session_state.pop("_sequencer_edits", None)
+        st.rerun()
+
+    # Choose which columns to expose in the editor. Keep the editable surface
+    # narrow (date + qty) so we don't accidentally let the planner mangle
+    # the FG/Accessory SKUs from this view (those have their own catalogs).
+    display_cols = [
+        c for c in ["FG SKU ID", "FG ACCRY SKU ID", "BUILD QTY",
+                    "PRODUCTION DAY", "WEEK_OF_MONTH",
+                    "CUSTOMER NAME", "PRODUCTION MONTH", "LOCATION"]
+        if c in schedule_df.columns
+    ]
+    work = schedule_df[display_cols].copy()
+    # Make sure PRODUCTION DAY is a real datetime so st.column_config.DateColumn
+    # gets it as a Date.
+    if "PRODUCTION DAY" in work.columns:
+        work["PRODUCTION DAY"] = pd.to_datetime(work["PRODUCTION DAY"], errors="coerce")
+
+    col_cfg = {}
+    if "FG SKU ID" in work.columns:
+        col_cfg["FG SKU ID"] = st.column_config.TextColumn("FG SKU", disabled=True)
+    if "FG ACCRY SKU ID" in work.columns:
+        col_cfg["FG ACCRY SKU ID"] = st.column_config.TextColumn(
+            "Accessory SKU", disabled=True,
+        )
+    if "BUILD QTY" in work.columns:
+        col_cfg["BUILD QTY"] = st.column_config.NumberColumn(
+            "Qty", min_value=0, step=1,
+            help="Edit if you want to scale a row up/down.",
+        )
+    if "PRODUCTION DAY" in work.columns:
+        col_cfg["PRODUCTION DAY"] = st.column_config.DateColumn(
+            "Production Day",
+            help="Click the cell and pick a new date.",
+        )
+    if "WEEK_OF_MONTH" in work.columns:
+        col_cfg["WEEK_OF_MONTH"] = st.column_config.NumberColumn(
+            "Week", disabled=True,
+            help="Derived from Production Day after you click Apply.",
+        )
+    if "CUSTOMER NAME" in work.columns:
+        col_cfg["CUSTOMER NAME"] = st.column_config.TextColumn(
+            "Customer", disabled=True,
+        )
+    if "PRODUCTION MONTH" in work.columns:
+        col_cfg["PRODUCTION MONTH"] = st.column_config.TextColumn(
+            "Prod Month", disabled=True,
+        )
+    if "LOCATION" in work.columns:
+        col_cfg["LOCATION"] = st.column_config.TextColumn(
+            "Location", disabled=True,
+        )
+
+    edited = st.data_editor(
+        work,
+        use_container_width=True,
+        num_rows="fixed",
+        column_config=col_cfg,
+        key="sequencer_editor",
+        height=480,
+    )
+
+    # Apply / Download
+    ca, cb = st.columns([1, 1])
+    if ca.button(
+        "🔄 Apply edits",
+        use_container_width=True,
+        type="primary",
+        help=(
+            "Writes the edited rows back into the session schedule so all "
+            "analysis tabs use the new sequence."
+        ),
+    ):
+        _apply_sequencer_edits(schedule_df, edited)
+
+    # Build the downloadable CSV with the edits applied (without committing
+    # to session state until Apply is clicked).
+    try:
+        download_df = _merge_sequencer_edits_into_full(schedule_df, edited)
+        cb.download_button(
+            "📥 Download reshaped schedule",
+            download_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"schedule_reshaped_{today_local_str()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help=(
+                "Saves the current view (including unsaved edits) as a CSV "
+                "you can re-upload or save via the 📂 Save panel."
+            ),
+        )
+    except Exception:
+        # If merging fails for any reason, fall back to the canonical schedule.
+        cb.download_button(
+            "📥 Download current schedule",
+            schedule_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"schedule_{today_local_str()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+    _render_bulk_move_form(schedule_df)
+
+
+def _merge_sequencer_edits_into_full(
+    base_df: pd.DataFrame, edited: pd.DataFrame,
+) -> pd.DataFrame:
+    """Overlay the columns the editor allowed onto ``base_df`` and return
+    the result. Used both by the Apply path and the Download button."""
+    out = base_df.copy()
+    overlay_cols = [
+        c for c in ["PRODUCTION DAY", "BUILD QTY"]
+        if c in edited.columns and c in out.columns
+    ]
+    for c in overlay_cols:
+        out[c] = edited[c].values  # editor row-count is fixed; alignment is safe
+    # Recompute WEEK_OF_MONTH from the new PRODUCTION DAY
+    if "PRODUCTION DAY" in out.columns:
+        new_days = pd.to_datetime(out["PRODUCTION DAY"], errors="coerce")
+        out["PRODUCTION DAY"] = new_days
+        out["WEEK_OF_MONTH"] = new_days.dt.day.apply(
+            lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+        ).astype("Int64")
+    return out
+
+
+def _apply_sequencer_edits(base_df: pd.DataFrame, edited: pd.DataFrame) -> None:
+    """Commit the editor's changes back into the session schedule.
+
+    The mechanism: serialize the merged DataFrame to CSV bytes and stash
+    them in ``_loaded_schedule_buffer`` — the same one-shot path the
+    Sequencer's Accept proposal flow uses. Next rerun, the standard loader
+    picks the buffer up and the analysis tabs pick up the new dates.
+    """
+    try:
+        merged = _merge_sequencer_edits_into_full(base_df, edited)
+        csv_text = merged.to_csv(index=False)
+        st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
+            csv_text.encode("utf-8")
+        )
+        _track_and_flush(
+            "sequencer_apply",
+            rows=int(len(merged)),
+        )
+        st.success("Edits applied — refreshing the analysis…")
+        st.rerun()
+    except Exception as e:
+        st.error(f"❌ Couldn't apply edits: {e}")
+
+
+def _render_bulk_move_form(schedule_df: pd.DataFrame) -> None:
+    """Bulk move N units of an FG SKU from one week to another."""
+    st.markdown("**🔀 Bulk move**")
+    st.caption(
+        "Shift a batch of units of the same FG SKU from one week to "
+        "another. Useful when you want to even out a single problem week "
+        "without editing rows one at a time."
+    )
+
+    if "WEEK_OF_MONTH" not in schedule_df.columns:
+        st.info("Week info isn't available — your schedule has no PRODUCTION DAY.")
+        return
+
+    weeks = sorted(
+        int(w) for w in schedule_df["WEEK_OF_MONTH"].dropna().unique()
+    )
+    if len(weeks) < 1:
+        st.info("No week-bucketed rows to move.")
+        return
+
+    skus = sorted(schedule_df.get("FG SKU ID", pd.Series(dtype=str))
+                  .astype(str).str.strip().unique())
+    if not skus:
+        return
+
+    with st.form("bulk_move_form", clear_on_submit=False):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        chosen_sku = c1.selectbox("FG SKU", options=skus, key="bulk_move_sku")
+        from_week = c2.selectbox(
+            "From week", options=weeks, key="bulk_move_from",
+        )
+        to_week_opts = sorted(set(weeks + [w for w in (1, 2, 3, 4, 5) if w not in weeks]))
+        to_week = c3.selectbox(
+            "To week", options=to_week_opts, key="bulk_move_to",
+        )
+        qty = c4.number_input(
+            "Units", min_value=1, step=1, value=1, key="bulk_move_qty",
+        )
+        submitted = st.form_submit_button(
+            "🔀 Move",
+            use_container_width=True,
+        )
+
+    if not submitted:
+        return
+
+    # Pick the matching rows in the source week — newest first by index so
+    # the move targets the bottom of that week's stack.
+    mask = (
+        (schedule_df["FG SKU ID"].astype(str).str.strip() == chosen_sku)
+        & (schedule_df["WEEK_OF_MONTH"] == from_week)
+    )
+    eligible = schedule_df[mask].copy()
+    if eligible.empty:
+        st.warning(f"No units of **{chosen_sku}** found in week {from_week}.")
+        return
+
+    # Per-row BUILD QTY can be >1, so we accumulate rows until we cover the
+    # requested move count, splitting a row when partial.
+    moved = 0
+    new_df = schedule_df.copy()
+    new_rows = []  # for any split (partial-move) cases
+    for idx, row in eligible.iterrows():
+        if moved >= qty:
+            break
+        row_qty = int(row.get("BUILD QTY", 0) or 0)
+        if row_qty <= 0:
+            continue
+        take = min(row_qty, qty - moved)
+        if take == row_qty:
+            # Move the whole row by updating its PRODUCTION DAY to the
+            # first working day of the target week.
+            new_df.at[idx, "PRODUCTION DAY"] = _first_day_of_week(
+                new_df.at[idx, "PRODUCTION DAY"], to_week,
+            )
+            new_df.at[idx, "WEEK_OF_MONTH"] = to_week
+        else:
+            # Split: keep `row_qty - take` in the original row, add a new
+            # row with `take` units dated to the target week.
+            new_df.at[idx, "BUILD QTY"] = row_qty - take
+            split_row = row.copy()
+            split_row["BUILD QTY"] = take
+            split_row["PRODUCTION DAY"] = _first_day_of_week(
+                row.get("PRODUCTION DAY"), to_week,
+            )
+            split_row["WEEK_OF_MONTH"] = to_week
+            new_rows.append(split_row)
+        moved += take
+
+    if new_rows:
+        new_df = pd.concat([new_df, pd.DataFrame(new_rows)], ignore_index=True)
+
+    if moved == 0:
+        st.warning(f"Nothing moved — couldn't find {qty} unit(s) of {chosen_sku}.")
+        return
+
+    # Commit through the same buffer the editor uses.
+    csv_text = new_df.to_csv(index=False)
+    st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
+        csv_text.encode("utf-8")
+    )
+    _track_and_flush(
+        "sequencer_bulk_move",
+        sku=chosen_sku, from_week=from_week, to_week=to_week, units=moved,
+    )
+    st.success(
+        f"🔀 Moved **{moved}** unit(s) of **{chosen_sku}** from "
+        f"week {from_week} → week {to_week}."
+    )
+    st.rerun()
+
+
+def _first_day_of_week(reference, target_week: int):
+    """Return a pd.Timestamp for the first working day (Monday-ish) of the
+    given week-of-month, anchored on the same month as ``reference``.
+
+    Falls back to today's month if ``reference`` isn't a parseable date.
+    """
+    ref = pd.to_datetime(reference, errors="coerce")
+    if pd.isna(ref):
+        ref_dt = now_local()
+    else:
+        ref_dt = ref
+    year = int(ref_dt.year)
+    month = int(ref_dt.month)
+    working = _working_days_in_month(year, month)
+    # Pick the first working day whose week-of-month matches.
+    for d in working:
+        if 1 + (d.day - 1) // 7 == int(target_week):
+            return pd.Timestamp(d)
+    # Fallback — first working day of the month
+    return pd.Timestamp(working[0]) if working else pd.Timestamp(ref_dt.date())
 
 
 # =============================================================
@@ -1706,6 +2303,23 @@ A yellow banner at the top of the page tells the planner when auto-spread fired 
 
 **To override:** add real dates to your CSV's `PRODUCTION DAY` column and re-upload. Auto-spread won't touch rows that already have a date.
 
+### Sequencer (Suggest + manual reshape)
+The Sequencer turns the static schedule into something you can *re-balance* interactively.
+
+**💡 Suggest a level-loaded schedule** — top-of-page expander. Click *Generate proposal* and the tool runs a constraint-aware LPT scheduler:
+- Per-row labor weight = sum of per-station p-min × `BUILD QTY` (same path the rest of the analysis uses).
+- For each blank row, sorted largest-first, walk candidate days from lightest to heaviest. For each day, check that placing the unit wouldn't tip *any* station above 100% weekly utilization (computed against your current HC, shift, safety, efficiency). Take the first day that passes.
+- If no day satisfies the constraints, the row lands on the least-loaded day anyway and is flagged in an *overload diagnosis* showing which stations would be tipped over.
+
+The proposal appears as a side-by-side preview heatmap on the Overview (Current vs Proposed). **✅ Accept** swaps the analysis to use the proposed sequence; **🚫 Discard** drops it.
+
+**🗓 Sequence sub-section** (📁 Data & Setup) — manual reshape:
+- *Editable table* — every row's `PRODUCTION DAY` is a date-picker cell. Edit, then click **🔄 Apply edits** to push the changes into the analysis.
+- *🔀 Bulk move* form — shift N units of a chosen FG SKU from one week to another in one click. Useful when you want to flatten a single problem week without per-row edits.
+- *📥 Download* — reshaped schedule as CSV. Re-upload to save, or push it through the **📂 Save uploaded schedule** panel.
+
+Reshape edits live in your browser session only — they don't persist to GitHub unless you save through the existing 📂 Save panel.
+
 ### Blank template
 The **📥 Download blank template** button under the file uploader hands the planner an empty CSV with the 5 required headers + 2 example rows. Quickest way to ensure formatting is right.
 
@@ -1892,6 +2506,71 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     )
 
     st.markdown("---")
+
+    # =============================================================
+    # Proposed-schedule preview — Sequencer feature. When the planner has
+    # generated a proposal but not yet accepted/discarded it, show its
+    # weekly heatmap side-by-side with the current one so the comparison
+    # is glanceable.
+    # =============================================================
+    _proposed = st.session_state.get("_proposed_schedule")
+    if (
+        isinstance(_proposed, pd.DataFrame) and not _proposed.empty
+        and weekly_util is not None and not weekly_util.empty
+    ):
+        # Compute the proposal's weekly heatmap on the fly using the same
+        # helper that produced `weekly_util` for the current schedule.
+        try:
+            # Pull machine_df / acc_df from cached loaders (same path main() uses).
+            _machine = _load_machine_df(_csv_mtime("machine_clean.csv"))
+            _acc = _load_acc_df(_csv_mtime("acc_clean.csv"))
+            proposed_util = _compute_weekly_utilization(
+                _proposed, _machine, _acc, inputs,
+            )
+        except Exception:
+            proposed_util = None
+        if proposed_util is not None and not proposed_util.empty:
+            st.markdown("#### 💡 Current vs proposed (side-by-side)")
+            st.caption(
+                "Left: your **current** weekly pressure. Right: the Sequencer's "
+                "**proposed** level-loaded version. Scroll up to ✅ Accept or 🚫 Discard."
+            )
+
+            def _make_heatmap(df_util, title):
+                fig = px.imshow(
+                    df_util,
+                    text_auto=".0%",
+                    color_continuous_scale=[
+                        (0.00, "#16A34A"),
+                        (0.60, "#A3E635"),
+                        (0.75, "#FACC15"),
+                        (0.90, "#F97316"),
+                        (1.00, "#DC2626"),
+                    ],
+                    zmin=0, zmax=1.5,
+                    aspect="auto",
+                    labels={"x": "Week", "y": "Station", "color": "Util %"},
+                )
+                fig.update_layout(
+                    title=dict(text=title, font=dict(size=14)),
+                    height=min(380, 60 + 26 * max(len(df_util.index), 1)),
+                    margin=dict(l=4, r=4, t=40, b=4),
+                    coloraxis_showscale=False,
+                )
+                return fig
+
+            cL, cR = st.columns(2)
+            with cL:
+                st.plotly_chart(
+                    _make_heatmap(weekly_util, "Current"),
+                    use_container_width=True,
+                )
+            with cR:
+                st.plotly_chart(
+                    _make_heatmap(proposed_util, "Proposed"),
+                    use_container_width=True,
+                )
+            st.markdown("---")
 
     # =============================================================
     # Weekly utilization heatmap — STAGING / Step 1 of the time-dimension
@@ -2462,6 +3141,7 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
         "View",
         [
             "📋 Schedule",
+            "🗓 Sequence",
             "🗂 Machine catalog",
             "🗂 Accessory catalog",
             "🔩 Items",
@@ -2486,6 +3166,9 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
             st.info("No schedule rows. Upload a CSV in the sidebar or switch to manual entry.")
         else:
             st.dataframe(schedule_df, use_container_width=True, height=600)
+
+    elif sub == "🗓 Sequence":
+        _render_sequencer_view(schedule_df)
 
     elif sub == "🗂 Machine catalog":
         tab_floor_verification_machine(machine_df, schedule_df, used_fg)
@@ -4854,6 +5537,17 @@ def main():
                 "Upload a CSV that contains this location, or select a different location. "
                 "You can still use **📁 Data & Setup** to edit catalogs."
             )
+
+    # ----------------------------------------------------------------
+    # Sequencer — Suggest button + accept/discard preview. Renders an
+    # expander near the top of the page when a schedule is loaded. If
+    # the planner has accepted a proposal, the accepted schedule was
+    # already pushed into the upload buffer + a rerun fired, so by the
+    # time we reach here it's the new sequence we're analyzing.
+    # ----------------------------------------------------------------
+    schedule_df = _render_sequencer_controls(
+        schedule_df, machine_df, acc_df, inputs,
+    )
 
     # ----------------------------------------------------------------
     # Time-window filter (Step 1 of the actuals/time-dimension work).

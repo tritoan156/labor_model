@@ -572,6 +572,133 @@ def _suggest_schedule_dates(
     return new_df, overloads
 
 
+def _diagnose_overloads(
+    schedule_df: pd.DataFrame,
+    machine_df,
+    acc_df,
+    inputs: dict,
+    overloads: "list[dict]",
+) -> "list[dict]":
+    """Turn an overload list into actionable diagnoses.
+
+    For each station that's binding (i.e. some unit couldn't fit there at
+    safe capacity), compute:
+      • monthly demand at that station (p-min)
+      • monthly capacity at the current settings (p-min)
+      • shortfall (demand − capacity, p-min)
+      • three concrete fixes:
+          1. HC to add — ``ceil(shortfall / (shift × days × eff × safety))``
+          2. Extra working days needed
+          3. Which heaviest units to defer to free up the shortfall
+
+    Returns a list of dicts (one per binding station), sorted by severity:
+    ``[{station, demand, capacity, shortfall, shortfall_pct,
+        hire_hc, extend_days, defer_units}, …]``.
+
+    Returns ``[]`` when ``overloads`` is empty (sanity guard).
+    """
+    if not overloads or schedule_df is None or schedule_df.empty:
+        return []
+    from core.constants import STATION_KEY_TO_DISPLAY
+
+    crew_config = inputs["crew_config"]
+    shift = float(inputs["shift"])
+    eff = float(inputs["efficiency"])
+    safety = float(inputs["safety"])
+    days = float(inputs["days"])
+
+    # 1) Identify the set of stations called out as binding.
+    binding_stations: set = set()
+    for o in overloads:
+        for s in o.get("stations", []):
+            binding_stations.add(s)
+    if not binding_stations:
+        return []
+
+    # 2) Compute monthly demand + capacity per binding station.
+    diagnoses: list[dict] = []
+    for st_key in binding_stations:
+        # Sum p-min of this station across the whole schedule.
+        demand = 0.0
+        for _, row in schedule_df.iterrows():
+            try:
+                fg = row.get("FG_BASE") or row.get("FG SKU ID")
+                acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or None
+                qty = float(row.get("BUILD QTY", 0) or 0)
+                labor = compute_unit_labor(fg, acc, machine_df, acc_df)
+                if labor is None:
+                    continue
+                demand += float(labor.get(st_key, 0) or 0) * qty
+            except Exception:
+                continue
+        if demand <= 0:
+            continue
+
+        st_disp = STATION_KEY_TO_DISPLAY.get(st_key, st_key)
+        if st_disp not in crew_config.index:
+            continue
+        try:
+            hc = int(crew_config.loc[st_disp, "HC"])
+        except Exception:
+            hc = 0
+
+        capacity = hc * shift * days * eff * safety if hc > 0 else 0.0
+        shortfall = max(demand - capacity, 0.0)
+        if shortfall <= 0:
+            continue  # not actually short at the monthly level
+        shortfall_pct = (demand / capacity - 1.0) if capacity > 0 else float("inf")
+
+        # 3a) HC to add: ceil(shortfall / per-HC monthly cap)
+        per_hc_month = shift * days * eff * safety
+        hire_hc = int((shortfall + per_hc_month - 1) // per_hc_month) if per_hc_month > 0 else 0
+
+        # 3b) Extra working days: ceil(shortfall / per-day cap)
+        per_day_cap = hc * shift * eff * safety if hc > 0 else 0.0
+        extend_days = int((shortfall + per_day_cap - 1) // per_day_cap) if per_day_cap > 0 else 0
+
+        # 3c) Heaviest units to defer: pick FG SKUs by descending labor at
+        # this station × qty, accumulate until shortfall is covered.
+        per_row_labor: list[tuple] = []
+        for idx, row in schedule_df.iterrows():
+            try:
+                fg = row.get("FG_BASE") or row.get("FG SKU ID")
+                acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or None
+                qty = float(row.get("BUILD QTY", 0) or 0)
+                labor = compute_unit_labor(fg, acc, machine_df, acc_df)
+                if labor is None:
+                    continue
+                row_total = float(labor.get(st_key, 0) or 0) * qty
+                if row_total > 0:
+                    per_row_labor.append((row_total, str(fg), int(qty)))
+            except Exception:
+                continue
+        per_row_labor.sort(reverse=True)
+        defer_units: list[dict] = []
+        freed = 0.0
+        for total, fg, qty in per_row_labor:
+            if freed >= shortfall:
+                break
+            defer_units.append({"fg": fg, "qty": qty, "labor_at_station": total})
+            freed += total
+
+        diagnoses.append({
+            "station_key": st_key,
+            "station_display": st_disp,
+            "demand": demand,
+            "capacity": capacity,
+            "shortfall": shortfall,
+            "shortfall_pct": shortfall_pct,
+            "hire_hc": hire_hc,
+            "extend_days": extend_days,
+            "defer_units": defer_units,
+            "freed_by_defer": freed,
+        })
+
+    # Sort severity (largest shortfall first)
+    diagnoses.sort(key=lambda d: d["shortfall"], reverse=True)
+    return diagnoses
+
+
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
     """Schedule loader — accepts an uploaded CSV, a saved-schedule buffer, or
     falls back to the bundled May 2026 sample.
@@ -700,9 +827,72 @@ def _render_sequencer_controls(
                     _ol_summary += f" … (+{len(overloads) - 5} more)"
                 st.warning(
                     f"⚠️ **{len(overloads)} unit(s) couldn't fit without overload:** "
-                    f"{_ol_summary}. Consider adding HC at the named stations, "
-                    "deferring units to next month, or accepting a tighter plan."
+                    f"{_ol_summary}."
                 )
+
+                # Real-talk diagnosis: name the binding station(s),
+                # quantify the gap, propose concrete fixes.
+                diagnoses = _diagnose_overloads(
+                    proposal, machine_df, acc_df, inputs, overloads,
+                )
+                if diagnoses:
+                    st.markdown("##### 🛠 How to fix this")
+                    for d in diagnoses:
+                        with st.container():
+                            st.markdown(
+                                f"**Bottleneck: {d['station_display']}** "
+                                f"— short **{int(d['shortfall']):,} p-min** "
+                                f"({d['shortfall_pct']*100:+.0f}% over capacity)"
+                            )
+                            st.caption(
+                                f"Monthly demand: **{int(d['demand']):,} p-min** "
+                                f"· Capacity at current settings: "
+                                f"**{int(d['capacity']):,} p-min**"
+                            )
+
+                            colA, colB, colC = st.columns(3)
+                            with colA:
+                                st.markdown(
+                                    f"🧑 **Hire** &nbsp; +{d['hire_hc']} HC"
+                                )
+                                st.caption(
+                                    f"at {d['station_display']}. Bring weekly "
+                                    "capacity up by enough to absorb the gap."
+                                )
+                            with colB:
+                                st.markdown(
+                                    f"📅 **Extend** &nbsp; +{d['extend_days']} day(s)"
+                                )
+                                st.caption(
+                                    "Run overtime / Saturdays. Keeps current HC."
+                                )
+                            with colC:
+                                defer_label = "🚚 **Defer** "
+                                if d["defer_units"]:
+                                    deferred_total = sum(u["qty"] for u in d["defer_units"])
+                                    defer_label += f"&nbsp; {deferred_total} unit(s)"
+                                    st.markdown(defer_label)
+                                    _names = ", ".join(
+                                        f"{u['fg']} ×{u['qty']}"
+                                        for u in d["defer_units"][:5]
+                                    )
+                                    if len(d["defer_units"]) > 5:
+                                        _names += f" … (+{len(d['defer_units']) - 5} more)"
+                                    st.caption(
+                                        f"Push heaviest units to next month: "
+                                        f"{_names}. Frees "
+                                        f"~{int(d['freed_by_defer']):,} p-min."
+                                    )
+                                else:
+                                    st.markdown(defer_label + "&nbsp; —")
+                                    st.caption("No clear deferral candidates.")
+                            st.markdown("")  # spacer between stations
+                    st.caption(
+                        "Pick one of the three options above, change the "
+                        "matching sidebar setting (or the schedule), and "
+                        "click **💡 Generate proposal** again. "
+                        "Or hit ✅ Accept to live with the overload."
+                    )
             c1, c2, _ = st.columns([1, 1, 4])
             if c1.button("✅ Accept proposal", use_container_width=True, type="primary"):
                 # Replace the working schedule and clear proposal state.

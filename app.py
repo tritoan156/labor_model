@@ -2148,29 +2148,10 @@ def render_sidebar() -> dict:
             )
         elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
-
-        # Time window — only meaningful when the loaded schedule has a
-        # PRODUCTION DAY column. We always show the selector; if the schedule
-        # has no day data, picking anything other than "Whole month" will
-        # simply yield an empty filter (the existing empty-state banner
-        # already handles that).
-        time_window = st.sidebar.radio(
-            "Time window",
-            ["Whole month", "This week", "Remaining (from today)"],
-            index=0,
-            horizontal=True,
-            help=(
-                "Slice the analysis to a sub-week of the month so the "
-                "recommendations stay relevant as the month progresses. "
-                "Requires a PRODUCTION DAY column in your schedule. "
-                "Reduce 'Working days' below to match if you switch from "
-                "Whole month → This week (typically 5)."
-            ),
-        )
     else:
-        # Manual mode — no PRODUCTION DAY, so the time window is implicitly
-        # "the whole window of however many days the planner specifies".
-        time_window = "Whole month"
+        # Manual mode — auto-spread runs in main() so dates land on the
+        # manual rows automatically; the time-window radio below works
+        # for both modes.
         st.sidebar.caption(
             "Enter FG SKU, Accessory SKU (optional), and Quantity for each row. "
             "Use **Browse catalog** below to pick from the known SKUs."
@@ -2215,6 +2196,23 @@ def render_sidebar() -> dict:
 
         # Persist the latest in-flight edits so the next Add appends on top
         st.session_state[seed_key] = manual_entries
+
+    # Time window — applies to both upload and manual modes. Once the
+    # schedule has PRODUCTION DAY values (either from the CSV or via
+    # auto-spread on manual rows), this filter slices the analysis to
+    # just the current week / the remaining days.
+    time_window = st.sidebar.radio(
+        "Time window",
+        ["Whole month", "This week", "Remaining (from today)"],
+        index=0,
+        horizontal=True,
+        help=(
+            "Slice the analysis to a sub-week of the month so the "
+            "recommendations stay relevant as the month progresses. "
+            "Reduce 'Working days' below to match if you switch from "
+            "Whole month → This week (typically 5)."
+        ),
+    )
 
     st.sidebar.markdown("---")
 
@@ -5723,6 +5721,17 @@ def main():
                 empty_banner_msg = (
                     "✏️ **Manual entry mode** — fill in at least one row (FG SKU + Quantity > 0) in "
                     "the sidebar. You can still use **📁 Data & Setup** to edit catalogs."
+                )
+            else:
+                # Manual rows don't carry a PRODUCTION DAY — run auto-spread
+                # so the Calendar tab, the Sequencer Suggest button, and the
+                # weekly heatmap all light up the same way they do for an
+                # uploaded CSV. PRODUCTION MONTH = "Manual" doesn't match the
+                # target-month regex, so auto-spread falls back to today's
+                # Vegas month — which is exactly what a planner doing a
+                # quick what-if expects to see.
+                _auto_spread_dates(
+                    schedule_df, machine_df, acc_df, inputs["location"],
                 )
     else:
         try:

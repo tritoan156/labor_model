@@ -2354,6 +2354,8 @@ def render_sidebar() -> dict:
 | Get a blank upload template | Sidebar → **📥 Download blank template** (under the file uploader) |
 | Edit labor times | **📁 Data & Setup** tab → Machine / Accessory catalog |
 | Add a missing SKU | **📁 Data & Setup** → catalog → **➕ Add a new SKU** |
+| See what gets built each week / day | **📆 Calendar** tab |
+| Reshape the schedule (move SKUs between dates) | **📁 Data & Setup** → **🗓 Sequence** |
 | See bottlenecks + suggested fixes | **🏠 Overview** → 🎯 Recommended actions, or **🔧 Recommendations** tab |
 
 **Tip:** hover any column header in a table to see its specific tooltip.
@@ -2514,7 +2516,7 @@ The proposal appears as a side-by-side preview heatmap on the Overview (Current 
 Reshape edits live in your browser session only — they don't persist to GitHub unless you save through the existing 📂 Save panel.
 
 ### 📆 Calendar (week & day rollups)
-Sister view to 🗓 Sequence, also in **📁 Data & Setup**. Where 🗓 Sequence is row-level (one row per unit), 📆 Calendar is bucketed: one expandable card per week of the month showing total units, total labor (p-min), and the top FG SKUs. Open a card to see:
+Top-level tab (sits between **🏠 Overview** and **📊 Capacity**). Bucketed view of *what gets built each week and each day* — one expandable card per week of the month showing total units, total labor (p-min), and the top FG SKUs. Open a card to see:
 - **Daily breakdown** — one row per working day in that week: units built, labor p-min.
 - **Per-station labor mix** — horizontal bar chart showing how the week's labor splits across Warehouse / Wire / Battery / … / Ship. Quick read on where the week's heat goes.
 - **SKU detail** — collapsed table with every unit in the week (day, FG, accessory, qty, customer, location).
@@ -3342,7 +3344,6 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
         "View",
         [
             "📋 Schedule",
-            "📆 Calendar",
             "🗓 Sequence",
             "🗂 Machine catalog",
             "🗂 Accessory catalog",
@@ -3368,9 +3369,6 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
             st.info("No schedule rows. Upload a CSV in the sidebar or switch to manual entry.")
         else:
             st.dataframe(schedule_df, use_container_width=True, height=600)
-
-    elif sub == "📆 Calendar":
-        _render_calendar_view(schedule_df, machine_df, acc_df)
 
     elif sub == "🗓 Sequence":
         _render_sequencer_view(schedule_df)
@@ -5913,6 +5911,7 @@ def main():
     # consolidated into the single 📁 Data & Setup tab.
     tabs = st.tabs([
         "🏠 Overview",
+        "📆 Calendar",
         "📊 Capacity",
         "🔧 Recommendations",
         "⏱ Build Time",
@@ -5935,24 +5934,28 @@ def main():
         else:
             tab_overview(units, capacity, batt_type, inputs, schedule_month, weekly_util=weekly_util)
     with tabs[1]:
+        # Calendar — week & day rollups. Helper already handles the empty
+        # case with its own info banner, so we just call it directly.
+        _render_calendar_view(schedule_df, machine_df, acc_df)
+    with tabs[2]:
         if units.empty:
             _empty_state("Capacity")
         else:
             tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type)
-    with tabs[2]:
+    with tabs[3]:
         if units.empty:
             _empty_state("Recommendations")
         else:
             tab_mitigation(capacity, batt_sku, units, inputs)
-    with tabs[3]:
+    with tabs[4]:
         if units.empty:
             _empty_state("Build Time")
         else:
             tab_cycle_time(units, inputs)
-    with tabs[4]:
+    with tabs[5]:
         # Process Flow can show the editable flow even without a schedule
         tab_process_flow(units, machine_df, acc_df, inputs)
-    with tabs[5]:
+    with tabs[6]:
         tab_data_setup(
             machine_df=machine_df, acc_df=acc_df, schedule_df=schedule_df,
             item_master_df=item_master_df, item_packages_df=item_packages_df,

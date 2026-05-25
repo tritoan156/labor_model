@@ -1049,6 +1049,199 @@ def _first_day_of_week(reference, target_week: int):
     return pd.Timestamp(working[0]) if working else pd.Timestamp(ref_dt.date())
 
 
+def _render_calendar_view(schedule_df: pd.DataFrame, machine_df, acc_df) -> None:
+    """📆 Calendar — week & day rollups of the schedule.
+
+    Renders one expandable card per week of the month: total units,
+    total labor, top FG SKUs. Inside each card: a daily breakdown table
+    (units + labor per day) and a per-station labor-mix bar.
+
+    Designed to answer the planner's question *"what's being built each
+    week / day?"* without forcing them to scroll a 156-row table.
+    """
+    from core.constants import STATION_KEY_TO_DISPLAY
+
+    st.subheader("📆 Calendar")
+    if schedule_df is None or schedule_df.empty:
+        st.info(
+            "No schedule loaded yet. Upload a CSV in the sidebar, then come "
+            "back here for the week / day rollup."
+        )
+        return
+
+    if "PRODUCTION DAY" not in schedule_df.columns:
+        st.info(
+            "📅 This view needs `PRODUCTION DAY` data. Your CSV doesn't have "
+            "one, and auto-spread didn't fill it in (uncommon). Add a "
+            "PRODUCTION DAY column to your schedule and re-upload."
+        )
+        return
+
+    # Normalize: real datetime, drop rows the loader couldn't date.
+    work = schedule_df.copy()
+    work["PRODUCTION DAY"] = pd.to_datetime(work["PRODUCTION DAY"], errors="coerce")
+    work = work.dropna(subset=["PRODUCTION DAY"])
+    if work.empty:
+        st.info("No rows have a valid PRODUCTION DAY value.")
+        return
+
+    # Derive WEEK if missing (defensive — load_schedule normally sets it).
+    if "WEEK_OF_MONTH" not in work.columns:
+        work["WEEK_OF_MONTH"] = work["PRODUCTION DAY"].dt.day.apply(
+            lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+        ).astype("Int64")
+
+    # Per-row labor breakdown (station-level p-min × qty). Cache once so
+    # we can sum it both by week and by day cheaply.
+    breakdowns: list[dict] = []
+    totals: list[float] = []
+    for idx in work.index:
+        row = work.loc[idx]
+        fg = row.get("FG_BASE") or row.get("FG SKU ID")
+        acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or None
+        try:
+            qty = float(row.get("BUILD QTY", 0) or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            labor = compute_unit_labor(fg, acc, machine_df, acc_df)
+        except Exception:
+            labor = None
+        if labor is None:
+            br = {s: 0.0 for s in STATION_KEYS}
+            total = max(qty, 1.0) * 100.0  # crude fallback (unknown SKU)
+        else:
+            br = {s: float(labor.get(s, 0) or 0) * qty for s in STATION_KEYS}
+            total = sum(br.values())
+        breakdowns.append(br)
+        totals.append(total)
+    work["_labor"] = totals
+    # Attach per-station columns prefixed with __st_ so we can sum them.
+    for s in STATION_KEYS:
+        work[f"__st_{s}"] = [b.get(s, 0.0) for b in breakdowns]
+
+    # Glance metrics at the top.
+    total_units = int(work["BUILD QTY"].sum())
+    total_labor = float(work["_labor"].sum())
+    n_weeks = int(work["WEEK_OF_MONTH"].nunique())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Units in plan", f"{total_units:,}")
+    c2.metric("Total labor", f"{int(total_labor):,} p-min")
+    c3.metric("Weeks", n_weeks)
+    st.caption(
+        "Each week below is an expander. Open one to see the day-by-day "
+        "breakdown and the per-station labor mix."
+    )
+    st.markdown("---")
+
+    # Iterate weeks in order.
+    weeks = sorted(int(w) for w in work["WEEK_OF_MONTH"].dropna().unique())
+    for week_num in weeks:
+        wk_df = work[work["WEEK_OF_MONTH"] == week_num]
+        if wk_df.empty:
+            continue
+        wk_units = int(wk_df["BUILD QTY"].sum())
+        wk_labor = float(wk_df["_labor"].sum())
+        # Day range — first / last working day actually used
+        days_used = sorted(wk_df["PRODUCTION DAY"].dt.date.unique())
+        date_label = (
+            f"{days_used[0].strftime('%b %d')} – {days_used[-1].strftime('%b %d')}"
+            if len(days_used) > 1 else
+            (days_used[0].strftime("%b %d") if days_used else "—")
+        )
+        # Top 3 FG SKUs by qty
+        top_skus = (
+            wk_df.groupby(wk_df["FG SKU ID"].astype(str))["BUILD QTY"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(3)
+        )
+        top_label = " · ".join(
+            f"{sku} ×{int(q)}" for sku, q in top_skus.items()
+        ) or "—"
+
+        with st.expander(
+            f"📆 **Week {week_num}** ({date_label}) — "
+            f"{wk_units} units · {int(wk_labor):,} p-min  ·  Top: {top_label}",
+            expanded=False,
+        ):
+            # ---- Daily rollup ----
+            st.markdown("**Daily breakdown**")
+            daily = (
+                wk_df.assign(_d=wk_df["PRODUCTION DAY"].dt.date)
+                .groupby("_d")
+                .agg(
+                    units=("BUILD QTY", "sum"),
+                    labor=("_labor", "sum"),
+                )
+                .reset_index()
+                .rename(columns={"_d": "Day"})
+            )
+            daily["Day"] = daily["Day"].apply(
+                lambda d: f"{d.strftime('%a %b %d')}"
+            )
+            daily["units"] = daily["units"].astype(int)
+            daily["labor"] = daily["labor"].round(0).astype(int)
+            daily = daily.rename(columns={
+                "units": "Units",
+                "labor": "Labor (p-min)",
+            })
+            st.dataframe(
+                daily, use_container_width=True, hide_index=True,
+            )
+
+            # ---- Per-station labor mix ----
+            st.markdown("**Per-station labor mix this week**")
+            station_totals = {
+                STATION_KEY_TO_DISPLAY.get(s, s): float(wk_df[f"__st_{s}"].sum())
+                for s in STATION_KEYS
+            }
+            # Drop zero-stations to keep the chart focused.
+            mix_df = pd.DataFrame(
+                [
+                    {"Station": st_disp, "Labor (p-min)": v}
+                    for st_disp, v in station_totals.items()
+                    if v > 0
+                ]
+            ).sort_values("Labor (p-min)", ascending=True)
+            if mix_df.empty:
+                st.caption("_No labor recorded for this week's units._")
+            else:
+                _bar = px.bar(
+                    mix_df, x="Labor (p-min)", y="Station",
+                    orientation="h", text_auto=",.0f",
+                )
+                _bar.update_layout(
+                    height=min(360, 30 * len(mix_df) + 80),
+                    margin=dict(l=4, r=4, t=4, b=4),
+                    yaxis_title=None,
+                )
+                _bar.update_traces(marker_color="#4F46E5")
+                st.plotly_chart(_bar, use_container_width=True)
+
+            # ---- SKU detail table (collapsed) ----
+            with st.expander(f"📋 Units in week {week_num} ({wk_units})", expanded=False):
+                detail = wk_df.copy()
+                detail["Day"] = detail["PRODUCTION DAY"].dt.strftime("%a %b %d")
+                cols = [
+                    c for c in ["Day", "FG SKU ID", "FG ACCRY SKU ID",
+                                "BUILD QTY", "CUSTOMER NAME", "LOCATION"]
+                    if c in detail.columns
+                ]
+                renames = {
+                    "FG SKU ID": "FG SKU",
+                    "FG ACCRY SKU ID": "Accessory",
+                    "BUILD QTY": "Qty",
+                    "CUSTOMER NAME": "Customer",
+                    "LOCATION": "Location",
+                }
+                st.dataframe(
+                    detail[cols].rename(columns=renames),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+
 # =============================================================
 # SKU browser — supports the manual-entry "Browse catalog" panel
 # =============================================================
@@ -2320,6 +2513,14 @@ The proposal appears as a side-by-side preview heatmap on the Overview (Current 
 
 Reshape edits live in your browser session only — they don't persist to GitHub unless you save through the existing 📂 Save panel.
 
+### 📆 Calendar (week & day rollups)
+Sister view to 🗓 Sequence, also in **📁 Data & Setup**. Where 🗓 Sequence is row-level (one row per unit), 📆 Calendar is bucketed: one expandable card per week of the month showing total units, total labor (p-min), and the top FG SKUs. Open a card to see:
+- **Daily breakdown** — one row per working day in that week: units built, labor p-min.
+- **Per-station labor mix** — horizontal bar chart showing how the week's labor splits across Warehouse / Wire / Battery / … / Ship. Quick read on where the week's heat goes.
+- **SKU detail** — collapsed table with every unit in the week (day, FG, accessory, qty, customer, location).
+
+Use Calendar when you want the *what's being built when* answer; use Sequence when you want to *reshape* the dates.
+
 ### Blank template
 The **📥 Download blank template** button under the file uploader hands the planner an empty CSV with the 5 required headers + 2 example rows. Quickest way to ensure formatting is right.
 
@@ -3141,6 +3342,7 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
         "View",
         [
             "📋 Schedule",
+            "📆 Calendar",
             "🗓 Sequence",
             "🗂 Machine catalog",
             "🗂 Accessory catalog",
@@ -3166,6 +3368,9 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
             st.info("No schedule rows. Upload a CSV in the sidebar or switch to manual entry.")
         else:
             st.dataframe(schedule_df, use_container_width=True, height=600)
+
+    elif sub == "📆 Calendar":
+        _render_calendar_view(schedule_df, machine_df, acc_df)
 
     elif sub == "🗓 Sequence":
         _render_sequencer_view(schedule_df)

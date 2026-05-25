@@ -324,18 +324,29 @@ def _auto_spread_dates(df: pd.DataFrame, machine_df, acc_df, location: str) -> p
     if not working:
         return df  # defensive — never happens for real months
 
-    # Seed each day's running load from the rows that ARE already dated.
+    # Map each working day to its week-of-month bucket so we can balance
+    # load at the WEEK level first (so a small schedule doesn't bunch into
+    # the first few days), then break ties at the day level.
+    day_to_week: dict[date, int] = {d: 1 + (d.day - 1) // 7 for d in working}
+    weeks_set = sorted(set(day_to_week.values()))
+
+    # Seed running loads from rows that ARE already dated.
     day_load: dict[date, float] = {d: 0.0 for d in working}
+    week_load: dict[int, float] = {w: 0.0 for w in weeks_set}
     for idx in df.index[~blank_mask]:
         d = day_series.loc[idx].date()
         if d in day_load:
-            day_load[d] += _row_labor_weight(df.loc[idx], machine_df, acc_df)
+            w = _row_labor_weight(df.loc[idx], machine_df, acc_df)
+            day_load[d] += w
+            week_load[day_to_week[d]] = week_load.get(day_to_week[d], 0.0) + w
         # If a pinned date falls outside the target month's working days,
         # we don't add it to any bucket — auto-spread still works, the
         # heatmap just won't show that pin.
 
     # Compute labor weights for the blank rows once, then walk them
-    # largest-first and drop each into the currently-lightest day.
+    # largest-first and drop each into the lightest-loaded (week, day).
+    # The (week_load, day_load) key means a 5-unit plan spreads as
+    # 1-per-week instead of clustering in the first ~5 days.
     blank_idxs = list(df.index[blank_mask])
     weights = {idx: _row_labor_weight(df.loc[idx], machine_df, acc_df)
                for idx in blank_idxs}
@@ -343,9 +354,13 @@ def _auto_spread_dates(df: pd.DataFrame, machine_df, acc_df, location: str) -> p
 
     assigned: dict = {}
     for idx in blank_idxs:
-        d = min(day_load, key=day_load.get)
+        d = min(
+            working,
+            key=lambda x: (week_load[day_to_week[x]], day_load[x]),
+        )
         assigned[idx] = d
         day_load[d] += weights[idx]
+        week_load[day_to_week[d]] += weights[idx]
 
     # Write the new dates back. Preserve the pinned rows untouched.
     new_days = day_series.copy()
@@ -433,9 +448,14 @@ def _suggest_schedule_dates(
     day_to_week = {d: 1 + (d.day - 1) // 7 for d in working}
     weeks = sorted(set(day_to_week.values()))
 
-    # Running per-station-per-week load + total per-day load
+    # Running per-station-per-week load + total per-day load + total
+    # per-week load. The week-level total is what lets us spread a small
+    # plan across all 4-5 weeks instead of clustering everything in the
+    # first few days (LPT minimizes makespan; balancing weeks first then
+    # days within a week gives the level-loaded heatmap planners expect).
     station_load: dict = {(st, w): 0.0 for st in STATION_KEYS for w in weeks}
     day_total_load: dict = {d: 0.0 for d in working}
+    week_total_load: dict = {w: 0.0 for w in weeks}
 
     # Per-row labor breakdown
     def _row_breakdown(row) -> "tuple[dict, float]":
@@ -467,8 +487,15 @@ def _suggest_schedule_dates(
     overloads: list[dict] = []
     assigned: dict = {}
     for idx, breakdown, total in rows:
-        # Walk candidate days from lightest to heaviest
-        candidates = sorted(working, key=lambda d: day_total_load[d])
+        # Walk candidate days lightest-first, where "light" means the
+        # day's *week* has the least load. Within a week, prefer the
+        # lightest day. Without the week-level key, a small plan would
+        # cluster into the first few days because LPT optimizes makespan
+        # per day, not balance per week.
+        candidates = sorted(
+            working,
+            key=lambda d: (week_total_load[day_to_week[d]], day_total_load[d]),
+        )
         placed_day = None
         for cand in candidates:
             w = day_to_week[cand]
@@ -489,8 +516,14 @@ def _suggest_schedule_dates(
                 break
 
         if placed_day is None:
-            # Fall back to the lightest day; record which stations are over.
-            placed_day = min(day_total_load, key=day_total_load.get)
+            # No day satisfies the per-station check. Fall back to the
+            # least-loaded week+day pair and record which stations are
+            # going to be tipped over (same ordering as the constraint
+            # search, so the fallback respects week-balance too).
+            placed_day = min(
+                working,
+                key=lambda d: (week_total_load[day_to_week[d]], day_total_load[d]),
+            )
             w = day_to_week[placed_day]
             offenders = []
             for st_key, cost in breakdown.items():
@@ -516,6 +549,7 @@ def _suggest_schedule_dates(
         assigned[idx] = placed_day
         day_total_load[placed_day] += total
         wk = day_to_week[placed_day]
+        week_total_load[wk] = week_total_load.get(wk, 0.0) + total
         for st_key, cost in breakdown.items():
             station_load[(st_key, wk)] = station_load.get((st_key, wk), 0.0) + cost
 

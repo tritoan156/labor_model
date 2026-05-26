@@ -1,4 +1,4 @@
-"""Labor Capacity Tool (Henderson / Spartanburg / Cypress) — Streamlit web app.
+﻿"""Labor Capacity Tool (Henderson / Spartanburg / Cypress) — Streamlit web app.
 
 Run with:   streamlit run app.py
 
@@ -28,6 +28,7 @@ from core.labor_calculator import (
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
     DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
+    STATION_KEYS, CUSTOMER_SUFFIXES,
     now_local, today_local_str,
 )
 from core.facility_storage import (
@@ -262,6 +263,277 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str) -> None:
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
+
+
+# =============================================================
+# Customer suffix cleanup helpers
+# =============================================================
+
+def _strip_one_sku(sku: str, valid_bases: set) -> "tuple[str, str]":
+    """Return (cleaned_sku, suffix) for a single SKU.
+
+    Strips a customer suffix from `sku` only when the resulting base
+    exists in `valid_bases`. Mirrors `core/data_loader.collapse_customer_suffix`
+    but takes an arbitrary base set so it works for FG *and* accessory
+    catalogs.
+
+    Returns the original SKU + empty suffix if no clean strip is possible.
+    """
+    s = str(sku or "").strip()
+    if not s:
+        return s, ""
+    for sfx in CUSTOMER_SUFFIXES:
+        if s.endswith(sfx):
+            base = s[:-len(sfx)]
+            if base in valid_bases:
+                return base, sfx
+    return s, ""
+
+
+def _find_customer_suffixed_skus(
+    schedule_df: pd.DataFrame, machine_skus: set, acc_skus: set,
+) -> pd.DataFrame:
+    """Detect FG / Accessory SKUs in the loaded schedule whose tail
+    matches a CUSTOMER_SUFFIXES entry.
+
+    Returns a small DataFrame with one row per unique (column, original-
+    SKU) pair. Columns:
+      Original  · Suffix  · Base  · Type (FG / Accessory)  · In catalog  · Rows
+    """
+    if schedule_df is None or schedule_df.empty:
+        return pd.DataFrame()
+
+    fg_col_candidates = ["FG SKU ID", "FG_RAW", "FG_BASE"]
+    acc_col_candidates = ["FG ACCRY SKU ID", "ACC"]
+
+    def _detect(col_candidates, valid_bases, type_label):
+        out = []
+        col = next((c for c in col_candidates if c in schedule_df.columns), None)
+        if col is None:
+            return out
+        for sku, count in schedule_df[col].astype(str).str.strip().value_counts().items():
+            base, sfx = _strip_one_sku(sku, valid_bases)
+            if not sfx:
+                continue  # no suffix detected → skip
+            out.append({
+                "Original": sku,
+                "Suffix": sfx,
+                "Base": base,
+                "Type": type_label,
+                "In catalog": "✓",  # _strip_one_sku only returns sfx when base is in valid_bases
+                "Rows": int(count),
+            })
+        return out
+
+    # Also catch the "suffix present but base NOT in catalog" case so the
+    # planner sees it (and we leave those alone during the strip).
+    def _detect_orphans(col_candidates, valid_bases, type_label):
+        out = []
+        col = next((c for c in col_candidates if c in schedule_df.columns), None)
+        if col is None:
+            return out
+        for sku, count in schedule_df[col].astype(str).str.strip().value_counts().items():
+            s = str(sku).strip()
+            if not s:
+                continue
+            for sfx in CUSTOMER_SUFFIXES:
+                if s.endswith(sfx):
+                    base = s[:-len(sfx)]
+                    if base not in valid_bases:
+                        out.append({
+                            "Original": s,
+                            "Suffix": sfx,
+                            "Base": base,
+                            "Type": type_label,
+                            "In catalog": "✗",
+                            "Rows": int(count),
+                        })
+                    break  # only flag once per SKU
+        return out
+
+    rows = []
+    rows.extend(_detect(fg_col_candidates, machine_skus, "FG"))
+    rows.extend(_detect(acc_col_candidates, acc_skus, "Accessory"))
+    rows.extend(_detect_orphans(fg_col_candidates, machine_skus, "FG"))
+    rows.extend(_detect_orphans(acc_col_candidates, acc_skus, "Accessory"))
+    if not rows:
+        return pd.DataFrame(columns=["Original", "Suffix", "Base", "Type", "In catalog", "Rows"])
+    return pd.DataFrame(rows).sort_values(
+        by=["In catalog", "Type", "Rows"], ascending=[False, True, False],
+    ).reset_index(drop=True)
+
+
+def _strip_customer_suffixes_from_schedule(
+    schedule_df: pd.DataFrame, machine_skus: set, acc_skus: set,
+) -> "tuple[pd.DataFrame, int, int]":
+    """Return a copy of schedule_df with customer suffixes stripped from
+    FG and Accessory SKU columns. Also returns (n_fg_stripped, n_acc_stripped)
+    row counts for the UI.
+
+    Only strips when the base SKU exists in the matching catalog — orphan
+    suffixed SKUs (no catalog base) are left untouched so the analysis
+    doesn't silently lose them.
+    """
+    if schedule_df is None or schedule_df.empty:
+        return schedule_df, 0, 0
+
+    out = schedule_df.copy()
+    n_fg = 0
+    n_acc = 0
+
+    # FG side — there can be several FG-shaped columns; strip whichever exist.
+    for col in ("FG SKU ID", "FG_RAW", "FG_BASE"):
+        if col not in out.columns:
+            continue
+        new_vals = []
+        for v in out[col].astype(str).str.strip():
+            base, sfx = _strip_one_sku(v, machine_skus)
+            if sfx:
+                new_vals.append(base)
+                if col == "FG SKU ID":
+                    n_fg += 1
+            else:
+                new_vals.append(v)
+        out[col] = new_vals
+
+    # Accessory side
+    for col in ("FG ACCRY SKU ID", "ACC"):
+        if col not in out.columns:
+            continue
+        new_vals = []
+        for v in out[col].astype(str).str.strip():
+            base, sfx = _strip_one_sku(v, acc_skus)
+            if sfx:
+                new_vals.append(base)
+                if col == "FG ACCRY SKU ID":
+                    n_acc += 1
+            else:
+                new_vals.append(v)
+        out[col] = new_vals
+
+    return out, n_fg, n_acc
+
+
+def _render_suffix_cleanup_view(
+    schedule_df: pd.DataFrame, machine_df, acc_df,
+) -> None:
+    """🧹 Customer suffix cleanup — sub-section UI.
+
+    Surfaces suffixed FG / Accessory SKUs in the loaded schedule with
+    their detected bases, plus one-click Strip / Download actions. Catalog
+    rows are not touched — this is a *schedule display cleanup*, not a
+    catalog editor.
+    """
+    st.subheader("🧹 Customer suffix cleanup")
+    st.caption(
+        "ERP exports often carry customer-decal suffixes "
+        f"(**{', '.join(CUSTOMER_SUFFIXES)}**) on FG SKUs — e.g. "
+        "`BOSS70-001HRC`, `BOSS25-006ES`. The labor analysis already "
+        "strips these internally, but the suffixed text shows up in the "
+        "Sequence editor, Calendar, and downloaded CSV. This tool lets "
+        "you rewrite the loaded schedule to canonical base SKUs in one "
+        "click. **Catalogs are not modified.**"
+    )
+
+    if schedule_df is None or schedule_df.empty:
+        st.info(
+            "No schedule loaded yet. Upload a CSV in the sidebar, then "
+            "come back here to check for customer suffixes."
+        )
+        return
+
+    # Build lookup sets from the catalogs.
+    machine_skus = set(machine_df["SKU"].astype(str).str.strip()) if (
+        machine_df is not None and "SKU" in machine_df.columns
+    ) else set()
+    acc_skus = set(acc_df["SKU"].astype(str).str.strip()) if (
+        acc_df is not None and "SKU" in acc_df.columns
+    ) else set()
+
+    findings = _find_customer_suffixed_skus(schedule_df, machine_skus, acc_skus)
+    _track_and_flush("suffix_cleanup_view", rows=int(len(findings)))
+
+    if findings.empty:
+        st.success(
+            "✅ **Schedule already uses canonical SKUs.** No customer "
+            "suffixes detected in either the FG or Accessory columns."
+        )
+        return
+
+    # Show the detection panel.
+    st.markdown("**Detected customer-suffixed SKUs:**")
+    st.dataframe(findings, use_container_width=True, hide_index=True)
+
+    in_catalog_count = int((findings["In catalog"] == "✓").sum())
+    orphan_count = int((findings["In catalog"] == "✗").sum())
+    if orphan_count:
+        st.warning(
+            f"⚠️ **{orphan_count} row(s) have a customer suffix but the "
+            "base SKU isn't in the catalog** — those will be left alone "
+            "by the Strip action so the analysis doesn't silently lose "
+            "them. Add the base SKU to the catalog first if you want "
+            "them stripped too."
+        )
+
+    cleaned, n_fg_preview, n_acc_preview = _strip_customer_suffixes_from_schedule(
+        schedule_df, machine_skus, acc_skus,
+    )
+
+    c1, c2 = st.columns(2)
+    if c1.button(
+        f"🔄 Strip suffixes in loaded schedule "
+        f"({n_fg_preview} FG, {n_acc_preview} accessory cells)",
+        use_container_width=True, type="primary",
+        disabled=(in_catalog_count == 0),
+        help=(
+            "Rewrites FG / Accessory SKU columns in your active schedule "
+            "to their canonical base form. Pushes the cleaned schedule "
+            "through the analysis pipeline so every tab refreshes on the "
+            "next rerun. No GitHub commit."
+        ),
+    ):
+        try:
+            csv_text = cleaned.to_csv(index=False)
+            st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
+                csv_text.encode("utf-8")
+            )
+            _track_and_flush(
+                "suffix_cleanup_strip",
+                n_fg=n_fg_preview, n_acc=n_acc_preview,
+            )
+            st.success(
+                f"✅ Stripped suffixes from **{n_fg_preview} FG** + "
+                f"**{n_acc_preview} accessory** cells — refreshing analysis…"
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Strip failed: {e}")
+
+    try:
+        c2.download_button(
+            "📥 Download cleaned schedule",
+            cleaned.to_csv(index=False).encode("utf-8"),
+            file_name=f"schedule_cleaned_{today_local_str()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            on_click=lambda: _track_and_flush(
+                "suffix_cleanup_download",
+                n_fg=n_fg_preview, n_acc=n_acc_preview,
+            ),
+            help=(
+                "Saves the cleaned schedule as a CSV. Re-upload, or save "
+                "via the 📂 Save panel for the team."
+            ),
+        )
+    except Exception:
+        # Defensive — the on_click track-and-flush may have edge cases.
+        c2.download_button(
+            "📥 Download cleaned schedule",
+            cleaned.to_csv(index=False).encode("utf-8"),
+            file_name=f"schedule_cleaned_{today_local_str()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
 
 # =============================================================
@@ -1475,6 +1747,15 @@ The loader auto-matches column names so the team can upload their normal Excel e
 
 If a required column truly isn't there, the planner sees a yellow banner naming the missing column and listing the aliases the loader tried.
 
+### 🧹 Customer suffix cleanup
+Lives under **📁 Data & Setup → 🧹 Customer suffix cleanup**. ERP exports often label SKUs with a customer-decal tail like `BOSS70-001HRC`, `BOSS25-006ES`, `BOSS70-012UR`. The labor analysis already collapses these to their canonical base internally, but the suffixed text shows in the Sequence editor, the Calendar's "Top SKUs" line, and the downloaded / saved CSV.
+
+This sub-section detects every suffixed FG / Accessory SKU in your loaded schedule, lists them with their base (after stripping) and a ✓ / ✗ for whether the base exists in the catalog, and gives you two actions:
+- **🔄 Strip suffixes in loaded schedule** — rewrites your active schedule's SKU columns to the canonical base form. The analysis numbers don't change; only the *displayed* SKUs do. Catalogs are not touched.
+- **📥 Download cleaned schedule** — exports the cleaned CSV without committing the change.
+
+Rows whose base isn't in the catalog (orphan suffixes) are left untouched so analysis doesn't silently lose them.
+
 ### Blank template
 The **📥 Download blank template** button under the file uploader hands the planner an empty CSV with the 5 required headers + 2 example rows. Quickest way to ensure formatting is right.
 
@@ -2142,6 +2423,7 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
         "View",
         [
             "📋 Schedule",
+            "🧹 Customer suffix cleanup",
             "🗂 Machine catalog",
             "🗂 Accessory catalog",
             "🔩 Items",
@@ -2166,6 +2448,11 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
             st.info("No schedule rows. Upload a CSV in the sidebar or switch to manual entry.")
         else:
             st.dataframe(schedule_df, use_container_width=True, height=600)
+
+    elif sub == "🧹 Customer suffix cleanup":
+        # Cleanup operates on the loaded schedule (main has no time-window
+        # split, so schedule_df is already the full month).
+        _render_suffix_cleanup_view(schedule_df, machine_df, acc_df)
 
     elif sub == "🗂 Machine catalog":
         tab_floor_verification_machine(machine_df, schedule_df, used_fg)

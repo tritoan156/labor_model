@@ -4966,6 +4966,80 @@ def _read_fresh_csv(file_path: str, token: str) -> "tuple[pd.DataFrame, str | No
     return df, sha
 
 
+def _import_missing_skus_to_catalog(
+    file_path: str, label: str, skus: "list[str]", token: str,
+) -> "tuple[list[str], list[str]]":
+    """Append placeholder rows for ``skus`` to the catalog CSV on GitHub.
+
+    Each new row has the SKU + today's ``Last Modified`` and **blank** labor
+    cells — the loaders coerce blanks to 0, so the SKU enters the catalog with
+    zero labor that the planner fills in afterwards. This is the "quick import"
+    path: it gets the missing SKU into the system so its units stop being
+    dropped, without forcing the planner to enter labor times up front.
+
+    Reuses the same fresh-fetch + SHA-locked push + one-retry pattern as
+    :func:`_render_add_new_sku`. SKUs already present on the freshly-fetched
+    file (someone else added them) and SKUs that would trigger a spreadsheet
+    formula (leading ``= + - @``) are skipped.
+
+    Returns ``(added, skipped)`` SKU lists. Raises on a hard save failure so
+    the caller can surface the error.
+    """
+    today = today_local_str()
+    added: list[str] = []
+    skipped: list[str] = []
+
+    for attempt in (1, 2):
+        fresh_df, fresh_sha = _read_fresh_csv(file_path, token)
+        if fresh_df.empty or "SKU" not in fresh_df.columns:
+            raise RuntimeError(f"Could not read `{file_path}` from GitHub.")
+
+        if "Last Modified" not in fresh_df.columns:
+            fresh_df["Last Modified"] = ""
+
+        existing = set(fresh_df["SKU"].astype(str).str.strip().str.upper())
+
+        added = []
+        skipped = []
+        new_rows = []
+        for raw in skus:
+            sku = str(raw).strip()
+            if not sku:
+                continue
+            # Formula-injection guard — same rule as the manual add form.
+            if sku[:1] in ("=", "+", "-", "@"):
+                skipped.append(sku)
+                continue
+            if sku.upper() in existing:
+                skipped.append(sku)
+                continue
+            row = {col: "" for col in fresh_df.columns}
+            row["SKU"] = sku
+            row["Last Modified"] = today
+            new_rows.append(row)
+            added.append(sku)
+            existing.add(sku.upper())  # guard against dupes within this batch
+
+        if not new_rows:
+            return added, skipped  # nothing new to write
+
+        merged = pd.concat([fresh_df, pd.DataFrame(new_rows)], ignore_index=True)
+        csv_text = merged.to_csv(index=False)
+        try:
+            save_catalog_to_github(
+                csv_text, file_path, token,
+                message=f"Import {len(added)} missing {label} SKU(s) from schedule via app",
+                sha=fresh_sha,
+            )
+            return added, skipped
+        except GitHubConflict:
+            if attempt == 2:
+                raise
+            continue  # someone committed concurrently — refetch and retry
+
+    return added, skipped
+
+
 def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
     """Cell-level merge: compute the user's diff, fetch the latest file from
     GitHub, apply only those cells on top, and push back. Retries once on a
@@ -6704,8 +6778,86 @@ def main():
             )
         st.warning(
             "⚠️ " + "  \n".join(_bits)
-            + "  \n→ Open **📁 Data & Setup** to add them so they're included in the analysis."
+            + "  \n→ Quick-import them below, or edit catalogs in **📁 Data & Setup**."
         )
+
+        # Quick import — one click adds every missing SKU to the catalogs as a
+        # placeholder (zero labor, today's date) so its units stop being
+        # dropped. The planner fills in real labor times afterwards.
+        _n_missing = len(_skipped_fg) + len(_unknown_acc)
+        # Defensive: st.secrets.get() raises if no secrets.toml exists at all
+        # (e.g. local runs). Streamlit Cloud always has one, but guard anyway.
+        try:
+            _token = st.secrets.get("github_token", None)
+        except Exception:
+            _token = None
+        _ic1, _ic2 = st.columns([2, 3])
+        with _ic1:
+            _do_import = st.button(
+                f"➕ Import {_n_missing} missing SKU(s) into the catalogs",
+                use_container_width=True,
+                type="primary",
+                disabled=not _token,
+                help=(
+                    "Adds each missing FG SKU to the machine catalog and each "
+                    "missing accessory SKU to the accessory catalog as a "
+                    "zero-labor placeholder, committed to GitHub. Fill in the "
+                    "real labor times afterwards in 📁 Data & Setup."
+                ),
+            )
+        if not _token:
+            with _ic2:
+                st.caption(
+                    "🔒 Importing needs the GitHub token "
+                    "(`github_token` in Streamlit Secrets)."
+                )
+        if _do_import:
+            _added_all: list[str] = []
+            _skipped_all: list[str] = []
+            _failed = False
+            try:
+                with st.spinner("Importing missing SKUs into the catalogs…"):
+                    if _skipped_fg:
+                        _a, _s = _import_missing_skus_to_catalog(
+                            "data/machine_clean.csv", "machine", _skipped_fg, _token,
+                        )
+                        _added_all += _a
+                        _skipped_all += _s
+                    if _unknown_acc:
+                        _a, _s = _import_missing_skus_to_catalog(
+                            "data/acc_clean.csv", "accessory", _unknown_acc, _token,
+                        )
+                        _added_all += _a
+                        _skipped_all += _s
+            except Exception as e:
+                _failed = True
+                st.error(f"❌ Import failed: {e}")
+            if not _failed:
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                _track_and_flush(
+                    "missing_sku_import",
+                    n_added=len(_added_all), n_skipped=len(_skipped_all),
+                )
+                if _added_all:
+                    st.success(
+                        f"✅ Imported **{len(_added_all)}** SKU(s) as zero-labor "
+                        "placeholders. They'll appear in the catalogs after the "
+                        "app redeploys (~1 min) — then set their labor times in "
+                        "**📁 Data & Setup**."
+                        + (
+                            f"  \n_Skipped {len(_skipped_all)} already-present / "
+                            "invalid SKU(s)._" if _skipped_all else ""
+                        )
+                    )
+                else:
+                    st.info(
+                        "Nothing imported — every missing SKU was already in the "
+                        "catalog (another user may have just added them). Refresh "
+                        "to see them."
+                    )
 
     # Tabs — 6 top-level tabs, ordered from executive summary → planner detail → admin.
     # Batteries content folded into Capacity. Update Labor + Data Quality + Source Data

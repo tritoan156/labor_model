@@ -1772,7 +1772,12 @@ def _render_calendar_view(
                     yaxis_title=None,
                 )
                 _bar.update_traces(marker_color="#4F46E5")
-                st.plotly_chart(_bar, use_container_width=True)
+                # Unique key per week so Streamlit doesn't collide IDs
+                # when multiple weeks' bars have similar shapes.
+                st.plotly_chart(
+                    _bar, use_container_width=True,
+                    key=f"calendar_week_{week_num}_mix",
+                )
 
             # ---- SKU detail table (collapsed) ----
             with st.expander(f"📋 Units in week {week_num} ({wk_units})", expanded=False):
@@ -3333,11 +3338,13 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
                 st.plotly_chart(
                     _make_heatmap(weekly_util, "Current"),
                     use_container_width=True,
+                    key="overview_heatmap_current",
                 )
             with cR:
                 st.plotly_chart(
                     _make_heatmap(proposed_util, "Proposed"),
                     use_container_width=True,
+                    key="overview_heatmap_proposed",
                 )
             st.markdown("---")
 
@@ -3375,7 +3382,10 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             margin=dict(l=4, r=4, t=8, b=4),
             coloraxis_showscale=False,
         )
-        st.plotly_chart(_hm, use_container_width=True)
+        st.plotly_chart(
+            _hm, use_container_width=True,
+            key="overview_weekly_heatmap_full",
+        )
         st.markdown("---")
 
     # =============================================================

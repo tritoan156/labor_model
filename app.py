@@ -193,17 +193,34 @@ def _track_and_flush(event_type: str, *, force_flush: bool = True, **payload) ->
 
 
 
+def _upload_sig(uploaded_file) -> str:
+    """Stable identity for a Streamlit ``UploadedFile`` so we can tell a
+    genuinely new upload from the same file persisting across reruns.
+
+    Prefers Streamlit's per-upload ``file_id``; falls back to name + size.
+    """
+    if uploaded_file is None:
+        return ""
+    fid = getattr(uploaded_file, "file_id", None)
+    if fid:
+        return str(fid)
+    return f"{getattr(uploaded_file, 'name', '')}:{getattr(uploaded_file, 'size', '')}"
+
+
 def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
     """Schedule loader — accepts an uploaded CSV, a saved-schedule buffer, or
     falls back to the bundled May 2026 sample.
 
-    Resolution order (first non-None wins):
-      1. A ``st.session_state['_loaded_schedule_buffer']`` value — produced by
-         "📂 Load saved schedule" in the sidebar. **One-shot**: the key is
-         cleared after consumption so the next rerun doesn't keep reloading
-         the same saved CSV when the planner just wants a fresh upload.
-      2. ``uploaded_file`` from the ``st.file_uploader`` widget.
-      3. The bundled ``data/may_schedule.csv``.
+    Resolution order:
+      1. A one-shot ``st.session_state['_loaded_schedule_buffer']`` — produced
+         by "📂 Load saved schedule" in the sidebar. Consumed once, then
+         **promoted** to the persistent active schedule (below).
+      2. A genuinely new ``uploaded_file`` from ``st.file_uploader`` (detected
+         via :func:`_upload_sig`). Becomes the persistent active schedule.
+      3. The persistent ``st.session_state['_active_schedule_csv']`` — whatever
+         was loaded last. This is what lets the schedule survive reruns from
+         unrelated widgets (e.g. the efficiency slider) instead of resetting.
+      4. The bundled ``data/may_schedule.csv``.
 
     Passes file-like content as ``io.BytesIO`` so no temp file is written to
     disk — protects against race conditions when multiple users upload
@@ -219,21 +236,64 @@ def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.Dat
     """
     machine_skus = set(_load_machine_df(_csv_mtime("machine_clean.csv"))["SKU"])
 
-    # 1) Saved-schedule replay (one-shot)
+    # Resolution order. NOTE: the previously-loaded schedule must survive
+    # unrelated reruns (e.g. the planner nudging the efficiency slider). We
+    # persist the active schedule's CSV bytes in ``_active_schedule_csv`` so a
+    # rerun re-resolves to the *same* schedule instead of falling back to the
+    # uploader / bundled sample — that fallback was the "save schedule keeps
+    # resetting" bug.
+
+    # 1) One-shot action buffer — a saved-schedule load just happened. Consume
+    #    it and promote it to the persistent active schedule.
     buf = st.session_state.pop("_loaded_schedule_buffer", None)
     if buf is not None:
-        df = load_schedule(buf, location=location, machine_skus=machine_skus)
-        _stash_upload_summary(df, location, source="saved")
+        csv_bytes = buf.getvalue()
+        st.session_state["_active_schedule_csv"] = csv_bytes
+        st.session_state["_active_schedule_source"] = st.session_state.pop(
+            "_loaded_schedule_source", "saved"
+        )
+        # A programmatic load supersedes whatever file is still sitting in the
+        # uploader widget — mark it "seen" so the next rerun doesn't treat it
+        # as a fresh upload and clobber what we just loaded.
+        if uploaded_file is not None:
+            st.session_state["_seen_upload_sig"] = _upload_sig(uploaded_file)
+        df = load_schedule(
+            io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
+        )
+        _stash_upload_summary(df, location, source=st.session_state["_active_schedule_source"])
         return df
 
-    # 2) Live file upload
+    # 2) Live file upload — but only authoritative when it's a *new* file. The
+    #    uploader keeps returning the same object across reruns, so without the
+    #    signature check a stale upload would override a saved schedule the
+    #    planner loaded afterwards.
     if uploaded_file is not None:
-        buf2 = io.BytesIO(uploaded_file.getvalue())
-        df = load_schedule(buf2, location=location, machine_skus=machine_skus)
-        _stash_upload_summary(df, location, source="upload")
+        sig = _upload_sig(uploaded_file)
+        if sig != st.session_state.get("_seen_upload_sig"):
+            st.session_state["_seen_upload_sig"] = sig
+            csv_bytes = uploaded_file.getvalue()
+            st.session_state["_active_schedule_csv"] = csv_bytes
+            st.session_state["_active_schedule_source"] = "upload"
+            df = load_schedule(
+                io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
+            )
+            _stash_upload_summary(df, location, source="upload")
+            return df
+        # Same file as before → fall through to the persisted active schedule.
+
+    # 3) Persisted active schedule — survives reruns from slider/widget changes.
+    active = st.session_state.get("_active_schedule_csv")
+    if active is not None:
+        df = load_schedule(
+            io.BytesIO(active), location=location, machine_skus=machine_skus,
+        )
+        _stash_upload_summary(
+            df, location,
+            source=st.session_state.get("_active_schedule_source", "saved"),
+        )
         return df
 
-    # 3) Bundled sample
+    # 4) Bundled sample
     df = load_schedule(location=location, machine_skus=machine_skus)
     _stash_upload_summary(df, location, source="bundled")
     return df

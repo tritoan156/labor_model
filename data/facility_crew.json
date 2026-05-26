@@ -68,13 +68,13 @@
   },
   "Spartanburg": {
     "Warehouse (Pick)": {
-      "HC": 2,
-      "Conc": 2,
+      "HC": 1,
+      "Conc": 1,
       "Crew": 1
     },
     "Wire Assembly": {
-      "HC": 4,
-      "Conc": 4,
+      "HC": 2,
+      "Conc": 2,
       "Crew": 1
     },
     "Battery Assembly": {
@@ -88,18 +88,18 @@
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 8,
-      "Conc": 8,
+      "HC": 20,
+      "Conc": 20,
       "Crew": 1
     },
     "Com Accessories": {
-      "HC": 0,
-      "Conc": 0,
+      "HC": 7,
+      "Conc": 7,
       "Crew": 1
     },
     "Trailer Assembly": {
-      "HC": 6,
-      "Conc": 3,
+      "HC": 4,
+      "Conc": 4,
       "Crew": 2
     },
     "ETO": {
@@ -108,8 +108,8 @@
       "Crew": 2
     },
     "Accessories KIT": {
-      "HC": 1,
-      "Conc": 1,
+      "HC": 6,
+      "Conc": 6,
       "Crew": 1
     },
     "Final Assembly": {

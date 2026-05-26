@@ -41,7 +41,7 @@ try:
 except Exception:
     pass
 
-from .constants import CUSTOMER_SUFFIXES, BATTERY_COUNT_OVERRIDES
+from .constants import CUSTOMER_SUFFIXES, BATTERY_COUNT_OVERRIDES, week_of_month
 
 __all__ = [
     "load_machine_labor",
@@ -591,7 +591,9 @@ def load_schedule(
     # 9) Parse PRODUCTION DAY → real datetime + derive WEEK_OF_MONTH.
     # The column is OPTIONAL; if it's not in the CSV (or every value is
     # blank) we attach all-NaT and downstream code treats the schedule as
-    # whole-month-only. Week 1 = days 1-7, Week 2 = 8-14, ..., Week 5 = 29-end.
+    # whole-month-only. Weeks are Monday-anchored calendar weeks (see
+    # core.constants.week_of_month) — week 1 is the calendar week containing
+    # the 1st, so the first/last week may be partial.
     if "PRODUCTION DAY" in df.columns:
         parsed_day = pd.to_datetime(
             df["PRODUCTION DAY"].astype("object"),
@@ -600,8 +602,8 @@ def load_schedule(
     else:
         parsed_day = pd.Series([pd.NaT] * len(df), index=df.index)
     df["PRODUCTION DAY"] = parsed_day
-    df["WEEK_OF_MONTH"] = parsed_day.dt.day.apply(
-        lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+    df["WEEK_OF_MONTH"] = parsed_day.apply(
+        lambda d: week_of_month(d) if pd.notna(d) else pd.NA
     ).astype("Int64")
 
     # Apply customer-suffix collapse if we have a catalog

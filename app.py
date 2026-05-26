@@ -33,7 +33,7 @@ from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
     DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
     STATION_KEYS, CUSTOMER_SUFFIXES,
-    now_local, today_local_str,
+    now_local, today_local_str, week_of_month,
 )
 from core.facility_storage import (
     load_facility_crew_df, save_facility_crew_to_github,
@@ -376,7 +376,7 @@ def _auto_spread_dates(
     # Map each working day to its week-of-month bucket so we can balance
     # load at the WEEK level first (so a small schedule doesn't bunch into
     # the first few days), then break ties at the day level.
-    day_to_week: dict[date, int] = {d: 1 + (d.day - 1) // 7 for d in working}
+    day_to_week: dict[date, int] = {d: week_of_month(d) for d in working}
     weeks_set = sorted(set(day_to_week.values()))
 
     # Seed running loads from rows that ARE already dated.
@@ -418,8 +418,8 @@ def _auto_spread_dates(
     df["PRODUCTION DAY"] = new_days
 
     # Recompute WEEK_OF_MONTH from the (now-complete) PRODUCTION DAY.
-    df["WEEK_OF_MONTH"] = new_days.dt.day.apply(
-        lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+    df["WEEK_OF_MONTH"] = new_days.apply(
+        lambda d: week_of_month(d) if pd.notna(d) else pd.NA
     ).astype("Int64")
 
     df.attrs["auto_spread"] = {
@@ -494,7 +494,7 @@ def _suggest_schedule_dates(
         )
 
     # Map each working day → its week
-    day_to_week = {d: 1 + (d.day - 1) // 7 for d in working}
+    day_to_week = {d: week_of_month(d) for d in working}
     weeks = sorted(set(day_to_week.values()))
 
     # Running per-station-per-week load + total per-day load + total
@@ -609,8 +609,8 @@ def _suggest_schedule_dates(
         dtype="datetime64[ns]",
     )
     new_df["PRODUCTION DAY"] = new_days
-    new_df["WEEK_OF_MONTH"] = new_days.dt.day.apply(
-        lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+    new_df["WEEK_OF_MONTH"] = new_days.apply(
+        lambda d: week_of_month(d) if pd.notna(d) else pd.NA
     ).astype("Int64")
     new_df.attrs["suggested"] = {
         "target_month_label": f"{calendar.month_name[month]} {year}",
@@ -748,7 +748,10 @@ def _diagnose_overloads(
     return diagnoses
 
 
-def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.DataFrame:
+def _load_schedule_df(
+    uploaded_file=None, location: str = "HENDERSON",
+    target_month_hint: "tuple[int, int] | None" = None,
+) -> pd.DataFrame:
     """Schedule loader — accepts an uploaded CSV, a saved-schedule buffer, or
     falls back to the bundled May 2026 sample.
 
@@ -784,7 +787,10 @@ def _load_schedule_df(uploaded_file=None, location: str = "HENDERSON") -> pd.Dat
         """Common post-load step: auto-spread blank PRODUCTION DAY rows so
         the weekly heatmap has something to chart, then stash the summary."""
         if df is not None and not df.empty:
-            _auto_spread_dates(df, machine_df_full, acc_df_full, location)
+            _auto_spread_dates(
+                df, machine_df_full, acc_df_full, location,
+                target_month_hint=target_month_hint,
+            )
         _stash_upload_summary(df, location, source=source)
         return df
 
@@ -1158,8 +1164,8 @@ def _merge_sequencer_edits_into_full(
     if "PRODUCTION DAY" in out.columns:
         new_days = pd.to_datetime(out["PRODUCTION DAY"], errors="coerce")
         out["PRODUCTION DAY"] = new_days
-        out["WEEK_OF_MONTH"] = new_days.dt.day.apply(
-            lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
+        out["WEEK_OF_MONTH"] = new_days.apply(
+            lambda d: week_of_month(d) if pd.notna(d) else pd.NA
         ).astype("Int64")
     return out
 
@@ -1316,7 +1322,7 @@ def _first_day_of_week(reference, target_week: int):
     working = _working_days_in_month(year, month)
     # Pick the first working day whose week-of-month matches.
     for d in working:
-        if 1 + (d.day - 1) // 7 == int(target_week):
+        if week_of_month(d) == int(target_week):
             return pd.Timestamp(d)
     # Fallback — first working day of the month
     return pd.Timestamp(working[0]) if working else pd.Timestamp(ref_dt.date())
@@ -1592,12 +1598,20 @@ def _render_suffix_cleanup_view(
 def _render_calendar_view(
     schedule_df: pd.DataFrame, machine_df, acc_df,
     time_window: str = "Whole month",
+    plan_month: "tuple[int, int] | None" = None,
+    plan_month_label: str = "",
 ) -> None:
     """📆 Calendar — week & day rollups of the schedule.
 
-    Renders one expandable card per week of the month: total units,
-    total labor, top FG SKUs. Inside each card: a daily breakdown table
-    (units + labor per day) and a per-station labor-mix bar.
+    Renders one expandable card per **Monday–Friday week** of the selected
+    Plan month: total units, total labor, top FG SKUs. Inside each card: a
+    daily breakdown table (units + labor per day) and a per-station labor-mix
+    bar.
+
+    Weeks are real calendar weeks (Monday-anchored) of the Plan month chosen
+    in the sidebar — the first / last week may be partial. Only rows dated
+    inside the Plan month appear here; rows in other months are flagged by a
+    top-of-page warning in main().
 
     Designed to answer the planner's question *"what's being built each
     week / day?"* without forcing them to scroll a 156-row table.
@@ -1609,7 +1623,8 @@ def _render_calendar_view(
     """
     from core.constants import STATION_KEY_TO_DISPLAY
 
-    st.subheader("📆 Calendar")
+    _heading = f"📆 Calendar — {plan_month_label}" if plan_month_label else "📆 Calendar"
+    st.subheader(_heading)
     if schedule_df is None or schedule_df.empty:
         st.info(
             "No schedule loaded yet. Upload a CSV in the sidebar, then come "
@@ -1640,11 +1655,39 @@ def _render_calendar_view(
         st.info("No rows have a valid PRODUCTION DAY value.")
         return
 
-    # Derive WEEK if missing (defensive — load_schedule normally sets it).
-    if "WEEK_OF_MONTH" not in work.columns:
-        work["WEEK_OF_MONTH"] = work["PRODUCTION DAY"].dt.day.apply(
-            lambda d: 1 + (int(d) - 1) // 7 if pd.notna(d) else pd.NA
-        ).astype("Int64")
+    # Restrict to the selected Plan month — the picker is authoritative, so the
+    # Calendar only divides / shows that month. (Out-of-month rows get a
+    # top-of-page warning in main(); they're intentionally not shown here.)
+    if plan_month is not None:
+        _py, _pm = plan_month
+        work = work[
+            (work["PRODUCTION DAY"].dt.year == _py)
+            & (work["PRODUCTION DAY"].dt.month == _pm)
+        ].copy()
+        if work.empty:
+            st.info(
+                f"No units are dated in **{plan_month_label}**. Either pick a "
+                "different **Plan month** in the sidebar, or add dates in that "
+                "month to your schedule."
+            )
+            return
+
+    # Recompute WEEK_OF_MONTH on the filtered frame so it matches the
+    # Monday-anchored scheme used for the week cards below.
+    work["WEEK_OF_MONTH"] = work["PRODUCTION DAY"].apply(
+        lambda d: week_of_month(d) if pd.notna(d) else pd.NA
+    ).astype("Int64")
+
+    # Map each Monday-anchored week of the Plan month → its Mon–Fri working
+    # days (clamped to the month) so every card shows a real calendar span,
+    # e.g. "Jun 1 – Jun 5", even for partial first / last weeks.
+    _ym = plan_month if plan_month is not None else (
+        int(work["PRODUCTION DAY"].dt.year.mode()[0]),
+        int(work["PRODUCTION DAY"].dt.month.mode()[0]),
+    )
+    _week_days: dict[int, list] = {}
+    for _d in _working_days_in_month(_ym[0], _ym[1]):
+        _week_days.setdefault(week_of_month(_d), []).append(_d)
 
     # Per-row labor breakdown (station-level p-min × qty). Cache once so
     # we can sum it both by week and by day cheaply.
@@ -1697,12 +1740,18 @@ def _render_calendar_view(
             continue
         wk_units = int(wk_df["BUILD QTY"].sum())
         wk_labor = float(wk_df["_labor"].sum())
-        # Day range — first / last working day actually used
-        days_used = sorted(wk_df["PRODUCTION DAY"].dt.date.unique())
+        # Day range — the week's Monday–Friday span in the month (clamped),
+        # so the label reads as a real calendar week regardless of which days
+        # actually have units. Falls back to the days used if the week isn't
+        # in the month map (defensive).
+        _wk_span = _week_days.get(week_num) or sorted(
+            wk_df["PRODUCTION DAY"].dt.date.unique()
+        )
         date_label = (
-            f"{days_used[0].strftime('%b %d')} – {days_used[-1].strftime('%b %d')}"
-            if len(days_used) > 1 else
-            (days_used[0].strftime("%b %d") if days_used else "—")
+            f"{_wk_span[0].strftime('%b')} {_wk_span[0].day} – "
+            f"{_wk_span[-1].strftime('%b')} {_wk_span[-1].day}"
+            if len(_wk_span) > 1 else
+            (f"{_wk_span[0].strftime('%b')} {_wk_span[0].day}" if _wk_span else "—")
         )
         # Top 3 FG SKUs by qty
         top_skus = (
@@ -1733,7 +1782,7 @@ def _render_calendar_view(
                 .rename(columns={"_d": "Day"})
             )
             daily["Day"] = daily["Day"].apply(
-                lambda d: f"{d.strftime('%a %b %d')}"
+                lambda d: f"{d.strftime('%a %b')} {d.day}"
             )
             daily["units"] = daily["units"].astype(int)
             daily["labor"] = daily["labor"].round(0).astype(int)
@@ -1782,7 +1831,9 @@ def _render_calendar_view(
             # ---- SKU detail table (collapsed) ----
             with st.expander(f"📋 Units in week {week_num} ({wk_units})", expanded=False):
                 detail = wk_df.copy()
-                detail["Day"] = detail["PRODUCTION DAY"].dt.strftime("%a %b %d")
+                detail["Day"] = detail["PRODUCTION DAY"].apply(
+                    lambda d: f"{d.strftime('%a %b')} {d.day}"
+                )
                 cols = [
                     c for c in ["Day", "FG SKU ID", "FG ACCRY SKU ID",
                                 "BUILD QTY", "CUSTOMER NAME", "LOCATION"]
@@ -2761,6 +2812,42 @@ def render_sidebar() -> dict:
         # Persist the latest in-flight edits so the next Add appends on top
         st.session_state[seed_key] = manual_entries
 
+    # Plan month — the authoritative month for the whole tool. It drives:
+    #   • where auto-spread drops undated rows (target month),
+    #   • how the 📆 Calendar divides the month into Monday–Friday weeks,
+    #   • the month label shown on the Overview + Calendar.
+    # Rows whose PRODUCTION DAY falls in a different month still keep their
+    # dates, but the page warns the planner they fall outside this month.
+    _now = now_local()
+    # Rolling window: 2 months back → 12 months forward, current month first.
+    _month_opts: list[tuple[int, int]] = []
+    for _delta in range(-2, 13):
+        _m = _now.month - 1 + _delta
+        _y = _now.year + _m // 12
+        _month_opts.append((_y, _m % 12 + 1))
+    _month_labels = {
+        (y, m): f"{calendar.month_name[m]} {y}" for (y, m) in _month_opts
+    }
+    _default_idx = _month_opts.index((_now.year, _now.month))
+    plan_month = st.sidebar.selectbox(
+        "Plan month",
+        _month_opts,
+        index=_default_idx,
+        format_func=lambda ym: _month_labels[ym],
+        key="plan_month_select",
+        help=(
+            "The month this plan is for. Sets how the Calendar splits weeks "
+            "(Monday–Friday) and where undated rows get auto-scheduled. "
+            "Change this to plan a different month — e.g. pick *June 2026*."
+        ),
+    )
+    plan_month_label = _month_labels[plan_month]
+    _plan_working_days = _working_days_in_month(plan_month[0], plan_month[1])
+    st.sidebar.caption(
+        f"📅 **{plan_month_label}** — {len(_plan_working_days)} working days "
+        "(Mon–Fri)."
+    )
+
     # Time window — applies to both upload and manual modes. Once the
     # schedule has PRODUCTION DAY values (either from the CSV or via
     # auto-spread on manual rows), this filter slices the analysis to
@@ -3123,6 +3210,8 @@ Every catalog / scenario / schedule / flow save triggers a Streamlit Cloud rebui
         "shift": shift,
         "crew_config": edited,
         "time_window": time_window,
+        "plan_month": plan_month,
+        "plan_month_label": plan_month_label,
     }
 
 
@@ -6320,23 +6409,25 @@ def main():
                 # Manual rows don't carry a PRODUCTION DAY — run auto-spread
                 # so the Calendar tab, the Sequencer Suggest button, and the
                 # weekly heatmap all light up the same way they do for an
-                # uploaded CSV. PRODUCTION MONTH = "Manual" doesn't match
-                # the target-month regex, so we try to extract a (year,
-                # month) from the most-recently-loaded scenario name (e.g.
-                # "Hen 2026 June" → June 2026). Falls back to today's Vegas
-                # month if no scenario was loaded or the name doesn't
-                # mention a month.
-                _last_scen = st.session_state.get(
-                    f"_last_loaded_scenario_name_{inputs['location']}", ""
-                )
-                _hint = _parse_month_from_name(_last_scen)
+                # uploaded CSV. The sidebar "Plan month" picker is the
+                # authoritative target month; fall back to a scenario-name
+                # guess only if the picker is somehow missing.
+                _hint = inputs.get("plan_month")
+                if _hint is None:
+                    _last_scen = st.session_state.get(
+                        f"_last_loaded_scenario_name_{inputs['location']}", ""
+                    )
+                    _hint = _parse_month_from_name(_last_scen)
                 _auto_spread_dates(
                     schedule_df, machine_df, acc_df, inputs["location"],
                     target_month_hint=_hint,
                 )
     else:
         try:
-            schedule_df = _load_schedule_df(inputs["uploaded"], location=inputs["location"])
+            schedule_df = _load_schedule_df(
+                inputs["uploaded"], location=inputs["location"],
+                target_month_hint=inputs.get("plan_month"),
+            )
         except ScheduleColumnError as e:
             # Planner-friendly message with no internals leaked.
             empty_banner_msg = (
@@ -6394,7 +6485,7 @@ def main():
                     "the schedule's month for the filter to work)."
                 )
             else:
-                current_week = 1 + (_today_date.day - 1) // 7
+                current_week = week_of_month(_today_date)
                 schedule_df = schedule_df[
                     schedule_df["WEEK_OF_MONTH"] == current_week
                 ].copy()
@@ -6517,6 +6608,29 @@ def main():
             "and re-upload."
         )
 
+    # Out-of-month warning — the Plan month picker is authoritative, so any
+    # rows dated in a different month won't appear on the Calendar for the
+    # selected month. Surface the count (we don't silently move their dates).
+    _plan_ym = inputs.get("plan_month")
+    if (
+        _plan_ym is not None
+        and not schedule_df_full.empty
+        and "PRODUCTION DAY" in schedule_df_full.columns
+    ):
+        _pday = pd.to_datetime(schedule_df_full["PRODUCTION DAY"], errors="coerce")
+        _out_mask = _pday.notna() & (
+            (_pday.dt.year != _plan_ym[0]) | (_pday.dt.month != _plan_ym[1])
+        )
+        _n_out = int(_out_mask.sum())
+        if _n_out:
+            st.warning(
+                f"📆 **{_n_out} row(s) are dated outside "
+                f"{inputs.get('plan_month_label', 'the selected month')}** and "
+                "won't appear on the Calendar for this month. Switch the "
+                "**Plan month** in the sidebar to match your data, or re-date "
+                "those rows in **📁 Data & Setup → 🗓 Sequence**."
+            )
+
     _skipped_fg: list = []
     _unknown_acc: list = []
     if not units.empty and hasattr(units, "attrs"):
@@ -6578,6 +6692,8 @@ def main():
         _render_calendar_view(
             schedule_df_full, machine_df, acc_df,
             time_window=inputs.get("time_window", "Whole month"),
+            plan_month=inputs.get("plan_month"),
+            plan_month_label=inputs.get("plan_month_label", ""),
         )
     with tabs[2]:
         if units.empty:

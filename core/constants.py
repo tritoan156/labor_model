@@ -3,7 +3,7 @@
 All business rules from the v17 model. Edit here, not in the UI.
 """
 
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 # ---------------------------------------------------------------------------
 # Time helpers — Las Vegas / Pacific time
@@ -46,6 +46,25 @@ def today_local_str() -> str:
     catalog row.
     """
     return now_local().strftime("%Y-%m-%d")
+
+
+def week_of_month(d) -> int:
+    """1-based, Monday-anchored week index within ``d``'s own month.
+
+    Weeks start Monday; week 1 is the calendar week that contains the 1st
+    of the month, so the first and last weeks may be partial (Mon–Fri
+    aligned on the shop floor). Accepts a ``date``, ``datetime``, or
+    pandas ``Timestamp``.
+
+    Examples (June 2026, the 1st is a Monday):
+        Jun 1–5 → 1, Jun 8–12 → 2, … Jun 29–30 → 5.
+    (May 2026, the 1st is a Friday): May 1 → 1, May 4–8 → 2, …
+    """
+    d = date(d.year, d.month, d.day)
+    first = d.replace(day=1)
+    first_monday = first - timedelta(days=first.weekday())
+    d_monday = d - timedelta(days=d.weekday())
+    return (d_monday - first_monday).days // 7 + 1
 
 
 # === Locations ===

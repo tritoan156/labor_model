@@ -67,6 +67,23 @@ def week_of_month(d) -> int:
     return (d_monday - first_monday).days // 7 + 1
 
 
+def week_of_month_series(s):
+    """Apply :func:`week_of_month` over a datetime-like pandas Series and
+    return a nullable ``Int64`` array (``pd.NA`` for NaT rows).
+
+    Built as an explicit list → ``pd.array(dtype="Int64")`` rather than
+    ``Series.apply(...).astype("Int64")``: applying a scalar function over a
+    *datetime64* Series can make pandas retain the datetime dtype, which then
+    fails to cast to Int64. Constructing the array directly avoids that.
+    """
+    import pandas as pd  # local import keeps this module import-light
+
+    return pd.array(
+        [week_of_month(d) if pd.notna(d) else pd.NA for d in s],
+        dtype="Int64",
+    )
+
+
 # === Locations ===
 LOCATIONS = ["Henderson", "Spartanburg", "Cypress"]
 

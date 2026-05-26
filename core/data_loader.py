@@ -41,7 +41,7 @@ try:
 except Exception:
     pass
 
-from .constants import CUSTOMER_SUFFIXES, BATTERY_COUNT_OVERRIDES, week_of_month
+from .constants import CUSTOMER_SUFFIXES, BATTERY_COUNT_OVERRIDES, week_of_month_series
 
 __all__ = [
     "load_machine_labor",
@@ -602,9 +602,7 @@ def load_schedule(
     else:
         parsed_day = pd.Series([pd.NaT] * len(df), index=df.index)
     df["PRODUCTION DAY"] = parsed_day
-    df["WEEK_OF_MONTH"] = parsed_day.apply(
-        lambda d: week_of_month(d) if pd.notna(d) else pd.NA
-    ).astype("Int64")
+    df["WEEK_OF_MONTH"] = week_of_month_series(parsed_day)
 
     # Apply customer-suffix collapse if we have a catalog
     if machine_skus is not None:

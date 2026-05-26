@@ -33,7 +33,7 @@ from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
     DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
     STATION_KEYS, CUSTOMER_SUFFIXES,
-    now_local, today_local_str, week_of_month,
+    now_local, today_local_str, week_of_month, week_of_month_series,
 )
 from core.facility_storage import (
     load_facility_crew_df, save_facility_crew_to_github,
@@ -418,9 +418,7 @@ def _auto_spread_dates(
     df["PRODUCTION DAY"] = new_days
 
     # Recompute WEEK_OF_MONTH from the (now-complete) PRODUCTION DAY.
-    df["WEEK_OF_MONTH"] = new_days.apply(
-        lambda d: week_of_month(d) if pd.notna(d) else pd.NA
-    ).astype("Int64")
+    df["WEEK_OF_MONTH"] = week_of_month_series(new_days)
 
     df.attrs["auto_spread"] = {
         "count": int(blank_mask.sum()),
@@ -609,9 +607,7 @@ def _suggest_schedule_dates(
         dtype="datetime64[ns]",
     )
     new_df["PRODUCTION DAY"] = new_days
-    new_df["WEEK_OF_MONTH"] = new_days.apply(
-        lambda d: week_of_month(d) if pd.notna(d) else pd.NA
-    ).astype("Int64")
+    new_df["WEEK_OF_MONTH"] = week_of_month_series(new_days)
     new_df.attrs["suggested"] = {
         "target_month_label": f"{calendar.month_name[month]} {year}",
         "working_days": len(working),
@@ -1164,9 +1160,7 @@ def _merge_sequencer_edits_into_full(
     if "PRODUCTION DAY" in out.columns:
         new_days = pd.to_datetime(out["PRODUCTION DAY"], errors="coerce")
         out["PRODUCTION DAY"] = new_days
-        out["WEEK_OF_MONTH"] = new_days.apply(
-            lambda d: week_of_month(d) if pd.notna(d) else pd.NA
-        ).astype("Int64")
+        out["WEEK_OF_MONTH"] = week_of_month_series(new_days)
     return out
 
 
@@ -1674,9 +1668,7 @@ def _render_calendar_view(
 
     # Recompute WEEK_OF_MONTH on the filtered frame so it matches the
     # Monday-anchored scheme used for the week cards below.
-    work["WEEK_OF_MONTH"] = work["PRODUCTION DAY"].apply(
-        lambda d: week_of_month(d) if pd.notna(d) else pd.NA
-    ).astype("Int64")
+    work["WEEK_OF_MONTH"] = week_of_month_series(work["PRODUCTION DAY"])
 
     # Map each Monday-anchored week of the Plan month → its Mon–Fri working
     # days (clamped to the month) so every card shows a real calendar span,

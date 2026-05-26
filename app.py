@@ -269,7 +269,49 @@ def _row_labor_weight(row: pd.Series, machine_df, acc_df) -> float:
         return max(qty, 1.0) * 100.0
 
 
-def _auto_spread_dates(df: pd.DataFrame, machine_df, acc_df, location: str) -> pd.DataFrame:
+_MONTH_FROM_NAME = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+
+def _parse_month_from_name(label: str) -> "tuple[int, int] | None":
+    """Try to extract a (year, month) from a free-form name like
+    "Hen 2026 June" or "May-26 plan". Returns None if no month token
+    can be found.
+    """
+    if not label:
+        return None
+    text = str(label).lower()
+    # Find month token
+    month = None
+    for token, m in _MONTH_FROM_NAME.items():
+        # Whole-word match so "marble" doesn't match "mar"
+        if re.search(rf"\b{token}\b", text):
+            month = m
+            break
+    if month is None:
+        return None
+    # Find year token — 4-digit first, then 2-digit (assume 20xx)
+    year = None
+    y4 = re.search(r"\b(20\d{2})\b", text)
+    if y4:
+        year = int(y4.group(1))
+    else:
+        y2 = re.search(r"\b(\d{2})\b", text)
+        if y2:
+            year = 2000 + int(y2.group(1))
+    if year is None:
+        year = now_local().year
+    return (year, month)
+
+
+def _auto_spread_dates(
+    df: pd.DataFrame, machine_df, acc_df, location: str,
+    target_month_hint: "tuple[int, int] | None" = None,
+) -> pd.DataFrame:
     """Fill blank PRODUCTION DAY cells with auto-leveled dates.
 
     Uses the **Longest Processing Time** heuristic for the parallel-
@@ -280,6 +322,13 @@ def _auto_spread_dates(df: pd.DataFrame, machine_df, acc_df, location: str) -> p
     Mixed-mode aware: rows that already have a valid PRODUCTION DAY are
     preserved, and their labor weight seeds that day's running total so
     the blank rows are level-loaded **on top** of the existing pinned plan.
+
+    Target-month resolution order:
+      1. ``target_month_hint`` (callers in manual mode pass this from a
+         scenario name like "Hen 2026 June" → (2026, 6)).
+      2. First non-null ``PRODUCTION MONTH`` value parseable by
+         ``_parse_target_month`` (e.g. "May-26" or "26-Apr").
+      3. Fallback: today's month in Las Vegas time.
 
     Side effects:
       • Sets ``df["PRODUCTION DAY"]`` for previously-blank rows to a real
@@ -307,10 +356,10 @@ def _auto_spread_dates(df: pd.DataFrame, machine_df, acc_df, location: str) -> p
     if not blank_mask.any():
         return df  # nothing to do — every row is already dated
 
-    # Detect the target (year, month). Prefer the first non-null
-    # PRODUCTION MONTH; fall back to today's month in Vegas time.
-    target = None
-    if "PRODUCTION MONTH" in df.columns:
+    # Detect the target (year, month). Hint wins → schedule's PRODUCTION
+    # MONTH → today's month as fallback.
+    target = target_month_hint
+    if target is None and "PRODUCTION MONTH" in df.columns:
         for v in df["PRODUCTION MONTH"].dropna():
             target = _parse_target_month(v)
             if target:
@@ -1273,7 +1322,10 @@ def _first_day_of_week(reference, target_week: int):
     return pd.Timestamp(working[0]) if working else pd.Timestamp(ref_dt.date())
 
 
-def _render_calendar_view(schedule_df: pd.DataFrame, machine_df, acc_df) -> None:
+def _render_calendar_view(
+    schedule_df: pd.DataFrame, machine_df, acc_df,
+    time_window: str = "Whole month",
+) -> None:
     """📆 Calendar — week & day rollups of the schedule.
 
     Renders one expandable card per week of the month: total units,
@@ -1282,6 +1334,11 @@ def _render_calendar_view(schedule_df: pd.DataFrame, machine_df, acc_df) -> None
 
     Designed to answer the planner's question *"what's being built each
     week / day?"* without forcing them to scroll a 156-row table.
+
+    Calendar **always** shows the entire month — even when the sidebar's
+    Time window is set to "This week" or "Remaining (from today)" (which
+    filter the *analysis* tabs). A small note is shown when the planner is
+    in a filtered window so they understand the relationship.
     """
     from core.constants import STATION_KEY_TO_DISPLAY
 
@@ -1292,6 +1349,13 @@ def _render_calendar_view(schedule_df: pd.DataFrame, machine_df, acc_df) -> None
             "back here for the week / day rollup."
         )
         return
+
+    if time_window != "Whole month":
+        st.caption(
+            f"ℹ️ Showing the **full month** below. Your sidebar Time window "
+            f"is set to **{time_window}** — that filter only affects the "
+            "analysis tabs (Overview / Capacity / etc.), not this Calendar view."
+        )
 
     if "PRODUCTION DAY" not in schedule_df.columns:
         st.info(
@@ -1639,6 +1703,10 @@ def _scenario_load(location: str, name: str, seed_key: str, rev_key: str) -> Non
     seed["Qty"] = pd.to_numeric(seed["Qty"], errors="coerce").fillna(0).astype(int)
     st.session_state[seed_key] = seed
     st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
+    # Stash the scenario name so manual-mode auto-spread can parse a
+    # target month from it (e.g. "Hen 2026 June" → June 2026 instead of
+    # defaulting to today's month).
+    st.session_state[f"_last_loaded_scenario_name_{location}"] = name
     # Don't force-flush here — load is a read; let buffer accumulate.
     track_event("scenario_load", facility=location, name=name)
     st.success(f"Loaded scenario **{name}** — {len(seed)} row(s).")
@@ -3542,7 +3610,10 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     )
 
 
-def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_packages_df, units=None):
+def tab_data_setup(
+    machine_df, acc_df, schedule_df, item_master_df, item_packages_df,
+    units=None, schedule_df_full=None,
+):
     """Consolidated data + admin tab.
 
     Replaces three previous top-level tabs (Update Labor, Data Quality, Source
@@ -3593,7 +3664,12 @@ def tab_data_setup(machine_df, acc_df, schedule_df, item_master_df, item_package
             st.dataframe(schedule_df, use_container_width=True, height=600)
 
     elif sub == "🗓 Sequence":
-        _render_sequencer_view(schedule_df)
+        # Sequence reshape needs the FULL schedule (not the time-window
+        # subset) so the planner can move units across all weeks of the
+        # month, not just the currently-filtered slice.
+        _render_sequencer_view(
+            schedule_df_full if schedule_df_full is not None else schedule_df,
+        )
 
     elif sub == "🗂 Machine catalog":
         tab_floor_verification_machine(machine_df, schedule_df, used_fg)
@@ -5950,12 +6026,19 @@ def main():
                 # Manual rows don't carry a PRODUCTION DAY — run auto-spread
                 # so the Calendar tab, the Sequencer Suggest button, and the
                 # weekly heatmap all light up the same way they do for an
-                # uploaded CSV. PRODUCTION MONTH = "Manual" doesn't match the
-                # target-month regex, so auto-spread falls back to today's
-                # Vegas month — which is exactly what a planner doing a
-                # quick what-if expects to see.
+                # uploaded CSV. PRODUCTION MONTH = "Manual" doesn't match
+                # the target-month regex, so we try to extract a (year,
+                # month) from the most-recently-loaded scenario name (e.g.
+                # "Hen 2026 June" → June 2026). Falls back to today's Vegas
+                # month if no scenario was loaded or the name doesn't
+                # mention a month.
+                _last_scen = st.session_state.get(
+                    f"_last_loaded_scenario_name_{inputs['location']}", ""
+                )
+                _hint = _parse_month_from_name(_last_scen)
                 _auto_spread_dates(
                     schedule_df, machine_df, acc_df, inputs["location"],
+                    target_month_hint=_hint,
                 )
     else:
         try:
@@ -5995,29 +6078,56 @@ def main():
     schedule_df_full = schedule_df.copy() if not schedule_df.empty else schedule_df
     if not schedule_df.empty and "PRODUCTION DAY" in schedule_df.columns:
         window = inputs.get("time_window", "Whole month")
+        # Detect the schedule's actual month so "This week" / "Remaining"
+        # only fire when today is inside that month. Otherwise the filter
+        # would compare today's calendar week (May wk 4) against a future
+        # schedule's week numbers (June rows in week 4) — silently wrong.
+        _now = now_local()
+        _today_date = _now.date()
+        _today_ts = pd.Timestamp(_today_date)
+        _sched_months = set(
+            schedule_df["PRODUCTION DAY"].dropna().dt.to_period("M").astype(str)
+        ) if "PRODUCTION DAY" in schedule_df.columns else set()
+        _today_period = f"{_now.year}-{_now.month:02d}"
+        _today_in_schedule_month = _today_period in _sched_months
+
         if window == "This week":
-            current_week = 1 + (now_local().day - 1) // 7
-            schedule_df = schedule_df[
-                schedule_df["WEEK_OF_MONTH"] == current_week
-            ].copy()
-            if schedule_df.empty and not empty_banner_msg:
+            if not _today_in_schedule_month:
                 empty_banner_msg = (
-                    f"📅 **No units scheduled for week {current_week}** "
-                    f"in {inputs['location']}'s plan. Switch the **Time window** "
-                    "selector in the sidebar back to *Whole month* to see the full plan."
+                    "📅 **\"This week\" was ignored** — today isn't inside "
+                    "this schedule's month. Switch the **Time window** "
+                    "selector back to *Whole month* (or pick a date inside "
+                    "the schedule's month for the filter to work)."
                 )
+            else:
+                current_week = 1 + (_today_date.day - 1) // 7
+                schedule_df = schedule_df[
+                    schedule_df["WEEK_OF_MONTH"] == current_week
+                ].copy()
+                if schedule_df.empty and not empty_banner_msg:
+                    empty_banner_msg = (
+                        f"📅 **No units scheduled for week {current_week}** "
+                        f"in {inputs['location']}'s plan. Switch the **Time window** "
+                        "selector in the sidebar back to *Whole month* to see the full plan."
+                    )
         elif window == "Remaining (from today)":
-            today_ts = pd.Timestamp(now_local().date())
             schedule_df = schedule_df[
                 schedule_df["PRODUCTION DAY"].notna()
-                & (schedule_df["PRODUCTION DAY"] >= today_ts)
+                & (schedule_df["PRODUCTION DAY"] >= _today_ts)
             ].copy()
             if schedule_df.empty and not empty_banner_msg:
-                empty_banner_msg = (
-                    "📅 **No remaining units scheduled from today onward.** "
-                    "Switch the **Time window** selector to *Whole month* "
-                    "to see the full plan."
-                )
+                if not _today_in_schedule_month and _sched_months:
+                    empty_banner_msg = (
+                        "📅 **No remaining units from today onward.** "
+                        "This schedule is for a different month than today — "
+                        "switch back to *Whole month* to see it."
+                    )
+                else:
+                    empty_banner_msg = (
+                        "📅 **No remaining units scheduled from today onward.** "
+                        "Switch the **Time window** selector to *Whole month* "
+                        "to see the full plan."
+                    )
 
     # ----------------------------------------------------------------
     # Compute analysis frames. Empty-safe: when there are no units, we
@@ -6167,9 +6277,14 @@ def main():
         else:
             tab_overview(units, capacity, batt_type, inputs, schedule_month, weekly_util=weekly_util)
     with tabs[1]:
-        # Calendar — week & day rollups. Helper already handles the empty
-        # case with its own info banner, so we just call it directly.
-        _render_calendar_view(schedule_df, machine_df, acc_df)
+        # Calendar — week & day rollups. ALWAYS use the full (unfiltered)
+        # schedule here so the planner sees the entire month's per-week
+        # rollup regardless of the sidebar Time-window setting. The helper
+        # also handles the empty case with its own info banner.
+        _render_calendar_view(
+            schedule_df_full, machine_df, acc_df,
+            time_window=inputs.get("time_window", "Whole month"),
+        )
     with tabs[2]:
         if units.empty:
             _empty_state("Capacity")
@@ -6192,7 +6307,7 @@ def main():
         tab_data_setup(
             machine_df=machine_df, acc_df=acc_df, schedule_df=schedule_df,
             item_master_df=item_master_df, item_packages_df=item_packages_df,
-            units=units,
+            units=units, schedule_df_full=schedule_df_full,
         )
 
     # --- Footer ---------------------------------------------------------

@@ -6,7 +6,7 @@
       "Crew": 1
     },
     "Wire Assembly": {
-      "HC": 4,
+      "HC": 3,
       "Conc": 4,
       "Crew": 1
     },
@@ -31,7 +31,7 @@
       "Crew": 1
     },
     "Trailer Assembly": {
-      "HC": 6,
+      "HC": 5,
       "Conc": 12,
       "Crew": 2
     },

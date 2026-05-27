@@ -167,12 +167,12 @@
     "Trailer Assembly": {
       "HC": 2,
       "Conc": 3,
-      "Crew": 2
+      "Crew": 1
     },
     "ETO": {
       "HC": 0,
       "Conc": 2,
-      "Crew": 2
+      "Crew": 1
     },
     "Accessories KIT": {
       "HC": 0,
@@ -182,7 +182,7 @@
     "Final Assembly": {
       "HC": 1,
       "Conc": 2,
-      "Crew": 2
+      "Crew": 1
     },
     "PDI": {
       "HC": 0,

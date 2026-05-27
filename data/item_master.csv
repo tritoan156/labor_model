@@ -45,3 +45,4 @@ LF,Low Fuel Light,SDG25,,0.0,180.0,0.0,
 TB,600V Transformer Box,,,0.0,0.0,0.0,Default. Family-specific rows below override.
 TB,600V Transformer Box,SDG13,,0.0,120.0,0.0,
 HFF,Heated Fuel Filter,,,0.0,0.0,0.0,Used in cold-weather packages; needs verified time
+TELTU700,None,None,None,None,None,None,None

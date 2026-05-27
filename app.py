@@ -4154,7 +4154,11 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
     ).reset_index(drop=True)
 
     col_cfg = {
-        "SKU": st.column_config.TextColumn("SKU", disabled=True),
+        "SKU": st.column_config.TextColumn(
+            "SKU", width="medium",
+            help=("Editable — rename to fix a typo. ⚠️ Schedule rows using the "
+                  "OLD SKU won't auto-update; re-point or re-upload them."),
+        ),
         "Description": st.column_config.TextColumn(
             "Description", width="large",
             help="Editable — change the text and click 💾 Save.",
@@ -4176,14 +4180,18 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
         column_config=col_cfg, hide_index=True,
     )
 
-    _render_pending_changes(edited, machine_df, editable_cols, text_cols=["Description"])
+    edited_cells, renames = _detect_sku_renames(display_df, edited)
+    if renames:
+        st.caption("🔁 Pending SKU rename(s): "
+                   + ", ".join(f"`{o}` → `{n}`" for o, n in renames))
+    _render_pending_changes(edited_cells, machine_df, editable_cols, text_cols=["Description"])
 
     if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
         _save_catalog_csv(
-            edited=edited, source_df=machine_df,
+            edited=edited_cells, source_df=machine_df,
             editable_cols=editable_cols,
             file_path="data/machine_clean.csv", label="machine",
-            text_cols=["Description"],
+            text_cols=["Description"], renames=renames,
         )
 
     _render_add_new_sku(
@@ -4245,7 +4253,11 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     display_df["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
 
     col_cfg = {
-        "SKU": st.column_config.TextColumn("SKU", disabled=True),
+        "SKU": st.column_config.TextColumn(
+            "SKU", width="medium",
+            help=("Editable — rename to fix a typo. ⚠️ Schedule rows using the "
+                  "OLD SKU won't auto-update; re-point or re-upload them."),
+        ),
         "Description": st.column_config.TextColumn(
             "Description", width="large",
             help="Editable — change the text and click 💾 Save.",
@@ -4279,14 +4291,18 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
         "`Bat` is the exact count from the machine catalog (max within the family)."
     )
 
-    _render_pending_changes(edited, acc_df, editable_cols, text_cols=["Description"])
+    edited_cells, renames = _detect_sku_renames(display_df, edited)
+    if renames:
+        st.caption("🔁 Pending SKU rename(s): "
+                   + ", ".join(f"`{o}` → `{n}`" for o, n in renames))
+    _render_pending_changes(edited_cells, acc_df, editable_cols, text_cols=["Description"])
 
     if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
         _save_catalog_csv(
-            edited=edited, source_df=acc_df,
+            edited=edited_cells, source_df=acc_df,
             editable_cols=editable_cols,
             file_path="data/acc_clean.csv", label="accessory",
-            text_cols=["Description"],
+            text_cols=["Description"], renames=renames,
         )
 
     _render_add_new_sku(
@@ -4894,6 +4910,31 @@ def _render_stale_data_banner(file_path: str) -> None:
                 st.rerun()
 
 
+def _detect_sku_renames(display_df, edited, key_col="SKU"):
+    """Positionally compare the SKU column of the rendered ``display_df`` against
+    the editor's ``edited`` output (same row order — the editors use
+    ``num_rows="fixed"``) to find inline SKU renames.
+
+    Returns ``(edited_cells, renames)`` where:
+      • ``renames`` is a list of ``(old_sku, new_sku)`` for rows whose SKU
+        changed (new value non-blank), and
+      • ``edited_cells`` is a copy of ``edited`` with the SKU column reset to the
+        original values — so the cell/text diff (keyed by the *old* SKU) still
+        detects labor/description edits made on a row that's also being renamed.
+    """
+    if edited is None or key_col not in edited.columns or key_col not in display_df.columns:
+        return edited, []
+    orig = display_df[key_col].astype(str).str.strip().tolist()
+    new = edited[key_col].astype(str).str.strip().tolist()
+    if len(orig) != len(new):
+        # Shapes diverged unexpectedly — skip rename detection, diff as-is.
+        return edited, []
+    renames = [(o, n) for o, n in zip(orig, new) if o != n and n]
+    edited_cells = edited.copy()
+    edited_cells[key_col] = orig
+    return edited_cells, renames
+
+
 def _compute_cell_diffs(edited, source_df, editable_cols, text_cols=None):
     """Return a list of (sku, col, new_value) tuples for cells the user changed.
 
@@ -4949,11 +4990,19 @@ def _compute_cell_diffs(edited, source_df, editable_cols, text_cols=None):
     return diffs
 
 
-def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols):
-    """Apply the cell-level diffs on top of `fresh_df` (from GitHub) and return CSV text.
+def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols, renames=None):
+    """Apply the cell-level diffs (and optional SKU renames) on top of
+    `fresh_df` (from GitHub) and return CSV text.
 
-    Stamps Last Modified for any row that had a change.
+    `diffs` are keyed by the row's *current* (old) SKU. `renames` is a list of
+    ``(old_sku, new_sku)`` applied AFTER the cell diffs — so cell edits made on
+    a row that's also being renamed still land correctly (they're matched by
+    the old SKU first, then the SKU is changed). Stamps Last Modified for any
+    row that changed.
+
+    Returns ``(csv_text, n_cell_rows_changed, n_renamed)``.
     """
+    renames = renames or []
     today = today_local_str()
     if "Last Modified" not in fresh_df.columns:
         fresh_df["Last Modified"] = ""
@@ -4983,8 +5032,20 @@ def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols):
             idx = fresh_df.index[mask][0]
             fresh_df.at[idx, "Last Modified"] = today
 
+    # Apply SKU renames last, matching on the (old) normalized SKU.
+    n_renamed = 0
+    for old_sku, new_sku in renames:
+        mask = fresh_df["__sku_norm"] == str(old_sku).strip()
+        if not mask.any():
+            continue
+        idx = fresh_df.index[mask][0]
+        fresh_df.at[idx, "SKU"] = new_sku
+        fresh_df.at[idx, "Last Modified"] = today
+        fresh_df.at[idx, "__sku_norm"] = str(new_sku).strip()
+        n_renamed += 1
+
     fresh_df = fresh_df.drop(columns=["__sku_norm"])
-    return fresh_df.to_csv(index=False), len(changed_skus)
+    return fresh_df.to_csv(index=False), len(changed_skus), n_renamed
 
 
 def _read_fresh_csv(file_path: str, token: str) -> "tuple[pd.DataFrame, str | None]":
@@ -5075,41 +5136,92 @@ def _import_missing_skus_to_catalog(
     return added, skipped
 
 
-def _save_catalog_csv(edited, source_df, editable_cols, file_path, label, text_cols=None):
+def _validate_renames(renames, fresh_df):
+    """Validate ``(old, new)`` SKU renames against the freshly-fetched catalog.
+
+    Returns ``(clean_renames, error_message)``. ``error_message`` is None when
+    everything is valid. Rules: new SKU non-empty, not a spreadsheet-formula
+    prefix, unique within the batch, and not colliding with a *different*
+    existing SKU.
+    """
+    fresh_upper = set(fresh_df["SKU"].astype(str).str.strip().str.upper()) \
+        if "SKU" in fresh_df.columns else set()
+    clean = []
+    seen_new = set()
+    for old, new in renames:
+        old = str(old).strip()
+        new = str(new).strip()
+        if not old or old == new:
+            continue
+        if not new:
+            return None, f"`{old}` → (blank): a SKU can't be renamed to an empty value."
+        if new[:1] in ("=", "+", "-", "@"):
+            return None, (
+                f"`{new}` can't start with `=`, `+`, `-`, or `@` "
+                "(those trigger formula execution in Excel)."
+            )
+        if new.upper() in seen_new:
+            return None, f"Two rows are being renamed to the same SKU `{new}`."
+        # Collision with a different existing SKU (one not being renamed away).
+        others = fresh_upper - {old.upper()}
+        if new.upper() in others:
+            return None, (
+                f"`{new}` already exists in the catalog — pick a unique SKU "
+                "or edit that row instead."
+            )
+        seen_new.add(new.upper())
+        clean.append((old, new))
+    return clean, None
+
+
+def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
+                      text_cols=None, renames=None):
     """Cell-level merge: compute the user's diff, fetch the latest file from
-    GitHub, apply only those cells on top, and push back. Retries once on a
-    409 SHA conflict (the narrow race window where someone else committed
-    between our fetch and our PUT).
+    GitHub, apply only those cells (and any SKU renames) on top, and push back.
+    Retries once on a 409 SHA conflict (the narrow race window where someone
+    else committed between our fetch and our PUT).
 
     `text_cols` (e.g. ``["Description"]``) lets free-text columns be edited and
-    saved alongside the numeric labor columns.
+    saved alongside the numeric labor columns. `renames` is a list of
+    ``(old_sku, new_sku)`` for inline SKU renames.
     """
+    renames = [r for r in (renames or []) if str(r[0]).strip() != str(r[1]).strip()]
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
 
     diffs = _compute_cell_diffs(edited, source_df, editable_cols, text_cols=text_cols)
-    if not diffs:
+    if not diffs and not renames:
         st.info("No changes detected.")
         return
 
     n_diffs = len(diffs)
-    commit_message = f"Update {label} catalog via app ({n_diffs} cells)"
+    n_ren = len(renames)
+    _parts = []
+    if n_diffs:
+        _parts.append(f"{n_diffs} cells")
+    if n_ren:
+        _parts.append(f"{n_ren} SKU rename(s)")
+    commit_message = f"Update {label} catalog via app ({', '.join(_parts)})"
 
     response = None
     for attempt in (1, 2):
         try:
             with st.spinner(
-                f"Saving {label} catalog to GitHub "
-                f"({n_diffs} cell change(s){' — retrying' if attempt == 2 else ''})..."
+                f"Saving {label} catalog to GitHub"
+                f"{' — retrying' if attempt == 2 else ''}..."
             ):
                 fresh_df, fresh_sha = _read_fresh_csv(file_path, token)
                 if fresh_df.empty:
                     st.error("Could not fetch the current catalog from GitHub.")
                     return
-                csv_text, changed_skus_count = _apply_diffs_and_serialize(
-                    fresh_df, diffs, editable_cols,
+                clean_renames, rename_err = _validate_renames(renames, fresh_df)
+                if rename_err:
+                    st.error(f"❌ SKU rename rejected: {rename_err}")
+                    return
+                csv_text, changed_skus_count, n_renamed = _apply_diffs_and_serialize(
+                    fresh_df, diffs, editable_cols, renames=clean_renames,
                 )
                 response = save_catalog_to_github(
                     csv_text, file_path, token,
@@ -5141,12 +5253,27 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label, text_c
     except Exception:
         pass
 
-    _track_and_flush("catalog_save", file=file_path, label=label, cells=n_diffs)
+    _track_and_flush(
+        "catalog_save", file=file_path, label=label, cells=n_diffs, renames=n_ren,
+    )
 
+    _saved_bits = []
+    if n_diffs:
+        _saved_bits.append(f"{n_diffs} cell change(s)")
+    if n_ren:
+        _saved_bits.append(f"{n_ren} SKU rename(s)")
     st.success(
-        f"✅ Saved {n_diffs} cell change(s) to `{file_path}` "
+        f"✅ Saved {' + '.join(_saved_bits)} to `{file_path}` "
         + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
     )
+    if n_ren:
+        _ren_list = ", ".join(f"`{o}` → `{n}`" for o, n in renames[:8])
+        st.warning(
+            f"🔁 **Renamed: {_ren_list}.** Heads up — schedule rows and saved "
+            "schedules that still reference the **old** SKU won't auto-update; "
+            "they'll show as *missing SKU* until you re-point or re-upload them. "
+            "(Catalog-only change.)"
+        )
     st.info(
         "⏳ **Streamlit Cloud is now redeploying** with the new values "
         "(~1–2 minutes). The Refresh banner at the top of this tab will let "

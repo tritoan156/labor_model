@@ -797,6 +797,13 @@ def _load_schedule_df(
     machine_df_full = _load_machine_df(_csv_mtime("machine_clean.csv"))
     acc_df_full = _load_acc_df(_csv_mtime("acc_clean.csv"))
 
+    # The Plan-month picker is authoritative — show it on the confirmation pill
+    # (and use it for auto-spread) rather than the CSV's own PRODUCTION MONTH.
+    _plan_label = ""
+    if target_month_hint:
+        _py, _pm = target_month_hint
+        _plan_label = f"{calendar.month_name[_pm]} {_py}"
+
     def _finalize(df: pd.DataFrame, source: str) -> pd.DataFrame:
         """Common post-load step: auto-spread blank PRODUCTION DAY rows so
         the weekly heatmap has something to chart, then stash the summary."""
@@ -805,7 +812,7 @@ def _load_schedule_df(
                 df, machine_df_full, acc_df_full, location,
                 target_month_hint=target_month_hint,
             )
-        _stash_upload_summary(df, location, source=source)
+        _stash_upload_summary(df, location, source=source, plan_month_label=_plan_label)
         return df
 
     # Resolution order. NOTE: the previously-loaded schedule must survive
@@ -865,11 +872,17 @@ def _load_schedule_df(
     return _finalize(df, "bundled")
 
 
-def _stash_upload_summary(df: pd.DataFrame, location: str, source: str) -> None:
+def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
+                          plan_month_label: str = "") -> None:
     """Save a one-line description of the just-loaded schedule into session
     state so the sidebar can echo it back to the planner as a green
     confirmation pill. No-op when the DataFrame is empty (caller already
-    surfaces an empty-state banner)."""
+    surfaces an empty-state banner).
+
+    ``plan_month_label`` is the authoritative Plan-month chosen in the sidebar
+    (e.g. "June 2026"). When set it's what the pill shows, since that month
+    drives the Calendar + auto-spread — even if the CSV's own PRODUCTION MONTH
+    column says something else (which we keep as ``csv_month`` for context)."""
     try:
         if df is None or df.empty:
             st.session_state.pop("_last_upload_summary", None)
@@ -878,13 +891,14 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str) -> None:
             df.loc[~df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
             if "CARRYOVER" in df.columns else []
         )
-        month_label = months[0] if months else (
+        csv_month = months[0] if months else (
             df["PRODUCTION MONTH"].iloc[0] if "PRODUCTION MONTH" in df.columns else ""
         )
         st.session_state["_last_upload_summary"] = {
             "rows": int(len(df)),
             "location": str(location),
-            "month": str(month_label or "—"),
+            "month": str(plan_month_label or csv_month or "—"),
+            "csv_month": str(csv_month or ""),
             "source": source,
             "auto_spread": (df.attrs.get("auto_spread")
                             if hasattr(df, "attrs") else None),
@@ -2799,15 +2813,24 @@ def render_sidebar() -> dict:
             _auto = _summary.get("auto_spread")
             _auto_suffix = ""
             if isinstance(_auto, dict) and _auto.get("count"):
+                _auto_month = _auto.get("target_month_label", "")
+                _across = f"across **{_auto_month}** " if _auto_month else ""
                 _auto_suffix = (
                     f"  \n📅 _Auto-leveled {_auto['count']} of "
-                    f"{_auto['total_rows']} rows across "
-                    f"{_auto['working_days']} working days._"
+                    f"{_auto['total_rows']} undated rows {_across}"
+                    f"({_auto['working_days']} working days)._"
                 )
+            # Note the CSV's own month when it differs from the Plan month, so
+            # the planner understands why (e.g. a May export planned for June).
+            _csv_month = _summary.get("csv_month", "")
+            _shown_month = _summary.get("month", "—")
+            _csv_note = ""
+            if _csv_month and _csv_month not in ("—", _shown_month):
+                _csv_note = f" _(CSV says {_csv_month})_"
             st.sidebar.success(
                 f"✅ Loaded **{_summary.get('rows', '?')}** rows from "
                 f"**{_summary.get('location', '?')}** "
-                f"· month **{_summary.get('month', '—')}** "
+                f"· month **{_shown_month}**{_csv_note} "
                 f"({_src_label})"
                 + _auto_suffix
             )

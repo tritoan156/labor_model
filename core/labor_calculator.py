@@ -119,6 +119,77 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     }
 
 
+def unit_labor_split(fg_base: str, acc_sku: str | None,
+                     machine_df: pd.DataFrame, acc_df: pd.DataFrame) -> dict | None:
+    """Split one unit's per-unit labor by source: the machine (FG) catalog vs
+    the accessory catalog. Returns ``{"machine": float, "acc": float}`` whose
+    sum equals the total from :func:`compute_unit_labor`. Returns None if the
+    FG isn't in the machine catalog.
+
+    Attribution mirrors ``compute_unit_labor``:
+      • Machine side — Warehouse(FG), Wire, Trailer, PDI, QC, Ship, Final
+        assembly, ETO, and battery labor when it comes from the machine
+        defaults (accessory supplied none).
+      • Accessory side — Warehouse(acc), PM/Gen/Com accessories, Accessory KIT,
+        and battery labor when the accessory row supplies it
+        (BattSubRaw / Nameplate Prep).
+    """
+    if fg_base not in machine_df.index:
+        return None
+    m = machine_df.loc[fg_base]
+    a = acc_df.loc[acc_sku] if (acc_sku and acc_sku in acc_df.index) else None
+
+    cls = classify_unit(fg_base)
+    is_boss = str(fg_base).upper().startswith("BOSS")
+    bat_in_catalog = int(m["Bat"]) if m["Bat"] else 0
+    bat = bat_in_catalog if is_boss else 0
+
+    def _acc(col: str) -> float:
+        if a is None:
+            return 0.0
+        try:
+            v = a[col]
+        except KeyError:
+            return 0.0
+        try:
+            return float(v) if pd.notna(v) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _m(col: str) -> float:
+        try:
+            return float(m[col]) if pd.notna(m[col]) else 0.0
+        except (TypeError, ValueError, KeyError):
+            return 0.0
+
+    btr = _acc("BattSubRaw")
+    nameplate = _acc("Nameplate Prep")
+    if not is_boss:
+        batt_total, batt_from_acc = 0.0, False
+    elif a is not None and (btr > 0 or nameplate > 0):
+        batt_total, batt_from_acc = btr * bat + nameplate, True
+    elif bat > 0:
+        batt_total, batt_from_acc = DEFAULT_BATT_RAW * bat + DEFAULT_NAMEPLATE_PREP, False
+    else:
+        batt_total, batt_from_acc = 0.0, False
+
+    fg_upper = str(fg_base).upper()
+    eto = ETO_LABOR_PER_UNIT if ("BOSS220" in fg_upper or "BOSS400" in fg_upper) else 0
+
+    machine = (
+        _m("Warehouse") + _m("Wire") + _m("Trailer")
+        + _m("PDI") + _m("QC") + _m("Ship")
+        + FINAL_LABOR[cls] + eto
+        + (0.0 if batt_from_acc else batt_total)
+    )
+    acc = (
+        _acc("Warehouse") + _acc("PMAcc") + _acc("GenAcc") + _acc("ComAcc")
+        + _acc("AccKIT")
+        + (batt_total if batt_from_acc else 0.0)
+    )
+    return {"machine": machine, "acc": acc}
+
+
 # ---------------------------------------------------------------
 # Schedule aggregates
 # ---------------------------------------------------------------

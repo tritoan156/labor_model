@@ -27,7 +27,7 @@ from core.data_loader import (
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
-    compute_unit_labor,
+    compute_unit_labor, unit_labor_split,
 )
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
@@ -5283,7 +5283,7 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         st.rerun()
 
 
-def tab_cycle_time(units, inputs):
+def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
     from core.constants import STATION_KEY_TO_DISPLAY, STATION_KEYS, HS_FINAL_CREW
 
     st.header("⏱ Build Time per Unit")
@@ -5293,6 +5293,8 @@ def tab_cycle_time(units, inputs):
         "Real production runs in parallel across stations, so the actual elapsed time is much shorter. "
         "Use lead time to compare units to each other, not to predict ship dates.\n\n"
         "• **Total Labor** — sum of person-minutes across every station the unit touches.  \n"
+        "• **Machine / Accessory Labor** — that total split by source: the FG (machine) "
+        "catalog vs the accessory catalog. They add up to Total Labor.  \n"
         "• **Lead Time (days)** — wall-clock days if **one person** built the whole unit "
         f"alone = `Total Labor ÷ ({inputs['shift']} min × efficiency)`.  \n"
         "• **Sum of Cycles** — wall-clock minutes if every station was done sequentially "
@@ -5332,6 +5334,14 @@ def tab_cycle_time(units, inputs):
         # Lead time (days) — assumes 1 person, shift × efficiency productive minutes/day
         lead_days = total_labor / (shift * efficiency) if shift > 0 else 0
 
+        # Split the total by source (FG/machine catalog vs accessory catalog).
+        machine_lbr = acc_lbr = None
+        if machine_df is not None and acc_df is not None:
+            split = unit_labor_split(fg, acc or None, machine_df, acc_df)
+            if split is not None:
+                machine_lbr = int(round(split["machine"]))
+                acc_lbr = int(round(split["acc"]))
+
         summary_rows.append({
             "FG SKU": fg,
             "ACC SKU": acc or "—",
@@ -5339,6 +5349,8 @@ def tab_cycle_time(units, inputs):
             "Bat": int(bat),
             "Qty in schedule": len(grp),
             "Total Labor (p-min)": int(total_labor),
+            "Machine Labor (p-min)": machine_lbr if machine_lbr is not None else int(total_labor),
+            "Acc Labor (p-min)": acc_lbr if acc_lbr is not None else 0,
             "Lead Time (days)": round(lead_days, 2),
             "Sum of Cycles (min)": round(sum_cycles, 1),
             "Longest Station": longest_st or "—",
@@ -5376,7 +5388,19 @@ def tab_cycle_time(units, inputs):
         column_config={
             "Total Labor (p-min)": st.column_config.NumberColumn(
                 "Total Labor (p-min)",
-                help="Person-minutes summed across all stations.",
+                help="Person-minutes summed across all stations (Machine + Accessory).",
+                format="%d",
+            ),
+            "Machine Labor (p-min)": st.column_config.NumberColumn(
+                "Machine Labor (p-min)",
+                help="Labor from the FG (machine) catalog: Warehouse, Wire, Trailer, "
+                     "Final, PDI, QC, Ship, ETO, and machine-default battery labor.",
+                format="%d",
+            ),
+            "Acc Labor (p-min)": st.column_config.NumberColumn(
+                "Acc Labor (p-min)",
+                help="Labor from the accessory catalog: Accessory KIT, PM/Gen/Com "
+                     "accessories, accessory Warehouse, and accessory-supplied battery labor.",
                 format="%d",
             ),
             "Lead Time (days)": st.column_config.NumberColumn(
@@ -7076,7 +7100,7 @@ def main():
         if units.empty:
             _empty_state("Build Time")
         else:
-            tab_cycle_time(units, inputs)
+            tab_cycle_time(units, inputs, machine_df, acc_df)
     with tabs[5]:
         # Process Flow can show the editable flow even without a schedule
         tab_process_flow(units, machine_df, acc_df, inputs)

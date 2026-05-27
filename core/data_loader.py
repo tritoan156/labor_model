@@ -363,7 +363,15 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     btr_col  = _find(df.columns, "SUB-BTR raw", "SUB-BTR)", "Battery Sub raw", "BattSubRaw", "SubRaw")
     pm_col   = _find(df.columns, "SUB-PM", "PMAcc", "PM Acc", "PM ")
     gen_col  = _find(df.columns, "SUB-GEN", "Gen Sub", "GenAcc", "Gen Acc")
-    com_col  = _find(df.columns, "SUB-COM", "Compressor", "ComAcc")
+    # Prefer an exact "ComAcc" column when present. The catalog editor save AND
+    # the reconciliation Apply both write the Compressor-side aggregate to a
+    # column named "ComAcc". A leftover legacy "Compressor" column must NOT
+    # shadow it — _find() scans columns in file order, so a "Compressor" that
+    # sits before "ComAcc" used to win, which meant saved Compressor-side
+    # values silently never took effect on reload.
+    com_col  = "ComAcc" if "ComAcc" in df.columns else _find(
+        df.columns, "SUB-COM", "Compressor", "ComAcc",
+    )
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]

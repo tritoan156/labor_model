@@ -453,9 +453,13 @@ def _suggest_schedule_dates(
 
     new_df = schedule_df.copy()
 
-    # ---- Target month detection (same as _auto_spread_dates) ------------
-    target = None
-    if "PRODUCTION MONTH" in new_df.columns:
+    # ---- Target month detection ----------------------------------------
+    # The sidebar "Plan month" picker is authoritative (same as auto-spread),
+    # so the suggestion level-loads across the month the planner chose — not
+    # whatever the CSV's PRODUCTION MONTH happens to say. Fall back to the
+    # CSV month, then today, only if no plan month is set.
+    target = inputs.get("plan_month") if isinstance(inputs, dict) else None
+    if target is None and "PRODUCTION MONTH" in new_df.columns:
         for v in new_df["PRODUCTION MONTH"].dropna():
             target = _parse_target_month(v)
             if target:

@@ -4155,7 +4155,10 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
 
     col_cfg = {
         "SKU": st.column_config.TextColumn("SKU", disabled=True),
-        "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+        "Description": st.column_config.TextColumn(
+            "Description", width="large",
+            help="Editable — change the text and click 💾 Save.",
+        ),
         "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
         "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
         "Last Modified": st.column_config.TextColumn(
@@ -4173,13 +4176,14 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
         column_config=col_cfg, hide_index=True,
     )
 
-    _render_pending_changes(edited, machine_df, editable_cols)
+    _render_pending_changes(edited, machine_df, editable_cols, text_cols=["Description"])
 
     if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
         _save_catalog_csv(
             edited=edited, source_df=machine_df,
             editable_cols=editable_cols,
             file_path="data/machine_clean.csv", label="machine",
+            text_cols=["Description"],
         )
 
     _render_add_new_sku(
@@ -4242,7 +4246,10 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
 
     col_cfg = {
         "SKU": st.column_config.TextColumn("SKU", disabled=True),
-        "Description": st.column_config.TextColumn("Description", disabled=True, width="large"),
+        "Description": st.column_config.TextColumn(
+            "Description", width="large",
+            help="Editable — change the text and click 💾 Save.",
+        ),
         "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
         "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
         "Bat": st.column_config.NumberColumn(
@@ -4272,13 +4279,14 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
         "`Bat` is the exact count from the machine catalog (max within the family)."
     )
 
-    _render_pending_changes(edited, acc_df, editable_cols)
+    _render_pending_changes(edited, acc_df, editable_cols, text_cols=["Description"])
 
     if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
         _save_catalog_csv(
             edited=edited, source_df=acc_df,
             editable_cols=editable_cols,
             file_path="data/acc_clean.csv", label="accessory",
+            text_cols=["Description"],
         )
 
     _render_add_new_sku(
@@ -4486,10 +4494,11 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         )
 
 
-def _render_pending_changes(edited, source_df, editable_cols):
+def _render_pending_changes(edited, source_df, editable_cols, text_cols=None):
     """Show a small expander listing cells where the edited value differs from
     the source. Helps the user confirm their edits are captured before clicking
     Save (and helps debug 'nothing happens' cases)."""
+    text_cols = text_cols or []
     if edited is None or len(edited) == 0:
         return
     if "SKU" not in edited.columns:
@@ -4517,6 +4526,17 @@ def _render_pending_changes(edited, source_df, editable_cols):
                     })
             except (TypeError, ValueError):
                 continue
+        # Text columns (e.g. Description) — string compare, no numeric Δ.
+        for col in text_cols:
+            if col not in ei.columns or col not in source_df.columns:
+                continue
+            new_s = "" if pd.isna(ei.at[sku, col]) else str(ei.at[sku, col]).strip()
+            old_s = "" if pd.isna(source_df.at[sku, col]) else str(source_df.at[sku, col]).strip()
+            if new_s != old_s:
+                diffs.append({
+                    "SKU": sku, "Column": col,
+                    "Old": old_s, "New": new_s, "Δ": "—",
+                })
 
     if not diffs:
         st.caption("ℹ️ No pending edits — make a change in the table above before saving.")
@@ -4874,12 +4894,17 @@ def _render_stale_data_banner(file_path: str) -> None:
                 st.rerun()
 
 
-def _compute_cell_diffs(edited, source_df, editable_cols):
+def _compute_cell_diffs(edited, source_df, editable_cols, text_cols=None):
     """Return a list of (sku, col, new_value) tuples for cells the user changed.
 
     Compares `edited` (user's data_editor output) against `source_df` (the
     in-memory catalog loaded at session start).
+
+    `editable_cols` are numeric (compared as floats). `text_cols` (e.g.
+    ``["Description"]``) are compared as trimmed strings so free-text columns
+    can be edited and saved too.
     """
+    text_cols = text_cols or []
     # Drop UI-only / derived columns first. We exclude any name that is also in
     # `editable_cols` so we don't accidentally strip a real editable column
     # (e.g. "Bat" is a derived column in the accessory editor but a real
@@ -4911,6 +4936,16 @@ def _compute_cell_diffs(edited, source_df, editable_cols):
                     diffs.append((sku, col, new_val))
             except (TypeError, ValueError):
                 continue
+        # Text columns (e.g. Description) — compare as trimmed strings.
+        for col in text_cols:
+            if col not in ei.columns or col not in source_df.columns:
+                continue
+            new_val = ei.loc[sku, col]
+            old_val = source_df.loc[sku, col]
+            new_s = "" if pd.isna(new_val) else str(new_val).strip()
+            old_s = "" if pd.isna(old_val) else str(old_val).strip()
+            if new_s != old_s:
+                diffs.append((sku, col, new_s))
     return diffs
 
 
@@ -5040,24 +5075,27 @@ def _import_missing_skus_to_catalog(
     return added, skipped
 
 
-def _save_catalog_csv(edited, source_df, editable_cols, file_path, label):
+def _save_catalog_csv(edited, source_df, editable_cols, file_path, label, text_cols=None):
     """Cell-level merge: compute the user's diff, fetch the latest file from
     GitHub, apply only those cells on top, and push back. Retries once on a
     409 SHA conflict (the narrow race window where someone else committed
     between our fetch and our PUT).
+
+    `text_cols` (e.g. ``["Description"]``) lets free-text columns be edited and
+    saved alongside the numeric labor columns.
     """
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
 
-    diffs = _compute_cell_diffs(edited, source_df, editable_cols)
+    diffs = _compute_cell_diffs(edited, source_df, editable_cols, text_cols=text_cols)
     if not diffs:
         st.info("No changes detected.")
         return
 
     n_diffs = len(diffs)
-    commit_message = f"Update {label} catalog labor values via app ({n_diffs} cells)"
+    commit_message = f"Update {label} catalog via app ({n_diffs} cells)"
 
     response = None
     for attempt in (1, 2):

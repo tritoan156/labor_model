@@ -41,7 +41,7 @@ try:
 except Exception:
     pass
 
-from .constants import CUSTOMER_SUFFIXES, BATTERY_COUNT_OVERRIDES, week_of_month_series
+from .constants import CUSTOMER_SUFFIXES, week_of_month_series
 
 __all__ = [
     "load_machine_labor",
@@ -140,6 +140,7 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     pdi_col  = _find(df.columns, "TEST-PDI", "PDI")
     qc_col   = _find(df.columns, "FN-QC", "QC")
     ship_col = _find(df.columns, "SHIP")
+    eto_col  = _find(df.columns, "ETO")
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
@@ -154,14 +155,11 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["PDI"] = pd.to_numeric(df[pdi_col], errors="coerce").fillna(0) if pdi_col else zeros
     out["QC"] = pd.to_numeric(df[qc_col], errors="coerce").fillna(0) if qc_col else zeros
     out["Ship"] = pd.to_numeric(df[ship_col], errors="coerce").fillna(0) if ship_col else zeros
+    out["ETO"] = pd.to_numeric(df[eto_col], errors="coerce").fillna(0) if eto_col else zeros
     out["Bat"] = pd.to_numeric(df[bat_col], errors="coerce").fillna(0).astype(int) if bat_col else int_zeros
     # Last-modified date — empty for rows never edited through the app.
     mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
     out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * n, index=df.index, dtype=object)
-
-    # Apply battery-count overrides
-    for sku, count in BATTERY_COUNT_OVERRIDES.items():
-        out.loc[out["SKU"] == sku, "Bat"] = count
 
     out = out[out["SKU"].notna() & (out["SKU"] != "")]
     out = out.set_index("SKU", drop=False)

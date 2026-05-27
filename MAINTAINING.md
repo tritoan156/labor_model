@@ -53,7 +53,7 @@ How to rotate:
 
 ## When you change a CSV column
 
-`app.py:_LOADER_SCHEMA_VERSION` (currently `4`) is a cache-buster. Every
+`app.py:_LOADER_SCHEMA_VERSION` (currently `5`) is a cache-buster. Every
 cached DataFrame loader includes this constant as a `@st.cache_data`
 argument, so bumping it forces every user's browser session to re-read
 the CSV with the new schema.

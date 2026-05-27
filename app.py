@@ -121,7 +121,7 @@ def _csv_mtime(filename: str) -> float:
 # Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
 # renames, new columns, etc.) so the cache invalidates even if the underlying
 # CSV file's mtime hasn't changed.
-_LOADER_SCHEMA_VERSION = 4
+_LOADER_SCHEMA_VERSION = 5
 
 
 @st.cache_data(show_spinner=False)
@@ -4157,7 +4157,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
         "see new values after redeploy (~1 min)."
     )
 
-    editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "Bat"]
+    editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "ETO", "Bat"]
     display_df = machine_df.reset_index(drop=True).copy()
     # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
     if "FN_Assy_old" in display_df.columns and "FN_Assy" not in display_df.columns:

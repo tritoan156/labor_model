@@ -96,10 +96,17 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     else:
         batt_total = 0
 
-    # ETO?
+    # ETO — read from the machine catalog's ETO column when present (the
+    # planner enters it per FG SKU). Fall back to the legacy rule (960 p-min
+    # for BOSS220/BOSS400) only if the column is missing, e.g. a stale cache.
     fg_upper = str(fg_base).upper()
-    is_eto = "BOSS220" in fg_upper or "BOSS400" in fg_upper
-    eto = ETO_LABOR_PER_UNIT if is_eto else 0
+    if "ETO" in m.index:
+        try:
+            eto = float(m["ETO"]) if pd.notna(m["ETO"]) else 0.0
+        except (TypeError, ValueError):
+            eto = 0.0
+    else:
+        eto = ETO_LABOR_PER_UNIT if ("BOSS220" in fg_upper or "BOSS400" in fg_upper) else 0
 
     # Final Assembly is taken straight from the machine catalog's FN_Assy
     # column (person-minutes the planner enters per FG SKU), used literally.
@@ -181,8 +188,13 @@ def unit_labor_split(fg_base: str, acc_sku: str | None,
     else:
         batt_total, batt_from_acc = 0.0, False
 
+    # ETO from the catalog (fallback to the legacy BOSS220/400 rule if the
+    # column is missing), mirroring compute_unit_labor.
     fg_upper = str(fg_base).upper()
-    eto = ETO_LABOR_PER_UNIT if ("BOSS220" in fg_upper or "BOSS400" in fg_upper) else 0
+    if "ETO" in m.index:
+        eto = _m("ETO")
+    else:
+        eto = ETO_LABOR_PER_UNIT if ("BOSS220" in fg_upper or "BOSS400" in fg_upper) else 0
 
     machine = (
         _m("Warehouse") + _m("Wire") + _m("Trailer")

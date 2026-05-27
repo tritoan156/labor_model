@@ -42,9 +42,10 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
       - Else 0
 
     Final logic:
-      - HS: 30 person-mins (single value, not 'crew × cycle')
-      - HT: 60 person-mins (Mount only)
-      - STD: 156 person-mins (Mount 60 + Marry 96 batched)
+      - Read directly from the machine catalog's ``FN_Assy`` column (the
+        person-minutes the planner enters per FG SKU). Used literally,
+        including 0 — a blank/0 FN_Assy means no Final-assembly labor for
+        that SKU.
 
     ETO logic:
       - 960 person-mins for BOSS220/BOSS400 units (HS or otherwise)
@@ -100,6 +101,13 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     is_eto = "BOSS220" in fg_upper or "BOSS400" in fg_upper
     eto = ETO_LABOR_PER_UNIT if is_eto else 0
 
+    # Final Assembly is taken straight from the machine catalog's FN_Assy
+    # column (person-minutes the planner enters per FG SKU), used literally.
+    try:
+        final_labor = float(m["FN_Assy"]) if pd.notna(m["FN_Assy"]) else 0.0
+    except (KeyError, TypeError, ValueError):
+        final_labor = 0.0
+
     return {
         "Class": cls,
         "Bat": bat,
@@ -111,7 +119,7 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
         "ComAcc": _acc("ComAcc"),
         "Trailer": m["Trailer"],
         "AccKIT": _acc("AccKIT"),
-        "Final": FINAL_LABOR[cls],
+        "Final": final_labor,
         "PDI": m["PDI"],
         "QC": m["QC"],
         "Ship": m["Ship"],
@@ -179,7 +187,7 @@ def unit_labor_split(fg_base: str, acc_sku: str | None,
     machine = (
         _m("Warehouse") + _m("Wire") + _m("Trailer")
         + _m("PDI") + _m("QC") + _m("Ship")
-        + FINAL_LABOR[cls] + eto
+        + _m("FN_Assy") + eto
         + (0.0 if batt_from_acc else batt_total)
     )
     acc = (

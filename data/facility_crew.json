@@ -89,17 +89,17 @@
     },
     "Gen Accessories": {
       "HC": 20,
-      "Conc": 20,
+      "Conc": 16,
       "Crew": 1
     },
     "Com Accessories": {
       "HC": 7,
-      "Conc": 7,
+      "Conc": 8,
       "Crew": 1
     },
     "Trailer Assembly": {
       "HC": 4,
-      "Conc": 4,
+      "Conc": 8,
       "Crew": 1
     },
     "ETO": {
@@ -108,18 +108,18 @@
       "Crew": 1
     },
     "Accessories KIT": {
-      "HC": 6,
-      "Conc": 6,
+      "HC": 0,
+      "Conc": 0,
       "Crew": 1
     },
     "Final Assembly": {
-      "HC": 4,
-      "Conc": 2,
+      "HC": 6,
+      "Conc": 16,
       "Crew": 1
     },
     "PDI": {
       "HC": 2,
-      "Conc": 2,
+      "Conc": 6,
       "Crew": 1
     },
     "QC": {

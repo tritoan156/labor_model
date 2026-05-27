@@ -2949,11 +2949,23 @@ def render_sidebar() -> dict:
     # ----------------------------------------------------------------
     with st.sidebar.expander("⏱️ Working-time settings", expanded=False):
         st.caption("How much capacity you have per person per day.")
+        # 'Working days' defaults to the chosen Plan month's working-day count
+        # so capacity is computed over the same window you're planning. It
+        # re-syncs whenever the Plan month changes, but a manual edit sticks
+        # until you pick a different month (e.g. set 5 to model a single week).
+        _pm_working_days = len(_plan_working_days)
+        if st.session_state.get("_work_days_synced_month") != plan_month:
+            st.session_state["work_days_input"] = _pm_working_days
+            st.session_state["_work_days_synced_month"] = plan_month
         days = st.number_input(
             "Working days in the period",
             min_value=1, max_value=31,
-            value=DEFAULT_WORKING_DAYS,
-            help="E.g. 20 for a typical month with 5-day weeks.",
+            key="work_days_input",
+            help=(
+                f"Defaults to the Plan month's working days "
+                f"({_pm_working_days} for {plan_month_label}). Override for a "
+                "partial period — e.g. set 5 for a single week."
+            ),
         )
         shift = st.number_input(
             "Shift length (minutes)",

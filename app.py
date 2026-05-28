@@ -4619,13 +4619,18 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
     ).reset_index(drop=True)
 
     col_cfg = {
+        # NOTE on pinned columns: Streamlit's frontend silently disables
+        # pinning when the SUM of pinned column widths exceeds ~60% of the
+        # container width. Keep these compact so the freeze stays active on
+        # normal-sized browser windows. Width="large" on Description was
+        # enough to trip the threshold and quietly turn pinning off.
         "SKU": st.column_config.TextColumn(
-            "SKU", width="medium", pinned=True,
+            "SKU", width="small", pinned=True,
             help=("Editable — rename to fix a typo. ⚠️ Schedule rows using the "
                   "OLD SKU won't auto-update; re-point or re-upload them."),
         ),
         "Description": st.column_config.TextColumn(
-            "Description", width="large", pinned=True,
+            "Description", width="medium", pinned=True,
             help="Editable — change the text and click 💾 Save.",
         ),
         fs_col: st.column_config.SelectboxColumn(
@@ -4760,13 +4765,16 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     display_df["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
 
     col_cfg = {
+        # See note in tab_floor_verification_machine: keep pinned widths
+        # compact so Streamlit's ~60% container-width threshold doesn't
+        # silently turn off pinning.
         "SKU": st.column_config.TextColumn(
-            "SKU", width="medium", pinned=True,
+            "SKU", width="small", pinned=True,
             help=("Editable — rename to fix a typo. ⚠️ Schedule rows using the "
                   "OLD SKU won't auto-update; re-point or re-upload them."),
         ),
         "Description": st.column_config.TextColumn(
-            "Description", width="large", pinned=True,
+            "Description", width="medium", pinned=True,
             help="Editable — change the text and click 💾 Save.",
         ),
         "Used (qty)": st.column_config.NumberColumn(

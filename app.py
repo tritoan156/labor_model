@@ -478,6 +478,30 @@ def _carryover_transfer_counts(df: pd.DataFrame, plan_month) -> "tuple[int, int]
     return int(carry.sum()), int((carry & ~in_plan).sum())
 
 
+def _transfer_out_of_month_to_plan_month(df, machine_df, acc_df, location, plan_month):
+    """Re-date any rows whose PRODUCTION DAY falls outside the plan month
+    back into it, level-loading them across the plan month's working days
+    (auto-spread, seeded by already-in-month rows). Returns (new_df, n_moved).
+
+    This is the cleanup button for the case where a saved schedule was first
+    auto-spread under a different Plan month — the dates got "frozen" at the
+    earlier month, so changing the picker doesn't move them on its own.
+    """
+    if df is None or df.empty or not plan_month or "PRODUCTION DAY" not in df.columns:
+        return df, 0
+    py, pm = plan_month
+    out = df.copy()
+    pday = pd.to_datetime(out["PRODUCTION DAY"], errors="coerce")
+    out_mask = pday.notna() & ((pday.dt.year != py) | (pday.dt.month != pm))
+    n = int(out_mask.sum())
+    if n == 0:
+        return out, 0
+    out["PRODUCTION DAY"] = pday
+    out.loc[out_mask, "PRODUCTION DAY"] = pd.NaT
+    _auto_spread_dates(out, machine_df, acc_df, location, target_month_hint=plan_month)
+    return out, n
+
+
 def _transfer_carryover_into_plan_month(df, machine_df, acc_df, location, plan_month):
     """Re-date carryover rows (PRODUCTION MONTH older than the plan month) that
     aren't yet scheduled in the plan month, level-loading them across the plan
@@ -7057,13 +7081,44 @@ def main():
         )
         _n_out = int(_out_mask.sum())
         if _n_out:
+            _plan_lbl_o = inputs.get("plan_month_label", "the selected month")
             st.warning(
-                f"📆 **{_n_out} row(s) are dated outside "
-                f"{inputs.get('plan_month_label', 'the selected month')}** and "
-                "won't appear on the Calendar for this month. Switch the "
-                "**Plan month** in the sidebar to match your data, or re-date "
-                "those rows in **📁 Data & Setup → 🗓 Sequence**."
+                f"📆 **{_n_out} row(s) are dated outside {_plan_lbl_o}** and "
+                "won't appear on the Calendar for this month. Click below to "
+                "re-spread them into the plan month, or switch the **Plan month** "
+                "in the sidebar to match the data."
             )
+            if st.button(
+                f"📅 Move {_n_out} row(s) into {_plan_lbl_o}",
+                type="primary",
+                help=(
+                    "Clears those rows' out-of-month dates and level-loads them "
+                    "across the plan month's working days (auto-spread, seeded "
+                    "by rows already in-month)."
+                ),
+                key="move_out_of_month_btn",
+            ):
+                try:
+                    _new_df, _n = _transfer_out_of_month_to_plan_month(
+                        schedule_df_full, machine_df, acc_df,
+                        inputs["location"], _plan_ym,
+                    )
+                    if _n:
+                        st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
+                            _new_df.to_csv(index=False).encode("utf-8")
+                        )
+                        _track_and_flush(
+                            "out_of_month_transfer",
+                            facility=inputs.get("location"), n=_n,
+                        )
+                        st.success(
+                            f"✅ Moved **{_n}** row(s) into {_plan_lbl_o} — refreshing…"
+                        )
+                        st.rerun()
+                    else:
+                        st.info("Nothing to move — all rows already in the plan month.")
+                except Exception as e:
+                    st.error(f"❌ Move failed: {e}")
 
     # Carryover transfer — units whose PRODUCTION MONTH is earlier than the
     # Plan month have slipped and need to be built this month. One click

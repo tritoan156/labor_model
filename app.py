@@ -4699,12 +4699,15 @@ def _render_pending_changes(edited, source_df, editable_cols, text_cols=None):
                     })
             except (TypeError, ValueError):
                 continue
-        # Text columns (e.g. Description) — string compare, no numeric Δ.
+        # Text columns (e.g. Description, Final Station) — string compare,
+        # no numeric Δ. Robust to source_df missing the column (stale cache).
         for col in text_cols:
-            if col not in ei.columns or col not in source_df.columns:
+            if col not in ei.columns:
                 continue
-            new_s = "" if pd.isna(ei.at[sku, col]) else str(ei.at[sku, col]).strip()
-            old_s = "" if pd.isna(source_df.at[sku, col]) else str(source_df.at[sku, col]).strip()
+            new_v = ei.at[sku, col]
+            old_v = source_df.at[sku, col] if col in source_df.columns else ""
+            new_s = "" if pd.isna(new_v) else str(new_v).strip()
+            old_s = "" if pd.isna(old_v) else str(old_v).strip()
             if new_s != old_s:
                 diffs.append({
                     "SKU": sku, "Column": col,
@@ -5134,12 +5137,16 @@ def _compute_cell_diffs(edited, source_df, editable_cols, text_cols=None):
                     diffs.append((sku, col, new_val))
             except (TypeError, ValueError):
                 continue
-        # Text columns (e.g. Description) — compare as trimmed strings.
+        # Text columns (e.g. Description, Final Station) — compare as trimmed
+        # strings. Robust to the column being missing from ``source_df`` (e.g.
+        # a stale cache that pre-dates a newly-added column): treat the
+        # missing source as an empty string so any non-empty edit still
+        # registers as a diff and reaches the GitHub save.
         for col in text_cols:
-            if col not in ei.columns or col not in source_df.columns:
+            if col not in ei.columns:
                 continue
             new_val = ei.loc[sku, col]
-            old_val = source_df.loc[sku, col]
+            old_val = source_df.loc[sku, col] if col in source_df.columns else ""
             new_s = "" if pd.isna(new_val) else str(new_val).strip()
             old_s = "" if pd.isna(old_val) else str(old_val).strip()
             if new_s != old_s:

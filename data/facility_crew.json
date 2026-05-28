@@ -113,8 +113,8 @@
       "Crew": 1
     },
     "Final Assembly": {
-      "HC": 2,
-      "Conc": 2,
+      "HC": 0,
+      "Conc": 0,
       "Crew": 1
     },
     "PDI": {
@@ -123,13 +123,13 @@
       "Crew": 1
     },
     "QC": {
-      "HC": 4,
-      "Conc": 4,
+      "HC": 3,
+      "Conc": 3,
       "Crew": 1
     },
     "Ship": {
-      "HC": 3,
-      "Conc": 3,
+      "HC": 2,
+      "Conc": 2,
       "Crew": 1
     }
   },

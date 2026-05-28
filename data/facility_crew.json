@@ -93,8 +93,8 @@
       "Crew": 1
     },
     "Com Accessories": {
-      "HC": 7,
-      "Conc": 8,
+      "HC": 13,
+      "Conc": 16,
       "Crew": 1
     },
     "Trailer Assembly": {
@@ -113,8 +113,8 @@
       "Crew": 1
     },
     "Final Assembly": {
-      "HC": 6,
-      "Conc": 16,
+      "HC": 2,
+      "Conc": 2,
       "Crew": 1
     },
     "PDI": {

@@ -124,6 +124,28 @@ def _csv_mtime(filename: str) -> float:
 _LOADER_SCHEMA_VERSION = 8
 
 
+def _fmt_min_hr(value, *, with_thousands: bool = True, hr_decimals: int = 1) -> str:
+    """Format a person-minutes number as ``"<N> p-min · <H> p-hr"``.
+
+    All labor in this app is computed in person-minutes (p-min), but managers
+    think in person-hours. Render both inline so a planner reading "Total
+    work: 103,366 p-min" also sees "1,722.8 p-hr" without doing the math.
+
+    ``with_thousands`` adds the comma separator on p-min (off for very small
+    values where it just adds visual noise). ``hr_decimals`` controls the
+    p-hr precision — keep it at 1 for headline metrics, bump to 2 for
+    per-unit values where 0.05 hr (3 min) matters.
+    """
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        v = 0.0
+    mins = int(round(v))
+    hrs = v / 60.0
+    mins_str = f"{mins:,}" if with_thousands else f"{mins}"
+    return f"{mins_str} p-min · {hrs:.{hr_decimals}f} p-hr"
+
+
 @st.cache_data(show_spinner=False)
 def _load_machine_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
     return load_machine_labor()
@@ -1098,13 +1120,13 @@ def _render_sequencer_controls(
                         with st.container():
                             st.markdown(
                                 f"**Bottleneck: {d['station_display']}** "
-                                f"— short **{int(d['shortfall']):,} p-min** "
+                                f"— short **{_fmt_min_hr(d['shortfall'])}** "
                                 f"({d['shortfall_pct']*100:+.0f}% over capacity)"
                             )
                             st.caption(
-                                f"Monthly demand: **{int(d['demand']):,} p-min** "
+                                f"Monthly demand: **{_fmt_min_hr(d['demand'])}** "
                                 f"· Capacity at current settings: "
-                                f"**{int(d['capacity']):,} p-min**"
+                                f"**{_fmt_min_hr(d['capacity'])}**"
                             )
 
                             colA, colB, colC = st.columns(3)
@@ -1138,7 +1160,7 @@ def _render_sequencer_controls(
                                     st.caption(
                                         f"Push heaviest units to next month: "
                                         f"{_names}. Frees "
-                                        f"~{int(d['freed_by_defer']):,} p-min."
+                                        f"~{_fmt_min_hr(d['freed_by_defer'])}."
                                     )
                                 else:
                                     st.markdown(defer_label + "&nbsp; —")
@@ -1922,7 +1944,7 @@ def _render_calendar_view(
     n_weeks = int(work["WEEK_OF_MONTH"].nunique())
     c1, c2, c3 = st.columns(3)
     c1.metric("Units in plan", f"{total_units:,}")
-    c2.metric("Total labor", f"{int(total_labor):,} p-min")
+    c2.metric("Total labor", _fmt_min_hr(total_labor))
     c3.metric("Weeks", n_weeks)
     st.caption(
         "Each week below is an expander. Open one to see the day-by-day "
@@ -1964,7 +1986,7 @@ def _render_calendar_view(
 
         with st.expander(
             f"📆 **Week {week_num}** ({date_label}) — "
-            f"{wk_units} units · {int(wk_labor):,} p-min  ·  Top: {top_label}",
+            f"{wk_units} units · {_fmt_min_hr(wk_labor)}  ·  Top: {top_label}",
             expanded=False,
         ):
             # ---- Daily rollup ----
@@ -1984,6 +2006,7 @@ def _render_calendar_view(
             )
             daily["units"] = daily["units"].astype(int)
             daily["labor"] = daily["labor"].round(0).astype(int)
+            daily["Labor (p-hr)"] = (daily["labor"] / 60.0).round(1)
             daily = daily.rename(columns={
                 "units": "Units",
                 "labor": "Labor (p-min)",
@@ -3699,8 +3722,8 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
         ),
     )
     c4.metric(
-        "Total work", f"{total_labor:,} p-min",
-        help="Total person-minutes of labor required across all stations.",
+        "Total work", _fmt_min_hr(total_labor),
+        help="Total labor required across all stations, shown as person-minutes and person-hours.",
     )
 
     # ----------------------------------------------------------------
@@ -4211,7 +4234,9 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
         disp["Stations/Cells"] = capacity["Conc"]
         disp["Crew/unit"] = capacity["Crew"]
         disp["Labor demand (p-min)"] = capacity["labor_demand"].astype(int)
+        disp["Labor demand (p-hr)"] = (capacity["labor_demand"] / 60.0).round(1)
         disp["Labor capacity (with buffer)"] = capacity["labor_cap_safe"].astype(int)
+        disp["Labor capacity (p-hr)"] = (capacity["labor_cap_safe"] / 60.0).round(1)
         disp["Labor util (with buffer)"] = (capacity["labor_util_safe"] * 100).round(1).astype(str) + "%"
         disp["Labor status"] = capacity["labor_status_safe"]
         disp["Labor capacity (raw)"] = capacity["labor_cap_raw"].astype(int)
@@ -4763,6 +4788,9 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
         per_batt = pd.Series(0, index=display_df.index)
     display_df["Bat"] = bat_counts.astype(int)
     display_df["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
+    display_df["Total per unit (p-hr)"] = (
+        display_df["Total per unit (p-min)"] / 60.0
+    ).round(2)
 
     col_cfg = {
         # See note in tab_floor_verification_machine: keep pinned widths
@@ -4790,6 +4818,11 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
         "Total per unit (p-min)": st.column_config.NumberColumn(
             "Total per unit (p-min)", disabled=True,
             help="Non-battery labor + BattSubRaw × Bat.",
+        ),
+        "Total per unit (p-hr)": st.column_config.NumberColumn(
+            "Total per unit (p-hr)", disabled=True,
+            help="Total per unit in person-hours.",
+            format="%.2f",
         ),
         "Last Modified": st.column_config.TextColumn(
             "Last Modified", disabled=True,
@@ -4963,6 +4996,9 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
         per_batt = display_df["BattSubRaw"].fillna(0)
         display_df["Bat"] = bat_counts.astype(int)
         display_df["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
+        display_df["Total per unit (p-hr)"] = (
+            display_df["Total per unit (p-min)"] / 60.0
+        ).round(2)
 
         col_cfg = {
             "SKU": st.column_config.TextColumn("SKU", disabled=True),
@@ -4976,6 +5012,11 @@ def tab_floor_verification(machine_df, acc_df, schedule_df):
             "Total per unit (p-min)": st.column_config.NumberColumn(
                 "Total per unit (p-min)", disabled=True,
                 help="Non-battery labor + BattSubRaw × Bat. Bat comes from the machine catalog for the accessory's family.",
+            ),
+            "Total per unit (p-hr)": st.column_config.NumberColumn(
+                "Total per unit (p-hr)", disabled=True,
+                help="Total per unit in person-hours.",
+                format="%.2f",
             ),
             "Last Modified": st.column_config.TextColumn(
                 "Last Modified", disabled=True,
@@ -5875,8 +5916,11 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
             "Bat": int(bat),
             "Qty in schedule": len(grp),
             "Total Labor (p-min)": int(total_labor),
+            "Total Labor (p-hr)": round(total_labor / 60.0, 1),
             "Machine Labor (p-min)": machine_lbr if machine_lbr is not None else int(total_labor),
+            "Machine Labor (p-hr)": round((machine_lbr if machine_lbr is not None else total_labor) / 60.0, 1),
             "Acc Labor (p-min)": acc_lbr if acc_lbr is not None else 0,
+            "Acc Labor (p-hr)": round((acc_lbr or 0) / 60.0, 1),
             "Lead Time (days)": round(lead_days, 2),
             "Sum of Cycles (min)": round(sum_cycles, 1),
             "Longest Station": longest_st or "—",
@@ -5896,11 +5940,11 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Unique unit pairings", f"{len(summary_df)}")
-        c2.metric("Avg labor / unit", f"{int(avg_labor):,} p-min")
+        c2.metric("Avg labor / unit", _fmt_min_hr(avg_labor))
         c3.metric("Avg lead time / unit", f"{avg_lead:.1f} days")
         c4.metric(
             "Slowest unit", f"{slowest['FG SKU']}",
-            help=f"{int(slowest['Total Labor (p-min)']):,} p-min · {slowest['Lead Time (days)']} days",
+            help=f"{_fmt_min_hr(slowest['Total Labor (p-min)'])} · {slowest['Lead Time (days)']} days",
         )
 
     st.markdown("---")
@@ -5917,17 +5961,32 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
                 help="Person-minutes summed across all stations (Machine + Accessory).",
                 format="%d",
             ),
+            "Total Labor (p-hr)": st.column_config.NumberColumn(
+                "Total Labor (p-hr)",
+                help="Same as Total Labor (p-min) ÷ 60.",
+                format="%.1f",
+            ),
             "Machine Labor (p-min)": st.column_config.NumberColumn(
                 "Machine Labor (p-min)",
                 help="Labor from the FG (machine) catalog: Warehouse, Wire, Trailer, "
                      "Final, PDI, QC, Ship, ETO, and machine-default battery labor.",
                 format="%d",
             ),
+            "Machine Labor (p-hr)": st.column_config.NumberColumn(
+                "Machine Labor (p-hr)",
+                help="Machine Labor in person-hours.",
+                format="%.1f",
+            ),
             "Acc Labor (p-min)": st.column_config.NumberColumn(
                 "Acc Labor (p-min)",
                 help="Labor from the accessory catalog: Accessory KIT, PM/Gen/Com "
                      "accessories, accessory Warehouse, and accessory-supplied battery labor.",
                 format="%d",
+            ),
+            "Acc Labor (p-hr)": st.column_config.NumberColumn(
+                "Acc Labor (p-hr)",
+                help="Accessory Labor in person-hours.",
+                format="%.1f",
             ),
             "Lead Time (days)": st.column_config.NumberColumn(
                 "Lead Time (days)",
@@ -5969,6 +6028,7 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
             breakdown_rows.append({
                 "Station": STATION_KEY_TO_DISPLAY[st_key],
                 "Total Labor (p-min)": lbr,
+                "Total Labor (p-hr)": round(lbr / 60.0, 2),
                 "Crew working in parallel": hc_used,
                 "Cycle Time (min)": cycle,
             })
@@ -5979,6 +6039,7 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
         total_row = pd.DataFrame([{
             "Station": "🟦 TOTAL",
             "Total Labor (p-min)": total_lbr,
+            "Total Labor (p-hr)": round(total_lbr / 60.0, 2),
             "Crew working in parallel": "—",
             "Cycle Time (min)": total_cycle,
         }])
@@ -5988,6 +6049,7 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
             breakdown_df, use_container_width=True, hide_index=True, height=460,
             column_config={
                 "Total Labor (p-min)": st.column_config.NumberColumn(format="%d"),
+                "Total Labor (p-hr)": st.column_config.NumberColumn(format="%.2f"),
                 "Cycle Time (min)": st.column_config.NumberColumn(format="%.1f"),
             },
         )
@@ -6161,7 +6223,14 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
         return f"n_{st_key}"
 
     def _node_label(sv) -> str:
-        return f"{sv['name']}\\n{sv['labor']} p-min · {sv['cycle']:.0f} cal-min"
+        # Show person-mins + person-hours alongside cycle time on each
+        # station node. Hours rounded to 1 decimal so 15 p-min reads as
+        # "15 p-min · 0.3 p-hr" rather than "0 p-hr".
+        _pmin = sv['labor']
+        return (
+            f"{sv['name']}\\n"
+            f"{_pmin} p-min ({_pmin/60:.1f} p-hr) · {sv['cycle']:.0f} cal-min"
+        )
 
     # ---- Build the Graphviz DOT -----------------------------------------
     dot_lines = [
@@ -6201,7 +6270,7 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
     c1.metric("Class", cls,
               help="HS = head-skid (PM only); HT = head + trailer; STD = standard trailer.")
     c2.metric("Batteries", bat)
-    c3.metric("Total labor", f"{total_labor:,} p-min")
+    c3.metric("Total labor", _fmt_min_hr(total_labor))
     c4.metric("Stations visited", len(station_visits))
 
     if filtered_edges:
@@ -7121,6 +7190,7 @@ def tab_source_data(machine_df, acc_df, schedule_df,
                               "PDI", "QC", "Ship"]
         present_cols = [c for c in machine_labor_cols if c in m_disp.columns]
         m_disp["Total labor (p-min)"] = m_disp[present_cols].fillna(0).sum(axis=1).astype(int)
+        m_disp["Total labor (p-hr)"] = (m_disp["Total labor (p-min)"] / 60.0).round(1)
         m_disp.insert(0, "Used (qty)", m_disp.index.map(lambda s: used_fg.get(s, 0)))
         m_disp.insert(1, "In schedule", m_disp["Used (qty)"] > 0)
         if only_used:

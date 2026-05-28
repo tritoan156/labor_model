@@ -53,7 +53,7 @@ How to rotate:
 
 ## When you change a CSV column
 
-`app.py:_LOADER_SCHEMA_VERSION` (currently `7`) is a cache-buster. Every
+`app.py:_LOADER_SCHEMA_VERSION` (currently `8`) is a cache-buster. Every
 cached DataFrame loader includes this constant as a `@st.cache_data`
 argument, so bumping it forces every user's browser session to re-read
 the CSV with the new schema.
@@ -67,6 +67,34 @@ the CSV with the new schema.
 If you forget, the team will see stale data with the old column name
 until they hard-refresh the browser or the Streamlit Cloud container
 recycles.
+
+---
+
+## Per-facility station routing + frozen catalog columns
+
+Two pieces of behavior that aren't obvious from the UI:
+
+**Per-facility routing.** Some stations are staffed by different teams at
+different plants (e.g. PDI is done by the PDI team in Henderson but by the
+Accessories team in Cypress). Routing is therefore stored *per facility* in
+`data/machine_clean.csv` as suffixed columns:
+`Final Station {CODE}`, `AccKIT Station {CODE}`, `PDI Station {CODE}`, where
+`{CODE}` is the 3-letter `core/constants.FACILITY_CODE` for the plant
+(`HND` / `SPB` / `CYP`). The catalog editor shows only the *active* facility's
+3 routing dropdowns. At load, `_project_facility_routing(...)` in `app.py`
+copies the active facility's three columns onto the legacy
+`Final Station` / `AccKIT Station` / `PDI Station` names so the rest of the
+compute path stays facility-agnostic.
+
+**Frozen (pinned) catalog columns — the ~60% gotcha.** The catalog editors
+pin SKU / Description (and a couple of status columns) with
+`st.column_config(..., pinned=True)` so they stay visible while scrolling
+horizontally. Streamlit's frontend **silently disables freezing** when the
+summed width of the pinned columns exceeds ~60% of the container width
+(confirmed in the bundled DataFrame JS). If pinning ever "stops working,"
+that's almost always why. Keep pinned `SKU` at `width="small"` and
+`Description` at `width="medium"` — widening them past the threshold turns the
+pins off with no error.
 
 ---
 
@@ -179,13 +207,23 @@ git push origin staging
 If the company spins up a fourth manufacturing facility:
 
 1. **`core/constants.LOCATIONS`** — add the facility name (e.g. `"Phoenix"`).
-2. **`data/facility_crew.json`** — add a new top-level key with the new
+2. **`core/constants.FACILITY_CODE`** — add a matching entry mapping the new
+   facility to a unique 3-letter code (e.g. `"Phoenix": "PHX"`). This code is
+   the column suffix used for per-facility station routing.
+3. **`data/machine_clean.csv`** — run a migration to add the 3 routing columns
+   for the new code: `Final Station PHX`, `AccKIT Station PHX`,
+   `PDI Station PHX`. Copy an existing facility's column values as the starting
+   point. `core/data_loader.load_machine_labor` expects *all* per-facility
+   routing columns to be present — a missing one breaks the load. After the CSV
+   change, **bump `_LOADER_SCHEMA_VERSION`** (see "When you change a CSV column"
+   above). See also "Per-facility station routing" for how these columns work.
+4. **`data/facility_crew.json`** — add a new top-level key with the new
    facility's per-station HC / Conc / Crew. Easiest is to copy an existing
    facility's block and tweak the numbers.
-3. **`data/scenarios.json`** and **`data/uploaded_schedules.json`** —
+5. **`data/scenarios.json`** and **`data/uploaded_schedules.json`** —
    automatically supports the new facility once the constant is added;
    the per-location dict structure scales freely.
-4. Commit + push. New facility appears in the sidebar dropdown after the
+6. Commit + push. New facility appears in the sidebar dropdown after the
    next redeploy.
 
 ---
@@ -239,7 +277,7 @@ ranges like `streamlit<2,>=1.30` and re-deploy.
 | `app.py` | Streamlit UI, sidebar, all tabs |
 | `core/data_loader.py` | CSV/JSON readers, fuzzy schedule column matching |
 | `core/labor_calculator.py` | Per-unit labor, capacity table, status flags |
-| `core/constants.py` | Stations, defaults, utilization thresholds, families |
+| `core/constants.py` | Stations, defaults, utilization thresholds, families, `FACILITY_CODE` (per-facility routing suffixes) |
 | `core/catalog_storage.py` | GitHub PUT/GET (shared by all storage modules) |
 | `core/scenario_storage.py` | Save/load manual scenarios |
 | `core/uploaded_schedule_storage.py` | Save/load uploaded CSVs |

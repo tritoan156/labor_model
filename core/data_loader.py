@@ -446,7 +446,13 @@ _OPTIONAL_SCHEDULE_COLUMNS = [
     # Day-level scheduling — when present we expose a Week selector in the
     # sidebar so the planner can see "this week" vs "remaining weeks". Absent
     # ⇒ the analysis collapses back to the whole-month behavior, unchanged.
-    ("PRODUCTION DAY", ["PRODUCTION DAY", "PROD DAY", "BUILD DATE", "DATE"]),
+    # PRODUCTION DAY is the **build day** for a unit. The patterns are
+    # specific on purpose — a bare "DATE" pattern used to greedy-match
+    # unrelated columns like PACKET RELEASE DATE / PLANNED COMPLETION DATE /
+    # SHIPPED DATE, so a CSV without a real build-day column would get those
+    # picked up as production days and then surface as "rows dated outside
+    # the plan month" on the Calendar.
+    ("PRODUCTION DAY", ["PRODUCTION DAY", "PROD DAY", "BUILD DAY", "BUILD DATE"]),
 ]
 
 

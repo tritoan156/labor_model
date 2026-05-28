@@ -141,6 +141,9 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     qc_col   = _find(df.columns, "FN-QC", "QC")
     ship_col = _find(df.columns, "SHIP")
     eto_col  = _find(df.columns, "ETO")
+    final_station_col = _find(
+        df.columns, "Final Station", "Build Station", "Final Team", "Build Team",
+    )
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
@@ -157,6 +160,19 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["Ship"] = pd.to_numeric(df[ship_col], errors="coerce").fillna(0) if ship_col else zeros
     out["ETO"] = pd.to_numeric(df[eto_col], errors="coerce").fillna(0) if eto_col else zeros
     out["Bat"] = pd.to_numeric(df[bat_col], errors="coerce").fillna(0).astype(int) if bat_col else int_zeros
+    # Final Station — which station receives this SKU's Final-assembly labor
+    # (FN_Assy). Defaults to "Final"; planners can override per SKU when the
+    # team that does the work is different (e.g. PDS compressors -> ComAcc).
+    # Unknown values fall back to "Final" so a typo can't crash the engine.
+    from .constants import STATION_KEYS as _STATION_KEYS
+    if final_station_col:
+        _raw_fs = df[final_station_col].fillna("").astype(str).str.strip()
+        _normalized = _raw_fs.where(_raw_fs.isin(_STATION_KEYS), "Final")
+        # Blank cells (now "" after fillna) → default Final.
+        _normalized = _normalized.where(_raw_fs != "", "Final")
+        out["Final Station"] = _normalized.values
+    else:
+        out["Final Station"] = pd.Series(["Final"] * n, index=df.index, dtype=object).values
     # Last-modified date — empty for rows never edited through the app.
     mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
     out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * n, index=df.index, dtype=object)

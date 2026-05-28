@@ -115,7 +115,21 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     except (KeyError, TypeError, ValueError):
         final_labor = 0.0
 
-    return {
+    # FN_Assy can be routed to a different station per SKU (e.g. PDS
+    # compressors are actually built by the Compressor team, so their
+    # "Final" labor lands at ComAcc, not Final). The "Final Station" catalog
+    # column carries the target station key; default Final, validated by the
+    # loader against STATION_KEYS so an unknown value can never land here.
+    try:
+        final_station = str(m["Final Station"]) if pd.notna(m["Final Station"]) else "Final"
+    except (KeyError, TypeError, ValueError):
+        final_station = "Final"
+    if final_station not in {"Final", "ComAcc", "GenAcc", "PMAcc", "Warehouse",
+                              "Wire", "Battery", "Trailer", "AccKIT", "PDI",
+                              "QC", "Ship", "ETO"}:
+        final_station = "Final"
+
+    result = {
         "Class": cls,
         "Bat": bat,
         "Warehouse": m["Warehouse"] + _acc("Warehouse"),
@@ -126,12 +140,16 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
         "ComAcc": _acc("ComAcc"),
         "Trailer": m["Trailer"],
         "AccKIT": _acc("AccKIT"),
-        "Final": final_labor,
+        "Final": 0.0,
         "PDI": m["PDI"],
         "QC": m["QC"],
         "Ship": m["Ship"],
         "ETO": eto,
     }
+    # Add the FN_Assy labor to whichever station the planner chose. When the
+    # target is "Final" this matches the previous unconditional behavior.
+    result[final_station] = float(result.get(final_station, 0) or 0) + final_labor
+    return result
 
 
 def unit_labor_split(fg_base: str, acc_sku: str | None,

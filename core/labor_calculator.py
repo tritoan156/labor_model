@@ -115,19 +115,36 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     except (KeyError, TypeError, ValueError):
         final_labor = 0.0
 
-    # FN_Assy can be routed to a different station per SKU (e.g. PDS
-    # compressors are actually built by the Compressor team, so their
-    # "Final" labor lands at ComAcc, not Final). The "Final Station" catalog
-    # column carries the target station key; default Final, validated by the
-    # loader against STATION_KEYS so an unknown value can never land here.
+    # FN_Assy / AccKIT / PDI can each be routed to a different station per SKU
+    # (e.g. PDS compressors are actually built by the Compressor team, so all
+    # three of their labor lines land at ComAcc, not Final / AccKIT / PDI).
+    # The respective "<X> Station" catalog columns carry the target station
+    # key; the loader has already validated against STATION_KEYS, so unknown
+    # values can never land here — but we add a final defensive set anyway.
+    _VALID = {"Final", "ComAcc", "GenAcc", "PMAcc", "Warehouse", "Wire",
+              "Battery", "Trailer", "AccKIT", "PDI", "QC", "Ship", "ETO"}
+
+    def _station(col, default):
+        try:
+            v = m[col]
+        except (KeyError, TypeError):
+            return default
+        if not pd.notna(v):
+            return default
+        s = str(v).strip()
+        return s if s in _VALID else default
+
+    final_station  = _station("Final Station",  "Final")
+    acckit_station = _station("AccKIT Station", "AccKIT")
+    pdi_station    = _station("PDI Station",    "PDI")
+
+    # Source labor lines — populated by their catalog values, then *routed*
+    # into the result dict at the chosen station below.
+    acckit_labor = _acc("AccKIT")
     try:
-        final_station = str(m["Final Station"]) if pd.notna(m["Final Station"]) else "Final"
+        pdi_labor = float(m["PDI"]) if pd.notna(m["PDI"]) else 0.0
     except (KeyError, TypeError, ValueError):
-        final_station = "Final"
-    if final_station not in {"Final", "ComAcc", "GenAcc", "PMAcc", "Warehouse",
-                              "Wire", "Battery", "Trailer", "AccKIT", "PDI",
-                              "QC", "Ship", "ETO"}:
-        final_station = "Final"
+        pdi_labor = 0.0
 
     result = {
         "Class": cls,
@@ -139,16 +156,18 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
         "GenAcc": _acc("GenAcc"),
         "ComAcc": _acc("ComAcc"),
         "Trailer": m["Trailer"],
-        "AccKIT": _acc("AccKIT"),
+        "AccKIT": 0.0,
         "Final": 0.0,
-        "PDI": m["PDI"],
+        "PDI": 0.0,
         "QC": m["QC"],
         "Ship": m["Ship"],
         "ETO": eto,
     }
-    # Add the FN_Assy labor to whichever station the planner chose. When the
-    # target is "Final" this matches the previous unconditional behavior.
-    result[final_station] = float(result.get(final_station, 0) or 0) + final_labor
+    # Route each labor line to its target station. When the target is the
+    # original station the behavior matches the previous (unrouted) version.
+    result[final_station]  = float(result.get(final_station, 0) or 0) + final_labor
+    result[acckit_station] = float(result.get(acckit_station, 0) or 0) + acckit_labor
+    result[pdi_station]    = float(result.get(pdi_station, 0) or 0) + pdi_labor
     return result
 
 

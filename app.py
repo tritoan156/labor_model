@@ -121,7 +121,7 @@ def _csv_mtime(filename: str) -> float:
 # Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
 # renames, new columns, etc.) so the cache invalidates even if the underlying
 # CSV file's mtime hasn't changed.
-_LOADER_SCHEMA_VERSION = 6
+_LOADER_SCHEMA_VERSION = 7
 
 
 @st.cache_data(show_spinner=False)
@@ -4364,11 +4364,15 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
     # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
     if "FN_Assy_old" in display_df.columns and "FN_Assy" not in display_df.columns:
         display_df = display_df.rename(columns={"FN_Assy_old": "FN_Assy"})
-    # Backward-compat: default Final Station for a stale cache (the loader
-    # adds the column, but if a worker process is still on an older frame
-    # the column might be missing — fall back to "Final" silently).
+    # Backward-compat: default routing columns for a stale cache (the loader
+    # adds them, but if a worker process is still on an older frame the
+    # column might be missing — fall back to the original station silently).
     if "Final Station" not in display_df.columns:
         display_df["Final Station"] = "Final"
+    if "AccKIT Station" not in display_df.columns:
+        display_df["AccKIT Station"] = "AccKIT"
+    if "PDI Station" not in display_df.columns:
+        display_df["PDI Station"] = "PDI"
     if "Last Modified" not in display_df.columns:
         display_df["Last Modified"] = ""
     display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_fg.get(s, 0)))
@@ -4404,6 +4408,26 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
             ),
             required=False,
         ),
+        "AccKIT Station": st.column_config.SelectboxColumn(
+            "AccKIT Station",
+            options=["AccKIT", "ComAcc", "GenAcc", "PMAcc", "Final"],
+            help=(
+                "Which station receives this SKU's Accessory-KIT labor. "
+                "Default Accessories KIT; reroute when there's no separate "
+                "AccKIT team (e.g. PDS → ComAcc, SDG → GenAcc)."
+            ),
+            required=False,
+        ),
+        "PDI Station": st.column_config.SelectboxColumn(
+            "PDI Station",
+            options=["PDI", "ComAcc", "GenAcc", "PMAcc", "Final", "QC"],
+            help=(
+                "Which station receives this SKU's PDI labor. "
+                "Default PDI; reroute when there's no separate PDI team "
+                "(e.g. PDS → ComAcc, SDG → GenAcc, or fold into QC)."
+            ),
+            required=False,
+        ),
         "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
         "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
         "Last Modified": st.column_config.TextColumn(
@@ -4427,7 +4451,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
                    + ", ".join(f"`{o}` → `{n}`" for o, n in renames))
     _render_pending_changes(
         edited_cells, machine_df, editable_cols,
-        text_cols=["Description", "Final Station"],
+        text_cols=["Description", "Final Station", "AccKIT Station", "PDI Station"],
     )
 
     if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
@@ -4435,7 +4459,8 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
             edited=edited_cells, source_df=machine_df,
             editable_cols=editable_cols,
             file_path="data/machine_clean.csv", label="machine",
-            text_cols=["Description", "Final Station"], renames=renames,
+            text_cols=["Description", "Final Station", "AccKIT Station", "PDI Station"],
+            renames=renames,
         )
 
     _render_add_new_sku(

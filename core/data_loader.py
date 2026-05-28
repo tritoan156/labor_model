@@ -144,6 +144,8 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     final_station_col = _find(
         df.columns, "Final Station", "Build Station", "Final Team", "Build Team",
     )
+    acckit_station_col = _find(df.columns, "AccKIT Station", "AccKIT Team", "Acc KIT Station")
+    pdi_station_col = _find(df.columns, "PDI Station", "PDI Team")
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
@@ -160,19 +162,23 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["Ship"] = pd.to_numeric(df[ship_col], errors="coerce").fillna(0) if ship_col else zeros
     out["ETO"] = pd.to_numeric(df[eto_col], errors="coerce").fillna(0) if eto_col else zeros
     out["Bat"] = pd.to_numeric(df[bat_col], errors="coerce").fillna(0).astype(int) if bat_col else int_zeros
-    # Final Station — which station receives this SKU's Final-assembly labor
-    # (FN_Assy). Defaults to "Final"; planners can override per SKU when the
-    # team that does the work is different (e.g. PDS compressors -> ComAcc).
-    # Unknown values fall back to "Final" so a typo can't crash the engine.
+    # Final / AccKIT / PDI Stations — per-SKU routing of those labor lines to
+    # the team that actually does the work (e.g. PDS compressors -> ComAcc,
+    # SDG generators -> GenAcc). Blank or unknown values fall back to the
+    # respective original station so a typo can never crash the engine.
     from .constants import STATION_KEYS as _STATION_KEYS
-    if final_station_col:
-        _raw_fs = df[final_station_col].fillna("").astype(str).str.strip()
-        _normalized = _raw_fs.where(_raw_fs.isin(_STATION_KEYS), "Final")
-        # Blank cells (now "" after fillna) → default Final.
-        _normalized = _normalized.where(_raw_fs != "", "Final")
-        out["Final Station"] = _normalized.values
-    else:
-        out["Final Station"] = pd.Series(["Final"] * n, index=df.index, dtype=object).values
+
+    def _read_station_col(src_col, default_station):
+        if not src_col:
+            return pd.Series([default_station] * n, index=df.index, dtype=object).values
+        raw = df[src_col].fillna("").astype(str).str.strip()
+        normalized = raw.where(raw.isin(_STATION_KEYS), default_station)
+        normalized = normalized.where(raw != "", default_station)
+        return normalized.values
+
+    out["Final Station"]  = _read_station_col(final_station_col,  "Final")
+    out["AccKIT Station"] = _read_station_col(acckit_station_col, "AccKIT")
+    out["PDI Station"]    = _read_station_col(pdi_station_col,    "PDI")
     # Last-modified date — empty for rows never edited through the app.
     mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
     out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * n, index=df.index, dtype=object)

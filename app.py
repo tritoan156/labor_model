@@ -429,6 +429,81 @@ def _auto_spread_dates(
     return df
 
 
+def _row_is_carryover(month_value, plan_month) -> bool:
+    """True when a row's PRODUCTION MONTH is *older* than the chosen Plan
+    month — i.e. it was supposed to be built earlier and has carried over.
+
+    ``plan_month`` is the (year, month) tuple from the sidebar picker.
+    Rows whose PRODUCTION MONTH can't be parsed (blank, "Manual", …) are not
+    carryover.
+    """
+    if not plan_month:
+        return False
+    t = _parse_target_month(month_value)
+    return bool(t is not None and tuple(t) < tuple(plan_month))
+
+
+def _recompute_carryover(df: pd.DataFrame, plan_month) -> pd.DataFrame:
+    """Set ``df['CARRYOVER']`` relative to the Plan month: True when the row's
+    PRODUCTION MONTH is earlier than the plan month. Overrides the loader's
+    format-based flag so the whole app shares one carryover definition."""
+    if (
+        df is None or df.empty
+        or "PRODUCTION MONTH" not in df.columns
+        or not plan_month
+    ):
+        return df
+    df = df.copy()
+    df["CARRYOVER"] = df["PRODUCTION MONTH"].apply(
+        lambda v: _row_is_carryover(v, plan_month)
+    )
+    return df
+
+
+def _carryover_transfer_counts(df: pd.DataFrame, plan_month) -> "tuple[int, int]":
+    """Return (total_carryover, needs_transfer) for the Plan month.
+
+    ``needs_transfer`` = carryover rows whose PRODUCTION DAY isn't already a
+    date inside the plan month (blank or a different month).
+    """
+    if df is None or df.empty or "PRODUCTION MONTH" not in df.columns or not plan_month:
+        return 0, 0
+    py, pm = plan_month
+    carry = df["PRODUCTION MONTH"].apply(lambda v: _row_is_carryover(v, plan_month))
+    if "PRODUCTION DAY" in df.columns:
+        pday = pd.to_datetime(df["PRODUCTION DAY"], errors="coerce")
+        in_plan = pday.notna() & (pday.dt.year == py) & (pday.dt.month == pm)
+    else:
+        in_plan = pd.Series(False, index=df.index)
+    return int(carry.sum()), int((carry & ~in_plan).sum())
+
+
+def _transfer_carryover_into_plan_month(df, machine_df, acc_df, location, plan_month):
+    """Re-date carryover rows (PRODUCTION MONTH older than the plan month) that
+    aren't yet scheduled in the plan month, level-loading them across the plan
+    month's working days. Their PRODUCTION MONTH (origin) is preserved so they
+    stay flagged as carryover. Returns (new_df, n_transferred)."""
+    if df is None or df.empty or not plan_month:
+        return df, 0
+    py, pm = plan_month
+    out = df.copy()
+    pday = pd.to_datetime(out["PRODUCTION DAY"], errors="coerce") \
+        if "PRODUCTION DAY" in out.columns else pd.Series(pd.NaT, index=out.index)
+    carry = out["PRODUCTION MONTH"].apply(lambda v: _row_is_carryover(v, plan_month)) \
+        if "PRODUCTION MONTH" in out.columns else pd.Series(False, index=out.index)
+    in_plan = pday.notna() & (pday.dt.year == py) & (pday.dt.month == pm)
+    need = carry & ~in_plan
+    n = int(need.sum())
+    if n == 0:
+        return out, 0
+    # Clear the carryover rows' dates, then level-load all undated rows into the
+    # plan month via the existing LPT auto-spread (seeded by already-dated rows).
+    out["PRODUCTION DAY"] = pday
+    out.loc[need, "PRODUCTION DAY"] = pd.NaT
+    _auto_spread_dates(out, machine_df, acc_df, location, target_month_hint=plan_month)
+    return out, n
+
+
 def _suggest_schedule_dates(
     schedule_df: pd.DataFrame, machine_df, acc_df, inputs: dict,
 ) -> "tuple[pd.DataFrame, list[dict]]":
@@ -6812,6 +6887,13 @@ def main():
     # that window. The full schedule is preserved on `schedule_df_full`
     # for the weekly heatmap rendering.
     # ----------------------------------------------------------------
+    # Carryover is Plan-month-relative: a unit whose PRODUCTION MONTH is older
+    # than the chosen Plan month has carried over (it must be built in the plan
+    # month). Override the loader's format-based flag so the whole app — the
+    # carryover-first priority sort, banners, and reports — shares this rule.
+    if not schedule_df.empty:
+        schedule_df = _recompute_carryover(schedule_df, inputs.get("plan_month"))
+
     schedule_df_full = schedule_df.copy() if not schedule_df.empty else schedule_df
     if not schedule_df.empty and "PRODUCTION DAY" in schedule_df.columns:
         window = inputs.get("time_window", "Whole month")
@@ -6981,6 +7063,53 @@ def main():
                 "won't appear on the Calendar for this month. Switch the "
                 "**Plan month** in the sidebar to match your data, or re-date "
                 "those rows in **📁 Data & Setup → 🗓 Sequence**."
+            )
+
+    # Carryover transfer — units whose PRODUCTION MONTH is earlier than the
+    # Plan month have slipped and need to be built this month. One click
+    # level-loads the not-yet-scheduled ones into the plan month.
+    if _plan_ym is not None and not schedule_df_full.empty:
+        _carry_total, _carry_need = _carryover_transfer_counts(schedule_df_full, _plan_ym)
+        _plan_lbl = inputs.get("plan_month_label", "the plan month")
+        if _carry_need:
+            st.warning(
+                f"📦 **{_carry_total} carryover unit(s)** (production month earlier "
+                f"than **{_plan_lbl}**) — **{_carry_need}** aren't scheduled in "
+                f"{_plan_lbl} yet."
+            )
+            if st.button(
+                f"📦 Build {_carry_need} carryover unit(s) in {_plan_lbl}",
+                type="primary",
+                help=(
+                    "Level-loads the carryover units across this month's working "
+                    "days (keeping their original production month so they stay "
+                    "flagged as carryover and are built first)."
+                ),
+            ):
+                try:
+                    _new_df, _n = _transfer_carryover_into_plan_month(
+                        schedule_df_full, machine_df, acc_df,
+                        inputs["location"], _plan_ym,
+                    )
+                    if _n:
+                        st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
+                            _new_df.to_csv(index=False).encode("utf-8")
+                        )
+                        _track_and_flush(
+                            "carryover_transfer", facility=inputs.get("location"), n=_n,
+                        )
+                        st.success(
+                            f"✅ Scheduled **{_n}** carryover unit(s) into {_plan_lbl} "
+                            "— refreshing…"
+                        )
+                        st.rerun()
+                    else:
+                        st.info("No carryover units needed re-dating.")
+                except Exception as e:
+                    st.error(f"❌ Carryover transfer failed: {e}")
+        elif _carry_total:
+            st.caption(
+                f"📦 {_carry_total} carryover unit(s) — all scheduled in {_plan_lbl}. ✅"
             )
 
     _skipped_fg: list = []

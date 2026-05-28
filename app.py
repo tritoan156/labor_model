@@ -121,12 +121,39 @@ def _csv_mtime(filename: str) -> float:
 # Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
 # renames, new columns, etc.) so the cache invalidates even if the underlying
 # CSV file's mtime hasn't changed.
-_LOADER_SCHEMA_VERSION = 7
+_LOADER_SCHEMA_VERSION = 8
 
 
 @st.cache_data(show_spinner=False)
 def _load_machine_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
     return load_machine_labor()
+
+
+def _project_facility_routing(machine_df, location: str):
+    """Project the per-facility routing columns into legacy column names.
+
+    machine_clean.csv carries 9 routing columns (3 stations × 3 facilities):
+    e.g. ``Final Station HND`` / ``Final Station SPB`` / ``Final Station CYP``.
+    The labor calculator and capacity table still read the legacy names
+    ``Final Station`` / ``AccKIT Station`` / ``PDI Station``, so we copy the
+    facility-matched column into those names here. Returns a NEW DataFrame
+    (does not mutate the cached one) so the cache stays clean across
+    location switches.
+    """
+    from core.constants import FACILITY_CODE
+    code = FACILITY_CODE.get(location, "HND")
+    out = machine_df.copy()
+    for base, default in (("Final Station", "Final"),
+                          ("AccKIT Station", "AccKIT"),
+                          ("PDI Station", "PDI")):
+        sfx = f"{base} {code}"
+        if sfx in out.columns:
+            out[base] = out[sfx]
+        elif base not in out.columns:
+            # Safety net for a stale cache: never crash compute if the
+            # facility column is missing — fall back to the default station.
+            out[base] = default
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -896,8 +923,12 @@ def _load_schedule_df(
 
     # Auto-spread needs the full machine + accessory frames so it can weight
     # each row by labor (per-station p-min × qty) before running LPT. Both
-    # come from the same cached loaders the rest of main() uses.
-    machine_df_full = _load_machine_df(_csv_mtime("machine_clean.csv"))
+    # come from the same cached loaders the rest of main() uses. Project the
+    # facility-specific routing so capacity-aware spreading sees the right
+    # station mapping for this plant.
+    machine_df_full = _project_facility_routing(
+        _load_machine_df(_csv_mtime("machine_clean.csv")), location,
+    )
     acc_df_full = _load_acc_df(_csv_mtime("acc_clean.csv"))
 
     # The Plan-month picker is authoritative — show it on the confirmation pill
@@ -3772,7 +3803,12 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
         # helper that produced `weekly_util` for the current schedule.
         try:
             # Pull machine_df / acc_df from cached loaders (same path main() uses).
-            _machine = _load_machine_df(_csv_mtime("machine_clean.csv"))
+            # Project the facility's routing so the proposed heatmap matches the
+            # current Capacity tab numbers at this plant.
+            _machine = _project_facility_routing(
+                _load_machine_df(_csv_mtime("machine_clean.csv")),
+                inputs.get("location", "Henderson"),
+            )
             _acc = _load_acc_df(_csv_mtime("acc_clean.csv"))
             proposed_util = _compute_weekly_utilization(
                 _proposed, _machine, _acc, inputs,
@@ -4432,7 +4468,7 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
 
 def tab_data_setup(
     machine_df, acc_df, schedule_df, item_master_df, item_packages_df,
-    units=None, schedule_df_full=None,
+    units=None, schedule_df_full=None, location: str = "Henderson",
 ):
     """Consolidated data + admin tab.
 
@@ -4500,7 +4536,7 @@ def tab_data_setup(
         )
 
     elif sub == "🗂 Machine catalog":
-        tab_floor_verification_machine(machine_df, schedule_df, used_fg)
+        tab_floor_verification_machine(machine_df, schedule_df, used_fg, location=location)
 
     elif sub == "🗂 Accessory catalog":
         tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df)
@@ -4518,15 +4554,31 @@ def tab_data_setup(
         tab_data_validation(machine_df, acc_df, units=units)
 
 
-def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
+def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: str = "Henderson"):
     """The Machine-catalog editor — extracted from the old tab_floor_verification
-    so it can be embedded as a sub-view of Data & Setup."""
+    so it can be embedded as a sub-view of Data & Setup.
+
+    Per-facility routing: the editor surfaces ONLY the 3 routing columns
+    matching the sidebar's selected facility (e.g. ``Final Station CYP`` at
+    Cypress). The other 6 columns stay in the CSV untouched. The dropdown's
+    display label drops the suffix so the editor reads "Final Station" /
+    "AccKIT Station" / "PDI Station" — the facility context comes from the
+    sidebar.
+    """
+    from core.constants import FACILITY_CODE
+    fac_code = FACILITY_CODE.get(location, "HND")
+    fs_col = f"Final Station {fac_code}"
+    ak_col = f"AccKIT Station {fac_code}"
+    pd_col = f"PDI Station {fac_code}"
+
     st.subheader("🗂 Machine catalog")
     _render_stale_data_banner("data/machine_clean.csv")
     st.caption(
-        "Edit labor times in the table below. SKUs used in the current schedule "
-        "are highlighted. Click **💾 Save** to push changes to GitHub — all users "
-        "see new values after redeploy (~1 min)."
+        f"Edit labor times in the table below. SKUs used in the current schedule "
+        f"are highlighted. Click **💾 Save** to push changes to GitHub — all users "
+        f"see new values after redeploy (~1 min). · Routing columns shown are for "
+        f"**{location}** ({fac_code}); switch facility in the sidebar to edit "
+        f"another plant's routing."
     )
 
     editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "ETO", "Bat"]
@@ -4534,15 +4586,24 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
     # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
     if "FN_Assy_old" in display_df.columns and "FN_Assy" not in display_df.columns:
         display_df = display_df.rename(columns={"FN_Assy_old": "FN_Assy"})
-    # Backward-compat: default routing columns for a stale cache (the loader
-    # adds them, but if a worker process is still on an older frame the
-    # column might be missing — fall back to the original station silently).
-    if "Final Station" not in display_df.columns:
-        display_df["Final Station"] = "Final"
-    if "AccKIT Station" not in display_df.columns:
-        display_df["AccKIT Station"] = "AccKIT"
-    if "PDI Station" not in display_df.columns:
-        display_df["PDI Station"] = "PDI"
+    # Backward-compat: default the facility's routing columns for a stale
+    # cache (a worker process may still be on the pre-migration frame).
+    if fs_col not in display_df.columns:
+        display_df[fs_col] = "Final"
+    if ak_col not in display_df.columns:
+        display_df[ak_col] = "AccKIT"
+    if pd_col not in display_df.columns:
+        display_df[pd_col] = "PDI"
+    # Drop the projected legacy routing columns from the editor view —
+    # they're compute helpers, not the source of truth. We also drop the
+    # OTHER facilities' columns so the editor only shows ONE set of
+    # routing dropdowns matching the sidebar location.
+    _drop_cols = ["Final Station", "AccKIT Station", "PDI Station"]
+    for _code in ("HND", "SPB", "CYP"):
+        if _code == fac_code:
+            continue
+        _drop_cols.extend([f"Final Station {_code}", f"AccKIT Station {_code}", f"PDI Station {_code}"])
+    display_df = display_df.drop(columns=[c for c in _drop_cols if c in display_df.columns])
     if "Last Modified" not in display_df.columns:
         display_df["Last Modified"] = ""
     display_df.insert(0, "Used (qty)", display_df["SKU"].map(lambda s: used_fg.get(s, 0)))
@@ -4567,34 +4628,37 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
             "Description", width="large",
             help="Editable — change the text and click 💾 Save.",
         ),
-        "Final Station": st.column_config.SelectboxColumn(
+        fs_col: st.column_config.SelectboxColumn(
             "Final Station",
             options=["Final", "ComAcc", "GenAcc", "PMAcc"],
             help=(
-                "Which team's station receives this SKU's FN_Assy labor. "
-                "Default Final Assembly; choose ComAcc / GenAcc / PMAcc when "
-                "another team actually builds the unit (e.g. PDS compressors "
-                "are built by the Compressor team — Com Accessories)."
+                f"Which team's station receives this SKU's FN_Assy labor "
+                f"at **{location}**. Default Final Assembly; choose "
+                f"ComAcc / GenAcc / PMAcc when another team actually builds "
+                f"the unit. Switch facility in the sidebar to edit a "
+                f"different plant's routing."
             ),
             required=False,
         ),
-        "AccKIT Station": st.column_config.SelectboxColumn(
+        ak_col: st.column_config.SelectboxColumn(
             "AccKIT Station",
             options=["AccKIT", "ComAcc", "GenAcc", "PMAcc", "Final"],
             help=(
-                "Which station receives this SKU's Accessory-KIT labor. "
-                "Default Accessories KIT; reroute when there's no separate "
-                "AccKIT team (e.g. PDS → ComAcc, SDG → GenAcc)."
+                f"Which station receives this SKU's Accessory-KIT labor "
+                f"at **{location}**. Default Accessories KIT; reroute when "
+                f"there's no separate AccKIT team (e.g. PDS → ComAcc, "
+                f"SDG → GenAcc)."
             ),
             required=False,
         ),
-        "PDI Station": st.column_config.SelectboxColumn(
+        pd_col: st.column_config.SelectboxColumn(
             "PDI Station",
             options=["PDI", "ComAcc", "GenAcc", "PMAcc", "Final", "QC"],
             help=(
-                "Which station receives this SKU's PDI labor. "
-                "Default PDI; reroute when there's no separate PDI team "
-                "(e.g. PDS → ComAcc, SDG → GenAcc, or fold into QC)."
+                f"Which station receives this SKU's PDI labor at "
+                f"**{location}**. Default PDI; reroute when there's no "
+                f"separate PDI team (e.g. PDS → ComAcc, SDG → GenAcc, or "
+                f"fold into QC)."
             ),
             required=False,
         ),
@@ -4621,7 +4685,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
                    + ", ".join(f"`{o}` → `{n}`" for o, n in renames))
     _render_pending_changes(
         edited_cells, machine_df, editable_cols,
-        text_cols=["Description", "Final Station", "AccKIT Station", "PDI Station"],
+        text_cols=["Description", fs_col, ak_col, pd_col],
     )
 
     if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
@@ -4629,7 +4693,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg):
             edited=edited_cells, source_df=machine_df,
             editable_cols=editable_cols,
             file_path="data/machine_clean.csv", label="machine",
-            text_cols=["Description", "Final Station", "AccKIT Station", "PDI Station"],
+            text_cols=["Description", fs_col, ak_col, pd_col],
             renames=renames,
         )
 
@@ -7135,6 +7199,11 @@ def main():
 
     # Load data with cache
     machine_df = _load_machine_df(_csv_mtime("machine_clean.csv"))
+    # Project the current facility's routing into legacy column names so
+    # compute_unit_labor / build_capacity_table see Henderson's PDI mapping
+    # at Henderson and Cypress's PDI mapping at Cypress — without changing
+    # those calculators or the cache key.
+    machine_df = _project_facility_routing(machine_df, inputs.get("location", "Henderson"))
     acc_df = _load_acc_df(_csv_mtime("acc_clean.csv"))
     item_master_df = _load_item_master_df(_csv_mtime("item_master.csv"))
     item_packages_df = _load_item_packages_df(_csv_mtime("item_packages.csv"))
@@ -7640,6 +7709,7 @@ def main():
             machine_df=machine_df, acc_df=acc_df, schedule_df=schedule_df,
             item_master_df=item_master_df, item_packages_df=item_packages_df,
             units=units, schedule_df_full=schedule_df_full,
+            location=inputs.get("location", "Henderson"),
         )
 
     # --- Footer ---------------------------------------------------------

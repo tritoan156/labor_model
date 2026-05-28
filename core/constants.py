@@ -87,6 +87,17 @@ def week_of_month_series(s):
 # === Locations ===
 LOCATIONS = ["Henderson", "Spartanburg", "Cypress"]
 
+# 3-letter facility codes used as column suffixes in machine_clean.csv for
+# per-facility station routing (e.g. "Final Station HND" / "Final Station
+# SPB" / "Final Station CYP"). Keep this in sync with LOCATIONS — adding a
+# new plant means adding both an entry here AND running the migration to
+# add the matching CSV columns.
+FACILITY_CODE = {
+    "Henderson":   "HND",
+    "Spartanburg": "SPB",
+    "Cypress":     "CYP",
+}
+
 # === Working time defaults ===
 DEFAULT_SHIFT_MINUTES = 480
 DEFAULT_WORKING_DAYS = 20

@@ -141,11 +141,19 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     qc_col   = _find(df.columns, "FN-QC", "QC")
     ship_col = _find(df.columns, "SHIP")
     eto_col  = _find(df.columns, "ETO")
-    final_station_col = _find(
-        df.columns, "Final Station", "Build Station", "Final Team", "Build Team",
-    )
-    acckit_station_col = _find(df.columns, "AccKIT Station", "AccKIT Team", "Acc KIT Station")
-    pdi_station_col = _find(df.columns, "PDI Station", "PDI Team")
+    # Per-facility routing — each station has 3 columns (HND/SPB/CYP) so the
+    # same SKU can route to different teams at different plants (e.g. PDI is
+    # done by the PDI team in Henderson but by the AccKIT team in Cypress).
+    # _find() is exact-substring, so the more specific suffix wins.
+    final_station_hnd_col = _find(df.columns, "Final Station HND")
+    final_station_spb_col = _find(df.columns, "Final Station SPB")
+    final_station_cyp_col = _find(df.columns, "Final Station CYP")
+    acckit_station_hnd_col = _find(df.columns, "AccKIT Station HND")
+    acckit_station_spb_col = _find(df.columns, "AccKIT Station SPB")
+    acckit_station_cyp_col = _find(df.columns, "AccKIT Station CYP")
+    pdi_station_hnd_col = _find(df.columns, "PDI Station HND")
+    pdi_station_spb_col = _find(df.columns, "PDI Station SPB")
+    pdi_station_cyp_col = _find(df.columns, "PDI Station CYP")
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
@@ -176,9 +184,19 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
         normalized = normalized.where(raw != "", default_station)
         return normalized.values
 
-    out["Final Station"]  = _read_station_col(final_station_col,  "Final")
-    out["AccKIT Station"] = _read_station_col(acckit_station_col, "AccKIT")
-    out["PDI Station"]    = _read_station_col(pdi_station_col,    "PDI")
+    # Emit all 9 per-facility routing columns. The caller (app.py) projects
+    # the right facility's columns into legacy "Final Station" /
+    # "AccKIT Station" / "PDI Station" names before invoking compute, so the
+    # downstream labor calculator keeps reading the legacy names unchanged.
+    out["Final Station HND"]  = _read_station_col(final_station_hnd_col,  "Final")
+    out["Final Station SPB"]  = _read_station_col(final_station_spb_col,  "Final")
+    out["Final Station CYP"]  = _read_station_col(final_station_cyp_col,  "Final")
+    out["AccKIT Station HND"] = _read_station_col(acckit_station_hnd_col, "AccKIT")
+    out["AccKIT Station SPB"] = _read_station_col(acckit_station_spb_col, "AccKIT")
+    out["AccKIT Station CYP"] = _read_station_col(acckit_station_cyp_col, "AccKIT")
+    out["PDI Station HND"]    = _read_station_col(pdi_station_hnd_col,    "PDI")
+    out["PDI Station SPB"]    = _read_station_col(pdi_station_spb_col,    "PDI")
+    out["PDI Station CYP"]    = _read_station_col(pdi_station_cyp_col,    "PDI")
     # Last-modified date — empty for rows never edited through the app.
     mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
     out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * n, index=df.index, dtype=object)

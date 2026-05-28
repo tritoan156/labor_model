@@ -141,32 +141,32 @@
     },
     "Wire Assembly": {
       "HC": 0,
-      "Conc": 4,
+      "Conc": 2,
       "Crew": 1
     },
     "Battery Assembly": {
       "HC": 0,
-      "Conc": 4,
+      "Conc": 0,
       "Crew": 2
     },
     "PM Acc (Headunit)": {
       "HC": 0,
-      "Conc": 3,
+      "Conc": 0,
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 5,
-      "Conc": 4,
+      "HC": 6,
+      "Conc": 6,
       "Crew": 1
     },
     "Com Accessories": {
-      "HC": 5,
+      "HC": 6,
       "Conc": 6,
       "Crew": 1
     },
     "Trailer Assembly": {
-      "HC": 2,
-      "Conc": 3,
+      "HC": 1,
+      "Conc": 2,
       "Crew": 1
     },
     "ETO": {
@@ -176,11 +176,11 @@
     },
     "Accessories KIT": {
       "HC": 0,
-      "Conc": 1,
+      "Conc": 0,
       "Crew": 1
     },
     "Final Assembly": {
-      "HC": 1,
+      "HC": 0,
       "Conc": 2,
       "Crew": 1
     },
@@ -195,7 +195,7 @@
       "Crew": 1
     },
     "Ship": {
-      "HC": 1,
+      "HC": 2,
       "Conc": 1,
       "Crew": 1
     }

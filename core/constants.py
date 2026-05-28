@@ -90,8 +90,8 @@ LOCATIONS = ["Henderson", "Spartanburg", "Cypress"]
 # === Working time defaults ===
 DEFAULT_SHIFT_MINUTES = 480
 DEFAULT_WORKING_DAYS = 20
-DEFAULT_SAFETY_FACTOR = 0.85
-DEFAULT_EFFICIENCY_FACTOR = 1.00  # 1.00 = no efficiency loss; 0.625 ≈ VSM productive-time rate
+DEFAULT_SAFETY_FACTOR = 1.00      # 1.00 = use 100% of capacity (no planning buffer)
+DEFAULT_EFFICIENCY_FACTOR = 0.50  # 0.50 = 50% productive time; 1.00 = no loss
 
 # === Utilization status thresholds ===
 # Drive the color flag for each station (🟢 OK / 🟡 Tight / 🟠 Near cap / 🔴 Over).

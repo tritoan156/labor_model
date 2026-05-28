@@ -4620,12 +4620,12 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
 
     col_cfg = {
         "SKU": st.column_config.TextColumn(
-            "SKU", width="medium",
+            "SKU", width="medium", pinned=True,
             help=("Editable — rename to fix a typo. ⚠️ Schedule rows using the "
                   "OLD SKU won't auto-update; re-point or re-upload them."),
         ),
         "Description": st.column_config.TextColumn(
-            "Description", width="large",
+            "Description", width="large", pinned=True,
             help="Editable — change the text and click 💾 Save.",
         ),
         fs_col: st.column_config.SelectboxColumn(
@@ -4662,8 +4662,12 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
             ),
             required=False,
         ),
-        "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
-        "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
+        "Used (qty)": st.column_config.NumberColumn(
+            "Used (qty)", disabled=True, pinned=True,
+        ),
+        "In schedule": st.column_config.CheckboxColumn(
+            "In schedule", disabled=True, pinned=True,
+        ),
         "Last Modified": st.column_config.TextColumn(
             "Last Modified", disabled=True,
             help="Date this row was last updated through the app. Blank = never edited.",
@@ -4757,16 +4761,20 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
 
     col_cfg = {
         "SKU": st.column_config.TextColumn(
-            "SKU", width="medium",
+            "SKU", width="medium", pinned=True,
             help=("Editable — rename to fix a typo. ⚠️ Schedule rows using the "
                   "OLD SKU won't auto-update; re-point or re-upload them."),
         ),
         "Description": st.column_config.TextColumn(
-            "Description", width="large",
+            "Description", width="large", pinned=True,
             help="Editable — change the text and click 💾 Save.",
         ),
-        "Used (qty)": st.column_config.NumberColumn("Used (qty)", disabled=True),
-        "In schedule": st.column_config.CheckboxColumn("In schedule", disabled=True),
+        "Used (qty)": st.column_config.NumberColumn(
+            "Used (qty)", disabled=True, pinned=True,
+        ),
+        "In schedule": st.column_config.CheckboxColumn(
+            "In schedule", disabled=True, pinned=True,
+        ),
         "Bat": st.column_config.NumberColumn(
             "Bat", disabled=True,
             help="Battery count for this accessory's FG family — from machine_clean.csv.",

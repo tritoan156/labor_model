@@ -3495,22 +3495,38 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
             max_util = util
             bottleneck = str(st_disp)
 
+    # "Potential" = what the staffed stations alone could absorb, ignoring
+    # the HC=0 gaps. Useful even in the infeasible case so planners see the
+    # upper bound they'd unlock by staffing the missing stations.
+    if max_util > 0:
+        potential_max = int(total_units // max_util)
+    else:
+        potential_max = int(total_units)
+
     if missing:
         return {"max_units": 0, "bottleneck": missing[0],
                 "max_util_safe": float("inf"), "infeasible": True,
-                "missing_stations": missing}
+                "missing_stations": missing,
+                "potential_max_units": potential_max,
+                "potential_bottleneck": bottleneck,
+                "potential_util_safe": max_util}
 
     if max_util <= 0:
         # No binding station — capacity is effectively unbounded for this mix.
         return {"max_units": int(total_units), "bottleneck": "",
-                "max_util_safe": 0.0, "infeasible": False, "missing_stations": []}
+                "max_util_safe": 0.0, "infeasible": False, "missing_stations": [],
+                "potential_max_units": int(total_units),
+                "potential_bottleneck": "", "potential_util_safe": 0.0}
 
     return {
-        "max_units": int(total_units // max_util) if max_util > 0 else int(total_units),
+        "max_units": potential_max,
         "bottleneck": bottleneck,
         "max_util_safe": max_util,
         "infeasible": False,
         "missing_stations": [],
+        "potential_max_units": potential_max,
+        "potential_bottleneck": bottleneck,
+        "potential_util_safe": max_util,
     }
 
 
@@ -3592,11 +3608,27 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     _mu = _max_units_at_current_mix(capacity, total_units)
     if _mu["infeasible"]:
         _ms = ", ".join(f"**{s}**" for s in _mu["missing_stations"])
+        _pm = int(_mu.get("potential_max_units", 0))
+        _pb = _mu.get("potential_bottleneck", "")
+        _pu = float(_mu.get("potential_util_safe", 0) or 0)
+        if _pm > 0 and _pb:
+            _ceiling = (
+                f" Once those are staffed, the next bottleneck would be "
+                f"**{_pb}** at {_pu:.0%} util — capping the mix at "
+                f"**{_pm:,} units**."
+            )
+        elif _pm > 0:
+            _ceiling = (
+                f" Once those are staffed, no other station is binding — "
+                f"the mix could go up to **{_pm:,} units**."
+            )
+        else:
+            _ceiling = ""
         st.error(
             f"🏭 **Max units this month at current mix: 0** — {_ms} "
             f"{'have' if len(_mu['missing_stations'])>1 else 'has'} no HC, "
             "but this mix needs it. Add headcount in the 👥 **Station "
-            "headcount** sidebar panel to unlock the plan."
+            f"headcount** sidebar panel to unlock the plan.{_ceiling}"
         )
     elif _mu["bottleneck"]:
         st.markdown(

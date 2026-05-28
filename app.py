@@ -3558,9 +3558,22 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
 
 def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", weekly_util=None):
     # =============================================================
-    # Compute headline numbers
+    # Empty-schedule guard FIRST — don't render zeroed KPIs and force
+    # the planner to scroll past meaningless 0s before reaching the
+    # "load a schedule" message at the bottom.
     # =============================================================
     total_units = len(units)
+    if total_units == 0 or capacity is None or capacity.empty:
+        st.info(
+            "ℹ️ **No schedule loaded.** Upload a CSV or type a few SKUs "
+            "in the sidebar to see your plan's capacity picture and "
+            "recommended actions."
+        )
+        return
+
+    # =============================================================
+    # Compute headline numbers
+    # =============================================================
     total_labor = int(units["total_labor"].sum())
     total_batt = int(units["Bat"].where(units["Battery"] > 0, 0).sum())
     total_hc = int(inputs["crew_config"]["HC"].sum())
@@ -3604,34 +3617,70 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     st.markdown("---")
 
     # =============================================================
-    # Hero KPIs — what an executive needs at a glance
+    # Hero KPIs — planner's decision row
+    # ----------------------------------------------------------------
+    # Story arc: what was asked (Planned) → what's possible (Buildable)
+    # → the gap as % (Coverage) → workload context (Total work). The
+    # bottleneck station name lives in the single-line readout BELOW
+    # this row, not in a 5th KPI column — keeps the headline focused on
+    # the question "can I build this plan?" and avoids naming the
+    # bottleneck in 4 different places.
     # =============================================================
     st.markdown("#### 📦 What this plan builds")
+
+    # Compute buildable + coverage once, reuse in the KPIs and the line below.
+    _mu = _max_units_at_current_mix(capacity, total_units)
+    if _mu["infeasible"]:
+        # Infeasible = a required station has HC=0. The "achievable right
+        # now" answer is 0; we surface the potential ceiling in the
+        # st.error block below so planners see what they'd unlock.
+        buildable_units = 0
+    else:
+        buildable_units = int(_mu.get("max_units", total_units) or 0)
+    coverage_pct = (buildable_units / total_units * 100.0) if total_units > 0 else 0.0
+    gap_units = buildable_units - total_units  # negative = short; positive = surplus
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
-        "Units to build", f"{total_units:,}",
+        "Units planned", f"{total_units:,}",
         help="Total finished-good units in this schedule (or manual entry).",
     )
     c2.metric(
+        "Buildable units", f"{buildable_units:,}",
+        help=(
+            "How many units of the current SKU mix the facility can actually "
+            "build this month, given HC × shift × days × efficiency × safety "
+            "and the bays × cycle throughput cap at every station."
+        ),
+    )
+    # Coverage delta-color: "inverse" means a NEGATIVE delta renders red
+    # (short of plan = bad) and a POSITIVE delta renders green (over plan).
+    c3.metric(
+        "Coverage", f"{coverage_pct:.0f}%",
+        delta=f"{gap_units:+,} vs plan" if total_units > 0 else None,
+        delta_color="inverse" if total_units > 0 else "off",
+        help=(
+            "Buildable ÷ Planned. <100% = the plan exceeds capacity at this "
+            "mix; ≥100% = you have headroom. The delta shows the unit gap."
+        ),
+    )
+    c4.metric(
         "Total work", f"{total_labor:,} p-min",
         help="Total person-minutes of labor required across all stations.",
     )
-    c3.metric(
-        "Batteries required", f"{total_batt:,}",
-        help="Total batteries that need to be assembled (BOSS units only).",
-    )
-    primary_bottleneck = over_stations[0] if over_stations else (
-        near_cap[0] if near_cap else (tight[0] if tight else "None")
-    )
-    c4.metric(
-        "Primary bottleneck", primary_bottleneck,
-        help="The station closest to or over capacity. Address this first.",
-    )
 
-    # Throughput headline — "given my available stations, how many units of
-    # this SKU mix can I build this month?" Reuses the capacity table's
-    # safe-util numbers, finds the bottleneck, and floors the scaling.
-    _mu = _max_units_at_current_mix(capacity, total_units)
+    # ----------------------------------------------------------------
+    # Bottleneck line — single, definitive, sits right under the KPIs.
+    # Replaces the previous markdown headline + 2-metric Labor/Throughput
+    # row + caption (the data is preserved inline here).
+    # ----------------------------------------------------------------
+    _lu = float(_mu.get("labor_max_util_safe", 0) or 0)
+    _tu = float(_mu.get("thru_max_util_safe", 0) or 0)
+    _lm = int(_mu.get("labor_max_units", 0) or 0)
+    _tm = int(_mu.get("thru_max_units", 0) or 0)
+    _lb = _mu.get("labor_bottleneck", "") or "—"
+    _tb = _mu.get("thru_bottleneck", "") or "—"
+
     if _mu["infeasible"]:
         _ms = ", ".join(f"**{s}**" for s in _mu["missing_stations"])
         _pm = int(_mu.get("potential_max_units", 0))
@@ -3656,50 +3705,18 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             "but this mix needs it. Add headcount in the 👥 **Station "
             f"headcount** sidebar panel to unlock the plan.{_ceiling}"
         )
-    elif _mu["bottleneck"]:
+    elif _mu.get("bottleneck"):
         st.markdown(
-            f"🏭 **Max units this month at current mix: "
-            f"{_mu['max_units']:,} units** — bottleneck: "
-            f"**{_mu['bottleneck']}** at {_mu['max_util_safe']:.0%} util."
+            f"🎯 **Bottleneck: {_mu['bottleneck']} · "
+            f"{_mu['max_util_safe']:.0%} util.** "
+            f"Labor cap: **{_lm:,}** ({_lb}) · "
+            f"Throughput cap: **{_tm:,}** ({_tb})."
         )
     else:
         st.markdown(
-            f"🏭 **Max units this month at current mix: "
-            f"{_mu['max_units']:,} units** — no binding station detected."
+            f"🎯 **No binding station detected.** "
+            f"Mix scales freely — capacity headroom available."
         )
-
-    # Split the cap by constraint type so planners see WHICH lever moves the
-    # number: labor (people-minutes — fix by adding HC or working days) vs
-    # throughput (bays × cycle — fix by adding concurrent bays or shortening
-    # cycle). Whichever is tighter is the headline number above.
-    _lu = float(_mu.get("labor_max_util_safe", 0) or 0)
-    _tu = float(_mu.get("thru_max_util_safe", 0) or 0)
-    _lm = int(_mu.get("labor_max_units", 0) or 0)
-    _tm = int(_mu.get("thru_max_units", 0) or 0)
-    _lb = _mu.get("labor_bottleneck", "") or "—"
-    _tb = _mu.get("thru_bottleneck", "") or "—"
-    if _lu > 0 or _tu > 0:
-        cL, cT = st.columns(2)
-        cL.metric(
-            "Labor-capped units",
-            f"{_lm:,}" if _lu > 0 else "—",
-            help=(
-                f"Person-minute constraint. Bottleneck: **{_lb}** at "
-                f"{_lu:.0%} of safe labor capacity. Relieve by adding HC, "
-                "working days, or shift minutes."
-            ),
-        )
-        cT.metric(
-            "Throughput-capped units",
-            f"{_tm:,}" if _tu > 0 else "—",
-            help=(
-                f"Bays × cycle-time constraint. Bottleneck: **{_tb}** at "
-                f"{_tu:.0%} of safe throughput. Relieve by adding "
-                "concurrent bays or shortening cycle time."
-            ),
-        )
-        cL.caption(f"Bottleneck: **{_lb}** · {_lu:.0%} util")
-        cT.caption(f"Bottleneck: **{_tb}** · {_tu:.0%} util")
 
     st.caption(
         "Scales the current SKU mix proportionally until any station hits "
@@ -3850,13 +3867,8 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     st.markdown("#### 🎯 Recommended actions")
     actions = []
 
-    # 0. Empty schedule — don't pretend everything is fine.
-    if total_units == 0 or capacity.empty:
-        st.info(
-            "ℹ️ **No schedule loaded.** Upload a CSV or type a few SKUs in the sidebar "
-            "to see recommendations tailored to your plan."
-        )
-        return
+    # NOTE: empty-schedule guard now fires at the very top of the tab
+    # (returns before any KPI rendering), so we don't repeat it here.
 
     # Separate over-capacity stations into "throughput-only" vs "needs HC".
     # A red Overall status can come from labor demand exceeding headcount

@@ -3653,12 +3653,15 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             "and the bays × cycle throughput cap at every station."
         ),
     )
-    # Coverage delta-color: "inverse" means a NEGATIVE delta renders red
-    # (short of plan = bad) and a POSITIVE delta renders green (over plan).
+    # Coverage delta-color: "normal" means a POSITIVE delta (surplus = more
+    # buildable than planned) renders green, and a NEGATIVE delta (short of
+    # plan = bad) renders red. That's the natural "growth is good" reading
+    # for this metric — we want planners to see red when they can't cover
+    # the plan and green when they have headroom.
     c3.metric(
         "Coverage", f"{coverage_pct:.0f}%",
-        delta=f"{gap_units:+,} vs plan" if total_units > 0 else None,
-        delta_color="inverse" if total_units > 0 else "off",
+        delta=f"{gap_units:+,} vs plan",
+        delta_color="normal",
         help=(
             "Buildable ÷ Planned. <100% = the plan exceeds capacity at this "
             "mix; ≥100% = you have headroom. The delta shows the unit gap."

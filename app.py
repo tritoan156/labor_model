@@ -3457,6 +3457,63 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
     return pd.DataFrame(out).fillna(0)
 
 
+def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
+    """How many units of the *current* SKU mix the facility can build this
+    month, given the available stations + sidebar settings.
+
+    Scales the schedule proportionally until any station hits its safe
+    capacity (HC × shift × days × efficiency × safety) OR its throughput cap
+    (bays × cycle). Returns the floor of that scaling, plus the bottleneck
+    station that dictated the limit. If any station the mix needs has HC = 0,
+    the build is infeasible (returns max_units = 0 and names the station).
+
+    Reuses ``build_capacity_table`` columns: HC, labor_demand, labor_util_safe,
+    thru_util_safe, station_display.
+    """
+    if capacity is None or capacity.empty or total_units <= 0:
+        return {"max_units": int(max(total_units, 0)), "bottleneck": "",
+                "max_util_safe": 0.0, "infeasible": False, "missing_stations": []}
+
+    missing: list[str] = []
+    max_util = 0.0
+    bottleneck = ""
+    for st_disp, row in capacity.iterrows():
+        labor_demand = float(row.get("labor_demand", 0) or 0)
+        # "need_per_day" is only > 0 when units route through this station,
+        # so it doubles as a "station is in the mix" signal alongside demand.
+        need_per_day = float(row.get("need_per_day", 0) or 0)
+        if labor_demand <= 0 and need_per_day <= 0:
+            continue
+        hc = int(row.get("HC", 0) or 0)
+        if hc <= 0:
+            missing.append(str(st_disp))
+            continue
+        util_labor = float(row.get("labor_util_safe", 0) or 0)
+        util_thru = float(row.get("thru_util_safe", 0) or 0)
+        util = max(util_labor, util_thru)
+        if util > max_util:
+            max_util = util
+            bottleneck = str(st_disp)
+
+    if missing:
+        return {"max_units": 0, "bottleneck": missing[0],
+                "max_util_safe": float("inf"), "infeasible": True,
+                "missing_stations": missing}
+
+    if max_util <= 0:
+        # No binding station — capacity is effectively unbounded for this mix.
+        return {"max_units": int(total_units), "bottleneck": "",
+                "max_util_safe": 0.0, "infeasible": False, "missing_stations": []}
+
+    return {
+        "max_units": int(total_units // max_util) if max_util > 0 else int(total_units),
+        "bottleneck": bottleneck,
+        "max_util_safe": max_util,
+        "infeasible": False,
+        "missing_stations": [],
+    }
+
+
 def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", weekly_util=None):
     # =============================================================
     # Compute headline numbers
@@ -3527,6 +3584,36 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     c4.metric(
         "Primary bottleneck", primary_bottleneck,
         help="The station closest to or over capacity. Address this first.",
+    )
+
+    # Throughput headline — "given my available stations, how many units of
+    # this SKU mix can I build this month?" Reuses the capacity table's
+    # safe-util numbers, finds the bottleneck, and floors the scaling.
+    _mu = _max_units_at_current_mix(capacity, total_units)
+    if _mu["infeasible"]:
+        _ms = ", ".join(f"**{s}**" for s in _mu["missing_stations"])
+        st.error(
+            f"🏭 **Max units this month at current mix: 0** — {_ms} "
+            f"{'have' if len(_mu['missing_stations'])>1 else 'has'} no HC, "
+            "but this mix needs it. Add headcount in the 👥 **Station "
+            "headcount** sidebar panel to unlock the plan."
+        )
+    elif _mu["bottleneck"]:
+        st.markdown(
+            f"🏭 **Max units this month at current mix: "
+            f"{_mu['max_units']:,} units** — bottleneck: "
+            f"**{_mu['bottleneck']}** at {_mu['max_util_safe']:.0%} util."
+        )
+    else:
+        st.markdown(
+            f"🏭 **Max units this month at current mix: "
+            f"{_mu['max_units']:,} units** — no binding station detected."
+        )
+    st.caption(
+        "Scales the current SKU mix proportionally until any station hits "
+        "its safe capacity (HC × shift × days × efficiency × safety) or "
+        "throughput cap. Relieve the bottleneck by adding HC to that "
+        "station in the 👥 **Station headcount** panel."
     )
 
     st.markdown("#### 👥 Headcount picture")

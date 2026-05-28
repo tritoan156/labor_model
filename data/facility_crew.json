@@ -180,8 +180,8 @@
       "Crew": 1
     },
     "Final Assembly": {
-      "HC": 0,
-      "Conc": 2,
+      "HC": 1,
+      "Conc": 1,
       "Crew": 1
     },
     "PDI": {

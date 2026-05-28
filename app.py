@@ -4009,7 +4009,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     st.plotly_chart(fig, use_container_width=True)
 
 
-def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None):
+def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, total_units: int = 0):
     st.header("📊 Capacity vs Demand")
     st.markdown(
         "**Are stations comfortably staffed for this plan?** "
@@ -4021,6 +4021,69 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None):
         f"buffer: {inputs['safety']:.2f} · "
         f"productive time: {inputs['efficiency']:.3f}"
     )
+
+    # =============================================================
+    # Headline caps — how many units this mix can build, broken out by
+    # which constraint is biting (labor person-mins vs throughput bays).
+    # Mirrors the Overview KPI so planners working in the Capacity tab
+    # don't need to bounce back to Overview to see the upper bound.
+    # =============================================================
+    if total_units > 0:
+        _mu = _max_units_at_current_mix(capacity, total_units)
+        _lu = float(_mu.get("labor_max_util_safe", 0) or 0)
+        _tu = float(_mu.get("thru_max_util_safe", 0) or 0)
+        _lm = int(_mu.get("labor_max_units", 0) or 0)
+        _tm = int(_mu.get("thru_max_units", 0) or 0)
+        _lb = _mu.get("labor_bottleneck", "") or "—"
+        _tb = _mu.get("thru_bottleneck", "") or "—"
+        if _lu > 0 or _tu > 0:
+            st.markdown("#### 🏭 Unit caps for this mix")
+            if _mu["infeasible"]:
+                _ms = ", ".join(f"**{s}**" for s in _mu["missing_stations"])
+                st.warning(
+                    f"⚠️ **{_ms}** {'have' if len(_mu['missing_stations'])>1 else 'has'} no HC — "
+                    "current build is blocked at **0 units**. Caps below show "
+                    "what would be possible once those stations are staffed."
+                )
+            cP, cL, cT = st.columns(3)
+            _pm = int(_mu.get("potential_max_units", 0) or 0)
+            _pb = _mu.get("potential_bottleneck", "") or "—"
+            _pu = float(_mu.get("potential_util_safe", 0) or 0)
+            cP.metric(
+                "Max units (tighter cap)",
+                f"{_pm:,}" if _pu > 0 else f"{total_units:,}",
+                help=(
+                    f"The smaller of the labor and throughput caps. "
+                    f"Bottleneck: **{_pb}** at {_pu:.0%} util."
+                ),
+            )
+            cL.metric(
+                "Labor-capped units",
+                f"{_lm:,}" if _lu > 0 else "—",
+                help=(
+                    f"Person-minute constraint. Bottleneck: **{_lb}** at "
+                    f"{_lu:.0%} of safe labor capacity. Relieve by adding "
+                    "HC, working days, or shift minutes."
+                ),
+            )
+            cT.metric(
+                "Throughput-capped units",
+                f"{_tm:,}" if _tu > 0 else "—",
+                help=(
+                    f"Bays × cycle-time constraint. Bottleneck: **{_tb}** "
+                    f"at {_tu:.0%} of safe throughput. Relieve by adding "
+                    "concurrent bays or shortening cycle time."
+                ),
+            )
+            cP.caption(f"Bottleneck: **{_pb}**")
+            cL.caption(f"Bottleneck: **{_lb}** · {_lu:.0%} util")
+            cT.caption(f"Bottleneck: **{_tb}** · {_tu:.0%} util")
+            st.caption(
+                f"Current plan: **{total_units:,} units**. Caps scale the "
+                "current SKU mix proportionally until the named station "
+                "hits its safe capacity."
+            )
+            st.markdown("---")
 
     # =============================================================
     # Utilization chart (most scannable)
@@ -7543,7 +7606,7 @@ def main():
         if units.empty:
             _empty_state("Capacity")
         else:
-            tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type)
+            tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type, total_units=len(units))
     with tabs[3]:
         if units.empty:
             _empty_state("Recommendations")

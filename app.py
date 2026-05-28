@@ -3477,6 +3477,12 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
     missing: list[str] = []
     max_util = 0.0
     bottleneck = ""
+    # Track labor and throughput separately so we can tell the planner WHICH
+    # constraint is biting (person-mins vs bays/cycle) at each binding station.
+    labor_max_util = 0.0
+    labor_bottleneck = ""
+    thru_max_util = 0.0
+    thru_bottleneck = ""
     for st_disp, row in capacity.iterrows():
         labor_demand = float(row.get("labor_demand", 0) or 0)
         # "need_per_day" is only > 0 when units route through this station,
@@ -3490,18 +3496,35 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
             continue
         util_labor = float(row.get("labor_util_safe", 0) or 0)
         util_thru = float(row.get("thru_util_safe", 0) or 0)
+        if util_labor > labor_max_util:
+            labor_max_util = util_labor
+            labor_bottleneck = str(st_disp)
+        if util_thru > thru_max_util:
+            thru_max_util = util_thru
+            thru_bottleneck = str(st_disp)
         util = max(util_labor, util_thru)
         if util > max_util:
             max_util = util
             bottleneck = str(st_disp)
 
+    def _cap(util: float) -> int:
+        return int(total_units // util) if util > 0 else int(total_units)
+
     # "Potential" = what the staffed stations alone could absorb, ignoring
     # the HC=0 gaps. Useful even in the infeasible case so planners see the
     # upper bound they'd unlock by staffing the missing stations.
-    if max_util > 0:
-        potential_max = int(total_units // max_util)
-    else:
-        potential_max = int(total_units)
+    potential_max = _cap(max_util)
+    labor_cap_units = _cap(labor_max_util)
+    thru_cap_units = _cap(thru_max_util)
+
+    extras = {
+        "labor_max_units": labor_cap_units,
+        "labor_bottleneck": labor_bottleneck,
+        "labor_max_util_safe": labor_max_util,
+        "thru_max_units": thru_cap_units,
+        "thru_bottleneck": thru_bottleneck,
+        "thru_max_util_safe": thru_max_util,
+    }
 
     if missing:
         return {"max_units": 0, "bottleneck": missing[0],
@@ -3509,14 +3532,16 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
                 "missing_stations": missing,
                 "potential_max_units": potential_max,
                 "potential_bottleneck": bottleneck,
-                "potential_util_safe": max_util}
+                "potential_util_safe": max_util,
+                **extras}
 
     if max_util <= 0:
         # No binding station — capacity is effectively unbounded for this mix.
         return {"max_units": int(total_units), "bottleneck": "",
                 "max_util_safe": 0.0, "infeasible": False, "missing_stations": [],
                 "potential_max_units": int(total_units),
-                "potential_bottleneck": "", "potential_util_safe": 0.0}
+                "potential_bottleneck": "", "potential_util_safe": 0.0,
+                **extras}
 
     return {
         "max_units": potential_max,
@@ -3527,6 +3552,7 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
         "potential_max_units": potential_max,
         "potential_bottleneck": bottleneck,
         "potential_util_safe": max_util,
+        **extras,
     }
 
 
@@ -3641,6 +3667,40 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             f"🏭 **Max units this month at current mix: "
             f"{_mu['max_units']:,} units** — no binding station detected."
         )
+
+    # Split the cap by constraint type so planners see WHICH lever moves the
+    # number: labor (people-minutes — fix by adding HC or working days) vs
+    # throughput (bays × cycle — fix by adding concurrent bays or shortening
+    # cycle). Whichever is tighter is the headline number above.
+    _lu = float(_mu.get("labor_max_util_safe", 0) or 0)
+    _tu = float(_mu.get("thru_max_util_safe", 0) or 0)
+    _lm = int(_mu.get("labor_max_units", 0) or 0)
+    _tm = int(_mu.get("thru_max_units", 0) or 0)
+    _lb = _mu.get("labor_bottleneck", "") or "—"
+    _tb = _mu.get("thru_bottleneck", "") or "—"
+    if _lu > 0 or _tu > 0:
+        cL, cT = st.columns(2)
+        cL.metric(
+            "Labor-capped units",
+            f"{_lm:,}" if _lu > 0 else "—",
+            help=(
+                f"Person-minute constraint. Bottleneck: **{_lb}** at "
+                f"{_lu:.0%} of safe labor capacity. Relieve by adding HC, "
+                "working days, or shift minutes."
+            ),
+        )
+        cT.metric(
+            "Throughput-capped units",
+            f"{_tm:,}" if _tu > 0 else "—",
+            help=(
+                f"Bays × cycle-time constraint. Bottleneck: **{_tb}** at "
+                f"{_tu:.0%} of safe throughput. Relieve by adding "
+                "concurrent bays or shortening cycle time."
+            ),
+        )
+        cL.caption(f"Bottleneck: **{_lb}** · {_lu:.0%} util")
+        cT.caption(f"Bottleneck: **{_tb}** · {_tu:.0%} util")
+
     st.caption(
         "Scales the current SKU mix proportionally until any station hits "
         "its safe capacity (HC × shift × days × efficiency × safety) or "

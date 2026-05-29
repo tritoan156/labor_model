@@ -1,0 +1,389 @@
+"""Tests for core.labor_calculator — the per-unit labor and capacity math.
+
+Expected values are hand-computed from the documented business rules so the
+suite pins the calculations (and the audit fixes) against regression.
+"""
+import numpy as np
+import pandas as pd
+import pytest
+
+from core.labor_calculator import (
+    classify_unit, compute_unit_labor, unit_labor_split, expand_schedule,
+    station_demand_table, cycle_for_unit, weighted_avg_cycle,
+    build_capacity_table, _status_emoji, _overall_status,
+    battery_demand_by_sku, battery_demand_by_type,
+)
+from core.constants import STATION_KEYS, DEFAULT_BATT_RAW, DEFAULT_NAMEPLATE_PREP
+
+
+# --------------------------------------------------------------------------
+# Fixtures / builders
+# --------------------------------------------------------------------------
+MACHINE_COLS = ["Bat", "Warehouse", "Wire", "Trailer", "QC", "Ship",
+                "FN_Assy", "PDI", "ETO",
+                "Final Station", "AccKIT Station", "PDI Station"]
+ACC_COLS = ["BattSubRaw", "Nameplate Prep", "Warehouse",
+            "PMAcc", "GenAcc", "ComAcc", "AccKIT"]
+
+
+def make_machine_df(rows, include_eto=True):
+    """rows: {fg_base: {column: value}}. Missing columns default to 0 /
+    default routing. Pass include_eto=False to omit the ETO column entirely
+    (exercises the legacy fallback)."""
+    cols = [c for c in MACHINE_COLS if include_eto or c != "ETO"]
+    data = {}
+    for fg, ov in rows.items():
+        r = {c: 0 for c in cols}
+        r["Final Station"] = "Final"
+        r["AccKIT Station"] = "AccKIT"
+        r["PDI Station"] = "PDI"
+        r.update(ov)
+        data[fg] = r
+    return pd.DataFrame.from_dict(data, orient="index")
+
+
+def make_acc_df(rows):
+    data = {}
+    for sku, ov in rows.items():
+        r = {c: 0 for c in ACC_COLS}
+        r.update(ov)
+        data[sku] = r
+    return pd.DataFrame.from_dict(data, orient="index")
+
+
+def make_units_df(units):
+    """units: list of dicts; missing station columns default to 0."""
+    rows = []
+    for i, u in enumerate(units, start=1):
+        r = {k: 0 for k in STATION_KEYS}
+        r.update({"Class": "STD", "Bat": 0, "unit_id": i,
+                  "fg_base": "FG", "batt_type": "25-12"})
+        r.update(u)
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def make_crew(d):
+    """d: {station_display: (HC, Conc, Crew)}."""
+    return pd.DataFrame(
+        [{"HC": hc, "Conc": c, "Crew": cr} for (hc, c, cr) in d.values()],
+        index=list(d.keys()),
+    )
+
+
+# --------------------------------------------------------------------------
+# classify_unit
+# --------------------------------------------------------------------------
+class TestClassifyUnit:
+    def test_hs(self):
+        assert classify_unit("BOSS70HS-001") == "HS"
+
+    def test_ht(self):
+        assert classify_unit("BOSSHT-200") == "HT"
+
+    def test_std(self):
+        assert classify_unit("BOSS125-004") == "STD"
+
+    def test_hs_precedence_over_ht(self):
+        # "HS" is checked before "HT".
+        assert classify_unit("BOSSHSHT") == "HS"
+
+
+# --------------------------------------------------------------------------
+# compute_unit_labor / unit_labor_split
+# --------------------------------------------------------------------------
+class TestComputeUnitLabor:
+    def test_multi_battery_machine_default(self):
+        # BOSS220HS-002, Bat=3, acc supplies no battery → machine default:
+        # batt = DEFAULT_BATT_RAW*3 + DEFAULT_NAMEPLATE_PREP = 320*3+10 = 970.
+        m = make_machine_df({"BOSS220HS-002": {
+            "Bat": 3, "Warehouse": 5, "Wire": 10, "Trailer": 20,
+            "QC": 8, "Ship": 4, "FN_Assy": 45, "PDI": 12, "ETO": 0}})
+        a = make_acc_df({"ACC1": {"Warehouse": 2, "PMAcc": 15, "AccKIT": 7}})
+        r = compute_unit_labor("BOSS220HS-002", "ACC1", m, a)
+        assert r["Battery"] == DEFAULT_BATT_RAW * 3 + DEFAULT_NAMEPLATE_PREP == 970
+        assert r["Warehouse"] == 7      # 5 (machine) + 2 (acc)
+        assert r["Final"] == 45
+        assert r["AccKIT"] == 7
+        assert r["PDI"] == 12
+        total = sum(r.get(s, 0) for s in STATION_KEYS)
+        assert total == 1098
+
+    def test_acc_supplied_battery(self):
+        # acc supplies BattSubRaw/Nameplate → batt = btr*bat + nameplate.
+        m = make_machine_df({"BOSS25-006": {"Bat": 1, "FN_Assy": 20}})
+        a = make_acc_df({"ACC1": {"BattSubRaw": 300, "Nameplate Prep": 10}})
+        r = compute_unit_labor("BOSS25-006", "ACC1", m, a)
+        assert r["Battery"] == 300 * 1 + 10 == 310
+
+    def test_non_boss_has_no_battery(self):
+        # PDS/SDG may carry Bat=1 in the catalog but have no real batteries.
+        m = make_machine_df({"PDS-100": {"Bat": 1, "FN_Assy": 30}})
+        r = compute_unit_labor("PDS-100", None, m, make_acc_df({}))
+        assert r["Bat"] == 0
+        assert r["Battery"] == 0
+
+    def test_eto_from_catalog(self):
+        m = make_machine_df({"BOSS400-001": {"ETO": 960, "FN_Assy": 0}})
+        r = compute_unit_labor("BOSS400-001", None, m, make_acc_df({}))
+        assert r["ETO"] == 960
+
+    def test_eto_legacy_fallback_when_column_missing(self):
+        m = make_machine_df({"BOSS220X": {"FN_Assy": 0}}, include_eto=False)
+        r = compute_unit_labor("BOSS220X", None, m, make_acc_df({}))
+        assert r["ETO"] == 960  # BOSS220 → legacy 960
+        m2 = make_machine_df({"BOSS70-001": {"FN_Assy": 0}}, include_eto=False)
+        r2 = compute_unit_labor("BOSS70-001", None, m2, make_acc_df({}))
+        assert r2["ETO"] == 0
+
+    def test_routing_final_to_comacc(self):
+        # FN_Assy routed to ComAcc lands at ComAcc, not Final; total unchanged.
+        m = make_machine_df({"PDS-9": {"FN_Assy": 45, "Final Station": "ComAcc"}})
+        r = compute_unit_labor("PDS-9", None, m, make_acc_df({}))
+        assert r["Final"] == 0
+        assert r["ComAcc"] == 45
+
+    def test_missing_fg_returns_none(self):
+        assert compute_unit_labor("NOPE", None, make_machine_df({"X": {}}),
+                                  make_acc_df({})) is None
+
+    def test_nan_machine_cell_does_not_poison_total(self):
+        # Audit fix: a NaN machine cell must be treated as 0, not propagate NaN
+        # into total_labor, and the machine/acc split must still equal the total.
+        m = make_machine_df({"BOSS125-001": {"Bat": 0, "Wire": np.nan,
+                                             "FN_Assy": 30, "QC": 5}})
+        r = compute_unit_labor("BOSS125-001", None, m, make_acc_df({}))
+        total = sum(r.get(s, 0) for s in STATION_KEYS)
+        assert not np.isnan(total)
+        assert r["Wire"] == 0.0
+
+    def test_bat_nan_does_not_crash(self):
+        # Audit fix: int(m["Bat"]) on a NaN previously raised ValueError.
+        m = make_machine_df({"BOSS25-006": {"Bat": np.nan, "FN_Assy": 10}})
+        r = compute_unit_labor("BOSS25-006", None, m, make_acc_df({}))
+        assert r is not None
+        assert r["Bat"] == 0
+
+
+class TestUnitLaborSplit:
+    @pytest.mark.parametrize("fg,mrow,acc,arow", [
+        ("BOSS220HS-002", {"Bat": 3, "Warehouse": 5, "Wire": 10, "Trailer": 20,
+                           "QC": 8, "Ship": 4, "FN_Assy": 45, "PDI": 12, "ETO": 0},
+         "ACC1", {"Warehouse": 2, "PMAcc": 15, "AccKIT": 7}),
+        ("BOSS25-006", {"Bat": 1, "FN_Assy": 20},
+         "ACC2", {"BattSubRaw": 300, "Nameplate Prep": 10, "GenAcc": 5}),
+        ("PDS-9", {"FN_Assy": 45, "Final Station": "ComAcc", "QC": 3}, None, {}),
+    ])
+    def test_split_sums_to_total(self, fg, mrow, acc, arow):
+        m = make_machine_df({fg: mrow})
+        a = make_acc_df({acc: arow}) if acc else make_acc_df({})
+        full = compute_unit_labor(fg, acc, m, a)
+        total = sum(full.get(s, 0) for s in STATION_KEYS)
+        split = unit_labor_split(fg, acc, m, a)
+        assert split["machine"] + split["acc"] == pytest.approx(total)
+
+    def test_split_nan_cell_still_matches_total(self):
+        m = make_machine_df({"BOSS125-001": {"Bat": 0, "Wire": np.nan,
+                                             "FN_Assy": 30, "QC": 5}})
+        full = compute_unit_labor("BOSS125-001", None, m, make_acc_df({}))
+        total = sum(full.get(s, 0) for s in STATION_KEYS)
+        split = unit_labor_split("BOSS125-001", None, m, make_acc_df({}))
+        assert split["machine"] + split["acc"] == pytest.approx(total)
+
+
+# --------------------------------------------------------------------------
+# expand_schedule / station_demand_table
+# --------------------------------------------------------------------------
+class TestExpandSchedule:
+    def _schedule(self):
+        return pd.DataFrame([
+            {"BUILD QTY": 2, "FG_BASE": "BOSS25-006", "FG_RAW": "BOSS25-006",
+             "ACC": "ACC1", "DECAL": "", "CUSTOMER NAME": "X", "CARRYOVER": False},
+            {"BUILD QTY": 1, "FG_BASE": "BOSS220HS-002", "FG_RAW": "BOSS220HS-002",
+             "ACC": "", "DECAL": "", "CUSTOMER NAME": "Y", "CARRYOVER": False},
+            {"BUILD QTY": 5, "FG_BASE": "NOPE", "FG_RAW": "NOPE",
+             "ACC": "", "DECAL": "", "CUSTOMER NAME": "Z", "CARRYOVER": False},
+            {"BUILD QTY": 1, "FG_BASE": "BOSS25-006", "FG_RAW": "BOSS25-006",
+             "ACC": "ACCX", "DECAL": "", "CUSTOMER NAME": "W", "CARRYOVER": True},
+        ])
+
+    def _catalog(self):
+        m = make_machine_df({
+            "BOSS25-006": {"Bat": 1, "FN_Assy": 20, "QC": 5},
+            "BOSS220HS-002": {"Bat": 3, "FN_Assy": 45},
+        })
+        a = make_acc_df({"ACC1": {"PMAcc": 10}})
+        return m, a
+
+    def test_qty_expansion_and_skips(self):
+        m, a = self._catalog()
+        units = expand_schedule(self._schedule(), m, a)
+        # 2 + 1 + (NOPE skipped) + 1 = 4 units
+        assert len(units) == 4
+        assert units.attrs["skipped_fg"] == ["NOPE"]
+        assert "ACCX" in units.attrs["unknown_acc"]
+        assert (units["total_labor"] > 0).all()
+
+    def test_station_demand_table(self):
+        m, a = self._catalog()
+        units = expand_schedule(self._schedule(), m, a)
+        demand = station_demand_table(units)
+        # QC labor = 5 per BOSS25-006 unit × 3 such units = 15.
+        assert demand.loc["QC", "demand"] == pytest.approx(15.0)
+        assert demand.loc["QC", "units_touching"] == 3
+
+
+# --------------------------------------------------------------------------
+# cycle_for_unit / weighted_avg_cycle
+# --------------------------------------------------------------------------
+class TestCycleForUnit:
+    def test_standard(self):
+        assert cycle_for_unit("QC", 100, "STD", 4) == 25
+
+    def test_final_hs_uses_crew_one(self):
+        # HS Final uses HS_FINAL_CREW=1, not the station crew.
+        assert cycle_for_unit("Final", 30, "HS", 2) == 30
+
+    def test_zero_labor(self):
+        assert cycle_for_unit("QC", 0, "STD", 4) == 0
+
+    def test_crew_zero_no_crash(self):
+        # Audit fix: crew=0 returned a ZeroDivisionError; now returns 0.0.
+        assert cycle_for_unit("QC", 100, "STD", 0) == 0.0
+
+
+class TestWeightedAvgCycle:
+    def test_volume_weighted_mean(self):
+        # Final: two STD (60/2=30) and one HS (30/1=30) → mean 30.
+        units = make_units_df([
+            {"Final": 60, "Class": "STD"},
+            {"Final": 60, "Class": "STD"},
+            {"Final": 30, "Class": "HS"},
+        ])
+        assert weighted_avg_cycle(units, "Final", crew=2) == pytest.approx(30.0)
+
+    def test_reconstructs_total_cell_time(self):
+        # units_touching × avg_cycle must equal the sum of per-unit cycles
+        # (the identity that keeps thru_util exact).
+        units = make_units_df([
+            {"QC": 100, "Class": "STD"},
+            {"QC": 40, "Class": "STD"},
+        ])
+        avg = weighted_avg_cycle(units, "QC", crew=2)
+        touching = int((units["QC"] > 0).sum())
+        assert touching * avg == pytest.approx((100 / 2) + (40 / 2))
+
+
+# --------------------------------------------------------------------------
+# build_capacity_table
+# --------------------------------------------------------------------------
+class TestBuildCapacityTable:
+    def test_labor_and_throughput_qc(self):
+        units = make_units_df([{"QC": 100}, {"QC": 100}])
+        crew = make_crew({"QC": (4, 4, 1)})
+        cap = build_capacity_table(units, crew, shift_minutes=480,
+                                   working_days=20, safety_factor=1.0,
+                                   efficiency_factor=0.5)
+        row = cap.loc["QC"]
+        assert row["labor_demand"] == pytest.approx(200.0)
+        assert row["labor_cap_safe"] == pytest.approx(4 * 480 * 20 * 0.5)  # 19200
+        assert row["labor_util_safe"] == pytest.approx(200 / 19200)
+        assert row["required_hc"] == 1          # ceil(200 / 4800)
+        assert row["avg_cycle"] == pytest.approx(100.0)
+        assert row["need_per_day"] == pytest.approx(2 / 20)
+        assert row["thru_cap_safe"] == pytest.approx(4 * (480 / 100) * 0.5)  # 9.6
+        assert row["overall_status"].startswith("🟢")
+
+    def test_battery_branch_counts_batteries(self):
+        units = make_units_df([
+            {"Battery": 970, "Bat": 3, "fg_base": "BOSS220HS-002"},
+        ])
+        crew = make_crew({"Battery Assembly": (8, 4, 2)})
+        cap = build_capacity_table(units, crew, 480, 20, 1.0, 0.5)
+        row = cap.loc["Battery Assembly"]
+        assert row["units_or_batt"] == 3          # batteries, not units
+        assert row["avg_cycle"] == 170            # BATTERY_CYCLE_MINUTES
+
+    def test_conc_zero_with_demand_flags_red(self):
+        # Audit fix: HC>0 but Conc=0 (no bays) + demand → 🔴, not false 🟢.
+        units = make_units_df([{"QC": 100}, {"QC": 100}])
+        crew = make_crew({"QC": (4, 0, 1)})
+        cap = build_capacity_table(units, crew, 480, 20, 1.0, 0.5)
+        row = cap.loc["QC"]
+        assert row["thru_status_safe"] == "🔴"
+        assert row["overall_status"].startswith("🔴")
+
+    def test_crew_zero_no_crash(self):
+        # Audit fix: Crew=0 previously crashed the whole table.
+        units = make_units_df([{"QC": 100}, {"QC": 100}])
+        crew = make_crew({"QC": (4, 4, 0)})
+        cap = build_capacity_table(units, crew, 480, 20, 1.0, 0.5)  # no raise
+        assert cap.loc["QC"]["overall_status"].startswith("🔴")
+
+    def test_zero_working_days_guarded(self):
+        units = make_units_df([{"QC": 100}])
+        crew = make_crew({"QC": (4, 4, 1)})
+        cap = build_capacity_table(units, crew, 480, 0, 1.0, 0.5)  # no raise
+        assert cap.loc["QC"]["required_hc"] == 0
+
+
+# --------------------------------------------------------------------------
+# status emojis
+# --------------------------------------------------------------------------
+class TestStatusEmoji:
+    def test_thresholds(self):
+        assert _status_emoji(1.01) == "🔴"   # > OVER (1.00)
+        assert _status_emoji(1.00) == "🟠"   # exactly 1.00 is NOT over
+        assert _status_emoji(0.95) == "🟠"   # > NEAR (0.90)
+        assert _status_emoji(0.90) == "🟡"   # exactly 0.90 → tight
+        assert _status_emoji(0.80) == "🟡"   # > TIGHT (0.75)
+        assert _status_emoji(0.75) == "🟢"   # exactly 0.75 → ok
+        assert _status_emoji(0.10) == "🟢"
+
+    def test_missing_station(self):
+        assert _status_emoji(0.0, station_missing=True, has_demand=False) == "⚪"
+        assert _status_emoji(0.0, station_missing=True, has_demand=True) == "🔴"
+
+
+class TestOverallStatus:
+    def _row(self, l_s, l_r, t_s, t_r, missing=False, demand=100):
+        return pd.Series({
+            "labor_status_safe": l_s, "labor_status_raw": l_r,
+            "thru_status_safe": t_s, "thru_status_raw": t_r,
+            "station_missing": missing, "labor_demand": demand,
+        })
+
+    def test_worst_of_four(self):
+        assert _overall_status(self._row("🟢", "🟢", "🟠", "🟢")) == "🟠 NEAR-CAP"
+        assert _overall_status(self._row("🟢", "🔴", "🟢", "🟢")) == "🔴 OVER"
+        assert _overall_status(self._row("🟢", "🟢", "🟢", "🟢")) == "🟢 OK"
+        assert _overall_status(self._row("🟡", "🟢", "🟢", "🟢")) == "🟡 TIGHT"
+
+    def test_missing_precedence(self):
+        assert _overall_status(self._row("🔴", "🔴", "🔴", "🔴",
+                                         missing=True, demand=100)) == "🔴 NO STATION"
+        assert _overall_status(self._row("⚪", "⚪", "⚪", "⚪",
+                                         missing=True, demand=0)) == "⚪ N/A"
+
+
+# --------------------------------------------------------------------------
+# battery demand
+# --------------------------------------------------------------------------
+class TestBatteryDemand:
+    def _units(self):
+        return make_units_df([
+            {"Battery": 970, "Bat": 3, "fg_base": "BOSS220HS-002", "batt_type": "125-20"},
+            {"Battery": 970, "Bat": 3, "fg_base": "BOSS220HS-002", "batt_type": "125-20"},
+            {"Battery": 330, "Bat": 1, "fg_base": "BOSS25-006", "batt_type": "25-12"},
+        ])
+
+    def test_by_sku(self):
+        g = battery_demand_by_sku(self._units()).set_index("fg_base")
+        assert g.loc["BOSS220HS-002", "total_batteries"] == 6   # 2 units × 3
+        assert g.loc["BOSS25-006", "total_batteries"] == 1
+        assert g["pct_of_total"].sum() == pytest.approx(1.0)
+
+    def test_by_type(self):
+        g = battery_demand_by_type(self._units()).set_index("batt_type")
+        assert g.loc["125-20", "total_batteries"] == 6
+        assert g.loc["25-12", "total_batteries"] == 1

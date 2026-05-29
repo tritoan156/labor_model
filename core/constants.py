@@ -214,7 +214,10 @@ def get_battery_type(fg_base: str) -> str:
     if s.startswith("BOSS25"):
         return "25-12"
     if s.startswith("BOSS70"):
-        if fg_base in ("BOSS70-012", "BOSS70-001"):
+        # Compare the normalized value (upper+strip), not the raw fg_base, so
+        # lower-case / whitespace-padded inputs (e.g. "boss70-012", "BOSS70-012 ")
+        # still classify as the 70-16 Hybrid rather than falling through to 70-20.
+        if s in ("BOSS70-012", "BOSS70-001"):
             return "70-16"
         return "70-20"
     if s.startswith("BOSS125") or s.startswith("BOSS220") or s.startswith("BOSS400"):

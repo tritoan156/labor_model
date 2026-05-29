@@ -1,0 +1,5 @@
+# Dev/test-only dependencies. NOT installed on Streamlit Cloud (which reads
+# requirements.txt). Install locally to run the test suite:
+#   ./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+#   ./.venv/Scripts/python.exe -m pytest
+pytest>=8

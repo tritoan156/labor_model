@@ -66,8 +66,22 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     # Bat=1 in the source machine catalog, but they have no batteries — so we
     # force their battery count and battery labor to 0.
     is_boss = str(fg_base).upper().startswith("BOSS")
-    bat_in_catalog = int(m["Bat"]) if m["Bat"] else 0
+    bat_in_catalog = int(m["Bat"]) if (pd.notna(m["Bat"]) and m["Bat"]) else 0
     bat = bat_in_catalog if is_boss else 0
+
+    # Defensive helper — read a machine labor column, returning 0 for a
+    # missing/NaN cell. Mirrors ``unit_labor_split._m`` so the per-station
+    # labor and the machine/acc split treat NaN identically (keeps their
+    # sums equal even if a catalog cell ever slips through un-sanitized).
+    def _m(col: str) -> float:
+        try:
+            v = m[col]
+        except (KeyError, TypeError):
+            return 0.0
+        try:
+            return float(v) if pd.notna(v) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
 
     # Defensive helper — read a labor column from the accessory row,
     # returning 0 if the column is missing (handles legacy CSVs that
@@ -149,18 +163,18 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     result = {
         "Class": cls,
         "Bat": bat,
-        "Warehouse": m["Warehouse"] + _acc("Warehouse"),
-        "Wire": m["Wire"],
+        "Warehouse": _m("Warehouse") + _acc("Warehouse"),
+        "Wire": _m("Wire"),
         "Battery": batt_total,
         "PMAcc": _acc("PMAcc"),
         "GenAcc": _acc("GenAcc"),
         "ComAcc": _acc("ComAcc"),
-        "Trailer": m["Trailer"],
+        "Trailer": _m("Trailer"),
         "AccKIT": 0.0,
         "Final": 0.0,
         "PDI": 0.0,
-        "QC": m["QC"],
-        "Ship": m["Ship"],
+        "QC": _m("QC"),
+        "Ship": _m("Ship"),
         "ETO": eto,
     }
     # Route each labor line to its target station. When the target is the
@@ -193,7 +207,7 @@ def unit_labor_split(fg_base: str, acc_sku: str | None,
 
     cls = classify_unit(fg_base)
     is_boss = str(fg_base).upper().startswith("BOSS")
-    bat_in_catalog = int(m["Bat"]) if m["Bat"] else 0
+    bat_in_catalog = int(m["Bat"]) if (pd.notna(m["Bat"]) and m["Bat"]) else 0
     bat = bat_in_catalog if is_boss else 0
 
     def _acc(col: str) -> float:
@@ -335,6 +349,11 @@ def cycle_for_unit(station: str, total_labor: float, cls: str, crew: int) -> flo
         return 0
     if station == "Final" and cls == "HS":
         return total_labor / HS_FINAL_CREW
+    # Defensive: a crew of 0 is an invalid config (the UI enforces ≥1, but the
+    # facility_crew.json is hand-editable / written via the GitHub API). Avoid a
+    # ZeroDivisionError that would crash the whole capacity table.
+    if crew <= 0:
+        return 0.0
     return total_labor / crew
 
 
@@ -433,6 +452,13 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
         # Status flags — distinguish "station doesn't exist here" from real status
         station_missing = (hc == 0)
         has_demand = labor_demand > 0
+        # A staffed station that has real throughput demand but zero throughput
+        # capacity can physically build nothing — yet the divide-by-zero guard
+        # above forces thru_util to 0, which would otherwise render a misleading
+        # 🟢. Flag it 🔴, mirroring the "missing station + demand" rule. This
+        # happens when Conc=0 (no concurrent bays — user-editable down to 0 in
+        # the crew panel) or avg_cycle<=0 (e.g. an invalid Crew=0 config).
+        thru_blocked = ((conc == 0 or avg_cycle <= 0) and need_per_day > 0)
 
         rows.append({
             "station_display": st_disp,
@@ -450,10 +476,10 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
             "need_per_day": need_per_day,
             "thru_cap_safe": thru_cap_safe,
             "thru_util_safe": thru_util_safe,
-            "thru_status_safe": _status_emoji(thru_util_safe, station_missing, has_demand),
+            "thru_status_safe": "🔴" if thru_blocked else _status_emoji(thru_util_safe, station_missing, has_demand),
             "thru_cap_raw": thru_cap_raw,
             "thru_util_raw": thru_util_raw,
-            "thru_status_raw": _status_emoji(thru_util_raw, station_missing, has_demand),
+            "thru_status_raw": "🔴" if thru_blocked else _status_emoji(thru_util_raw, station_missing, has_demand),
             "required_hc": required_hc,
             "hc_gap": hc_gap,
             "station_missing": station_missing,

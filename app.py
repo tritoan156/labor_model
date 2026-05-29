@@ -140,6 +140,12 @@ def _fmt_min_hr(value, *, with_thousands: bool = True, hr_decimals: int = 1) -> 
         v = float(value or 0)
     except (TypeError, ValueError):
         v = 0.0
+    # Guard NaN / Inf: float() above accepts them, but int(round(nan)) raises
+    # ValueError and int(round(inf)) raises OverflowError. Treat non-finite as 0
+    # so a malformed upstream aggregate degrades gracefully instead of crashing
+    # the metric render. (math isn't imported in this module — use comparisons.)
+    if v != v or v in (float("inf"), float("-inf")):
+        v = 0.0
     mins = int(round(v))
     hrs = v / 60.0
     mins_str = f"{mins:,}" if with_thousands else f"{mins}"
@@ -3536,8 +3542,17 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
     thru_util_safe, station_display.
     """
     if capacity is None or capacity.empty or total_units <= 0:
-        return {"max_units": int(max(total_units, 0)), "bottleneck": "",
-                "max_util_safe": 0.0, "infeasible": False, "missing_stations": []}
+        # Return the full key set (matching the other branches) so any caller
+        # that subscripts labor_/thru_/potential_ keys won't KeyError on the
+        # empty/zero path. All callers currently use .get(), but keep the
+        # contract uniform for safety.
+        _z = int(max(total_units, 0))
+        return {"max_units": _z, "bottleneck": "",
+                "max_util_safe": 0.0, "infeasible": False, "missing_stations": [],
+                "labor_max_units": _z, "labor_bottleneck": "", "labor_max_util_safe": 0.0,
+                "thru_max_units": _z, "thru_bottleneck": "", "thru_max_util_safe": 0.0,
+                "potential_max_units": _z, "potential_bottleneck": "",
+                "potential_util_safe": 0.0}
 
     missing: list[str] = []
     max_util = 0.0
@@ -4307,7 +4322,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                                 help="Calendar minutes one cell spends per unit (labor ÷ crew)."),
                             "Units/day per cell": st.column_config.NumberColumn(
                                 "Units/day per cell", format="%.1f",
-                                help="Extra units/day each added cell buys = (shift ÷ cycle) × buffers."),
+                                help="Extra units/day each added cell buys = (shift ÷ cycle) × buffers. 🔋 Battery row is batteries/day per cell."),
                             "Max units/day (cells)": st.column_config.NumberColumn(
                                 "Max units/day (cells)", format="%d",
                                 help="Cells × units/day per cell. 🔋 Battery row is batteries/day."),

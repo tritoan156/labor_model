@@ -270,6 +270,32 @@ ranges like `streamlit<2,>=1.30` and re-deploy.
 
 ---
 
+## Verifying the calculations (test suite)
+
+A pytest suite pins the labor/capacity math (`core/labor_calculator.py`,
+`core/constants.py`, and the `app.py` calc helpers) against regression. It is
+**dev-only** — `pytest` is in `requirements-dev.txt`, NOT the Cloud
+`requirements.txt`, so it never ships to Streamlit Cloud.
+
+Run it locally after any change to the calculation code:
+
+```bash
+./.venv/Scripts/python.exe -m pip install -r requirements-dev.txt   # once
+./.venv/Scripts/python.exe -m pytest -q
+```
+
+What it covers: per-unit labor (battery gating, ETO, FN_Assy, per-SKU station
+routing), `unit_labor_split` summing to the total, schedule expansion, station
+demand, cycle time / volume-weighted avg cycle, the full `build_capacity_table`
+(labor + throughput caps, `required_hc`, battery branch), status-emoji
+thresholds, battery demand, and the `app.py` helpers `_fmt_min_hr` /
+`_max_units_at_current_mix`. Several tests are explicit regression guards for
+audit fixes (e.g. `get_battery_type` case-normalization, `_fmt_min_hr` NaN/Inf,
+`Crew=0`/`Conc=0` capacity edge cases). If you change a formula on purpose,
+update the matching expected value in `tests/` in the same commit.
+
+---
+
 ## File map (where things live)
 
 | File | Purpose |

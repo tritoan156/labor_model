@@ -3154,8 +3154,12 @@ def render_sidebar() -> dict:
             min_value=0.40, max_value=1.00,
             value=DEFAULT_EFFICIENCY_FACTOR, step=0.025,
             help=(
-                "Fraction of the shift that is actually productive — breaks, setup, "
-                "and rework reduce it. 1.00 = no loss. Use 0.625 to match the VSM standard."
+                "Share of paid shift time that becomes productive work — breaks, "
+                "setup, rework, and line-balance loss reduce it (like OEE "
+                "availability × performance). 1.00 = no loss; typical assembly "
+                "plans run 0.80–0.90. The 0.50 default is deliberately conservative "
+                "for this shop. 0.625 ≈ 5 productive hours in an 8-hr shift "
+                "(a planning convention, not an external standard)."
             ),
         )
 
@@ -3276,23 +3280,25 @@ def render_sidebar() -> dict:
 ### Time units
 - **Person-minutes (p-min)** — labor *effort*. 1 person working 1 min = 1 p-min. 2 people working 30 min = 60 p-min. Independent of how many people you assign.
 - **Calendar minutes (cal-min)** — wall-clock *elapsed* time. With 1 person doing 60 p-min, cycle time is 60 cal-min. With 2 people working in parallel, the cycle is 30 cal-min.
-- **Cycle time** — calendar minutes a unit physically spends at a station = `p-min ÷ Crew per unit`.
-- **Lead time (days)** — total calendar days for **one** person to build the whole unit alone = `Total p-min ÷ (shift × efficiency)`.
+- **Cycle time (processing time)** — calendar minutes a unit physically occupies a station = `p-min ÷ Crew per unit`. Strictly this is the per-unit *processing time*; with several parallel cells the true line cycle (gap between finished units) is shorter (≈ processing ÷ cells).
+- **Lead time (days)** — calendar days for **one** person to do the whole unit's labor alone = `Total p-min ÷ (shift × efficiency)`. A single-operator *labor-content* yardstick for comparing units — **not** a delivery lead time (it excludes queue, move, and wait between stations).
 
 ### People & stations
 - **Headcount (HC) / People** — number of people assigned to a station for the whole shift.
-- **Stations/Cells (Conc)** — how many units can be worked on at the same time at one station (parallel bays/cells).
-- **Crew per unit** — number of people working together on one unit at a station. Drives cycle time.
-- **Required HC** — number of people needed to meet the schedule given safety + efficiency.
+- **Stations/Cells (Conc)** — how many identical bays/cells run in parallel at one station (units worked on at the same time) — *not* the number of process steps.
+- **Crew per unit** — number of people working together on one unit at a station. Drives processing (cycle) time.
+- **Required HC** — people needed to meet the schedule given safety + efficiency, rounded up per station. The facility total sums those per-station round-ups (assumes dedicated crews; shared floaters could need fewer).
 
 ### Safety & efficiency
 - **Safety factor** — planning buffer applied to capacity. `0.85` = leave 15% slack.
-- **Efficiency factor** — fraction of the shift that is actually productive. `1.00` = no loss; `0.625` ≈ VSM standard.
+- **Efficiency factor** — share of the paid shift that becomes productive work after breaks, setup, rework, and line-balance loss; behaves like OEE availability × performance. `1.00` = no loss; `0.625` ≈ 5 productive hours in an 8-hr shift (a planning convention, not an external standard). Typical assembly plans run `0.80–0.90`.
 - **Effective capacity** = `HC × shift × days × efficiency × safety` person-minutes per period.
 
 ### Labor vs Throughput utilization
 
 Each station has **two** utilization checks. The overall flag (🟢/🟡/🟠/🔴) is the worst of the two — because either one can be the actual bottleneck, and the fix is different.
+
+*These are **load ratios** — demand ÷ the **buffered** capacity (already cut by efficiency × safety). So 100% means "demand exactly fills the buffered allowance," not "the resource is 100% clock-busy," and the value can exceed 100%.*
 
 **Labor utilization** — *"Do I have enough people?"*
 - `labor_util = labor_demand ÷ labor_capacity`
@@ -3302,11 +3308,13 @@ Each station has **two** utilization checks. The overall flag (🟢/🟡/🟠/�
 **Throughput utilization** — *"Do I have enough stations/fixtures/bays?"*
 - `thru_util = units_per_day ÷ thru_capacity`
 - `thru_capacity = Stations/Cells × (shift ÷ avg_cycle) × efficiency × safety` (units/day the station can physically push through).
-- **Fix when red:** add more cells, shorten cycle time, extend working days. **Adding people doesn't help** — the constraint is the work footprint, not the workforce. Tuned by the **Stations/Cells** sidebar control.
+- **Fix when red:** add more cells, shorten cycle time, extend working days. **Adding people only helps if the step is labor-paced** (more crew lowers `p-min ÷ Crew`, so each cell clears units faster); for **machine/process-paced** steps like Battery, crew size can't change the per-cell time — you need more cells. Tuned by the **Stations/Cells** sidebar control.
 
 **The classic example: Battery Assembly.** Each battery cell takes ~170 calendar minutes to build, regardless of how many people you put around it. If you have 4 cells but the plan needs 50 batteries/day, throughput maxes out at ~11/day — hiring more people does nothing. You need more cells.
 
 The Overview's **🎯 Recommended actions** splits these two cases so you don't waste a hiring request on a throughput bottleneck.
+
+**Takt time** (the demand beat = available productive time ÷ units needed/day) isn't shown directly — the **Need/day vs. cell capacity** check is the equivalent: a station keeps up when its processing time per unit ÷ parallel cells stays at or below takt.
 
 | If this is red | What's pinching | Where to look |
 |---|---|---|

@@ -69,3 +69,41 @@ class TestMaxUnitsAtCurrentMix:
         r = app._max_units_at_current_mix(pd.DataFrame(), 0)
         assert r["max_units"] == 0
         assert "thru_max_units" in r
+
+
+class TestAreaSpaceCap:
+    def _cap(self, rows):
+        """rows: {station: (HC, need_per_day, thru_cap_safe, thru_util_safe)}."""
+        df = pd.DataFrame(
+            [{"HC": hc, "need_per_day": npd, "thru_cap_safe": cap,
+              "thru_util_safe": tu}
+             for (hc, npd, cap, tu) in rows.values()],
+            index=list(rows.keys()),
+        )
+        df.index.name = "station_display"
+        return df
+
+    def test_limiting_cell_is_highest_util(self):
+        # Use exactly-representable utils (0.25, 0.5) so the floor is unambiguous.
+        cap = self._cap({"A": (4, 2.5, 10.0, 0.25), "B": (4, 5.0, 10.0, 0.5)})
+        r = app._area_space_cap(cap, 100)
+        assert r["limiting_cell"] == "B"      # higher util = binding cell
+        assert r["cells_used_pct"] == 50
+        assert r["max_units"] == 200          # floor(100 / 0.5)
+
+    def test_ignores_hc_for_space_bottleneck(self):
+        # The whole point of the fix: a station with NO staff (HC=0) but real
+        # cells + demand must still be the area's space bottleneck. The
+        # labor-aware helper would wrongly skip it.
+        cap = self._cap({"A": (4, 2.5, 10.0, 0.25), "B": (0, 5.0, 10.0, 0.5)})
+        r = app._area_space_cap(cap, 100)
+        assert r["limiting_cell"] == "B"      # HC=0 but still binding
+        assert r["max_units"] == 200          # floor(100 / 0.5)
+        # Contrast: the labor-aware helper skips the HC=0 station → wrong cell.
+        m = app._max_units_at_current_mix(cap, 100)
+        assert m["thru_bottleneck"] == "A"
+
+    def test_none_when_no_space_demand(self):
+        assert app._area_space_cap(self._cap({"A": (4, 0.0, 10.0, 0.0)}), 100) is None
+        assert app._area_space_cap(pd.DataFrame(), 100) is None
+        assert app._area_space_cap(self._cap({"A": (4, 5.0, 10.0, 0.5)}), 0) is None

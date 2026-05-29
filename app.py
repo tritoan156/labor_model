@@ -3644,6 +3644,43 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
     }
 
 
+def _area_space_cap(sub: pd.DataFrame, total_units: int) -> dict | None:
+    """Throughput (space) cap for a group of stations — independent of HC.
+
+    Unlike ``_max_units_at_current_mix`` (which is labor-aware and skips
+    HC=0 stations), this looks ONLY at physical throughput: a station's
+    cells exist whether or not it is staffed, so an unstaffed-but-celled
+    station must still count toward the area's space bottleneck. Uses the
+    same inclusion rule as the per-station Space-limits table
+    (need_per_day > 0 AND thru_cap_safe > 0 AND thru_util_safe > 0), so the
+    two views stay consistent.
+
+    The binding cell is the station with the highest throughput utilization;
+    the area cap scales the current mix until that cell saturates. Returns
+    None when no station in the group is space-constrained.
+    """
+    if sub is None or sub.empty or total_units <= 0:
+        return None
+    best_util = 0.0
+    limiting = ""
+    for st_disp, row in sub.iterrows():
+        need = float(row.get("need_per_day", 0) or 0)
+        cap = float(row.get("thru_cap_safe", 0) or 0)
+        util = float(row.get("thru_util_safe", 0) or 0)
+        if need <= 0 or cap <= 0 or util <= 0:
+            continue
+        if util > best_util:
+            best_util = util
+            limiting = str(st_disp)
+    if best_util <= 0:
+        return None
+    return {
+        "max_units": int(total_units // best_util),
+        "limiting_cell": limiting or "—",
+        "cells_used_pct": round(best_util * 100),
+    }
+
+
 def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", weekly_util=None):
     # =============================================================
     # Empty-schedule guard FIRST — don't render zeroed KPIs and force
@@ -4286,20 +4323,21 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                 })
 
             # Per-area space roll-up (reuses area_groups built just above).
+            # Uses the HC-agnostic _area_space_cap (NOT the labor-aware
+            # _max_units_at_current_mix) so the area's space bottleneck counts
+            # cells regardless of staffing — consistent with the per-station
+            # table above, which also ignores HC.
             sp_area_rows = []
             for area, stations in area_groups.items():
                 sub = capacity[capacity.index.isin(stations)]
-                if sub.empty:
-                    continue
-                _smu = _max_units_at_current_mix(sub, total_units)
-                _s_tu = float(_smu.get("thru_max_util_safe", 0) or 0)
-                if _s_tu <= 0:
+                _cap = _area_space_cap(sub, total_units)
+                if _cap is None:
                     continue
                 sp_area_rows.append({
                     "Area": area,
-                    "Max units (cells)": int(_smu.get("thru_max_units", 0) or 0),
-                    "Limiting cell": _smu.get("thru_bottleneck", "") or "—",
-                    "Cells used %": round(_s_tu * 100),
+                    "Max units (this plan)": _cap["max_units"],
+                    "Limiting cell": _cap["limiting_cell"],
+                    "Cells used %": _cap["cells_used_pct"],
                 })
 
             if stn_rows:
@@ -4333,7 +4371,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                                 help="Extra units/day each added cell buys = (shift ÷ cycle) × buffers. 🔋 Battery row is batteries/day per cell."),
                             "Max units/day (cells)": st.column_config.NumberColumn(
                                 "Max units/day (cells)", format="%d",
-                                help="Cells × units/day per cell. 🔋 Battery row is batteries/day."),
+                                help="Total daily cell throughput = cells × (shift ÷ cycle) × buffers, rounded. 🔋 Battery row is batteries/day."),
                             "Max units/plan (cells)": st.column_config.NumberColumn(
                                 "Max units/plan (cells)", format="%d",
                                 help="Total this station's cells can process over the plan = Max units/day × working days (efficiency & safety applied). 🔋 Battery row is batteries/plan."),
@@ -4356,7 +4394,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                         st.markdown("**By production area**")
                         sp_area_df = (
                             pd.DataFrame(sp_area_rows)
-                            .sort_values("Max units (cells)")
+                            .sort_values("Max units (this plan)")
                             .reset_index(drop=True)
                         )
                         st.dataframe(
@@ -4364,11 +4402,11 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                             column_config={
                                 "Area": st.column_config.TextColumn(
                                     "Area", help="Production area (grouped stations)."),
-                                "Max units (cells)": st.column_config.NumberColumn(
-                                    "Max units (cells)", format="%d",
-                                    help="Units this area's cells alone can build at the current mix."),
+                                "Max units (this plan)": st.column_config.NumberColumn(
+                                    "Max units (this plan)", format="%d",
+                                    help="How far the current mix can scale before this area's tightest cell saturates (same metric as the per-station column)."),
                                 "Limiting cell": st.column_config.TextColumn(
-                                    "Limiting cell", help="The space-binding station within the area."),
+                                    "Limiting cell", help="The space-binding station within the area (counts cells regardless of staffing)."),
                                 "Cells used %": st.column_config.NumberColumn(
                                     "Cells used %", format="%d%%",
                                     help="The limiting cell's utilization at the current plan."),

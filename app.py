@@ -3732,10 +3732,13 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             "mix; ≥100% = you have headroom. The delta shows the unit gap."
         ),
     )
+    _tl_min = int(round(float(total_labor or 0)))
+    _tl_hr = float(total_labor or 0) / 60.0
     c4.metric(
-        "Total work", _fmt_min_hr(total_labor),
-        help="Total labor required across all stations, shown as person-minutes and person-hours.",
+        "Total work", f"{_tl_min:,} p-min",
+        help="Total labor required across all stations, shown as person-minutes (with person-hours below).",
     )
+    c4.caption(f"≈ {_tl_hr:,.1f} p-hr")
 
     # ----------------------------------------------------------------
     # Bottleneck line — single, definitive, sits right under the KPIs.

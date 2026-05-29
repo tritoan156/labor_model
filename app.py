@@ -28,6 +28,7 @@ from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
     compute_unit_labor, unit_labor_split,
+    classify_fg_category, buildable_by_line,
 )
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
@@ -3681,6 +3682,59 @@ def _area_space_cap(sub: pd.DataFrame, total_units: int) -> dict | None:
     }
 
 
+def _render_buildable_by_line(bl: dict, total: int) -> None:
+    """Render the per-line buildable breakdown (shared by Overview + Capacity).
+
+    ``bl`` is the dict returned by ``labor_calculator.buildable_by_line``. No-op
+    when the plan spans a single line (the headline number already says it all).
+    """
+    rows = (bl or {}).get("lines", [])
+    if len(rows) <= 1:
+        return
+
+    def _bound(r):
+        if r.get("infeasible"):
+            return "⚠️ unstaffed"
+        mu = r.get("max_util")
+        if not mu:
+            return "spare capacity"
+        return f"{r.get('binding_kind', 'labor')} · {mu * 100:.0f}%"
+
+    df = pd.DataFrame([{
+        "Line": r["line"],
+        "Units planned": r["planned"],
+        "Buildable": r["buildable"],
+        "Binding station": r["binding_station"],
+        "Bound by": _bound(r),
+    } for r in rows])
+    with st.expander("🏭 Buildable by production line", expanded=False):
+        st.caption(
+            "The plant runs parallel lines (Compressor=PDS · Generator=SDG · "
+            "EBOSS=full BOSS · PM=head/skid). Each scales to its OWN bottleneck "
+            "and the outputs add up, so one line isn't throttled by another's "
+            "constraint. A station shared by lines caps each line that uses it "
+            "(by its combined utilization), so the per-line caps never "
+            "over-subscribe a station."
+        )
+        st.dataframe(
+            df, use_container_width=True, hide_index=True,
+            column_config={
+                "Line": st.column_config.TextColumn(
+                    "Line", help="Compressor=PDS · Generator=SDG · EBOSS=full BOSS unit · PM=head/skid-only."),
+                "Units planned": st.column_config.NumberColumn(
+                    "Units planned", format="%d", help="Units of this line in the current plan."),
+                "Buildable": st.column_config.NumberColumn(
+                    "Buildable", format="%d",
+                    help="Units of this line the plant can build at the current mix, scaled to this line's own bottleneck."),
+                "Binding station": st.column_config.TextColumn(
+                    "Binding station", help="The station that limits this line."),
+                "Bound by": st.column_config.TextColumn(
+                    "Bound by", help="Whether the binding station is labor- or throughput-bound, and its utilization (or 'unstaffed' / 'spare capacity')."),
+            },
+        )
+        st.caption(f"Total buildable = **{total:,}** units (sum of the lines).")
+
+
 def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", weekly_util=None):
     # =============================================================
     # Empty-schedule guard FIRST — don't render zeroed KPIs and force
@@ -3753,15 +3807,15 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # =============================================================
     st.markdown("#### 📦 What this plan builds")
 
-    # Compute buildable + coverage once, reuse in the KPIs and the line below.
+    # Buildable is LINE-AWARE: the plant runs parallel production lines
+    # (Compressor / Generator / EBOSS / PM) whose outputs add up, so one line
+    # isn't throttled by another line's bottleneck (e.g. PDS/compressor is not
+    # limited by the Battery station, which only EBOSS/PM use). A line that
+    # needs an unstaffed station contributes 0 (the others still count).
+    _bl = buildable_by_line(units, capacity)
+    buildable_units = int(_bl.get("total", 0) or 0)
+    # _max_units_at_current_mix still drives the single-bottleneck readout below.
     _mu = _max_units_at_current_mix(capacity, total_units)
-    if _mu["infeasible"]:
-        # Infeasible = a required station has HC=0. The "achievable right
-        # now" answer is 0; we surface the potential ceiling in the
-        # st.error block below so planners see what they'd unlock.
-        buildable_units = 0
-    else:
-        buildable_units = int(_mu.get("max_units", total_units) or 0)
     coverage_pct = (buildable_units / total_units * 100.0) if total_units > 0 else 0.0
     gap_units = buildable_units - total_units  # negative = short; positive = surplus
 
@@ -3773,9 +3827,11 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     c2.metric(
         "Buildable units", f"{buildable_units:,}",
         help=(
-            "How many units of the current SKU mix the facility can actually "
-            "build this month, given HC × shift × days × efficiency × safety "
-            "and the bays × cycle throughput cap at every station."
+            "How many units of the current SKU mix the facility can build this "
+            "month. Summed across the parallel production lines (Compressor / "
+            "Generator / EBOSS / PM) — each scales to its OWN bottleneck, so one "
+            "line isn't throttled by another's constraint. See the per-line "
+            "breakdown below."
         ),
     )
     # Coverage delta-color: "normal" means a POSITIVE delta (surplus = more
@@ -3799,6 +3855,10 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
         help="Total labor required across all stations, shown as person-minutes (with person-hours below).",
     )
     c4.caption(f"≈ {_tl_hr:,.1f} p-hr")
+
+    # Per-line breakdown — show how buildable decomposes across the parallel
+    # production lines (only meaningful when the plan spans more than one line).
+    _render_buildable_by_line(_bl, buildable_units)
 
     # ----------------------------------------------------------------
     # Bottleneck line — single, definitive, sits right under the KPIs.
@@ -4157,7 +4217,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     st.plotly_chart(fig, use_container_width=True)
 
 
-def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, total_units: int = 0):
+def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, total_units: int = 0, units=None):
     st.header("📊 Capacity vs Demand")
     st.markdown(
         "**Can each station's capacity keep up with this plan's demand?** "
@@ -4184,6 +4244,10 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
         _tm = int(_mu.get("thru_max_units", 0) or 0)
         _lb = _mu.get("labor_bottleneck", "") or "—"
         _tb = _mu.get("thru_bottleneck", "") or "—"
+        # Line-aware buildable (parallel Compressor/Generator/EBOSS/PM lines).
+        _bl = buildable_by_line(units, capacity) if units is not None else {"lines": [], "total": 0}
+        _bl_total = int(_bl.get("total", 0) or 0)
+        _multi_line = len(_bl.get("lines", [])) > 1
         if _lu > 0 or _tu > 0:
             st.markdown("#### 🏭 Unit caps for this mix")
             if _mu["infeasible"]:
@@ -4198,9 +4262,15 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
             _pb = _mu.get("potential_bottleneck", "") or "—"
             _pu = float(_mu.get("potential_util_safe", 0) or 0)
             cP.metric(
-                "Max units (tighter cap)",
-                f"{_pm:,}" if _pu > 0 else f"{total_units:,}",
-                help="The smaller of the labor and throughput caps for the current mix.",
+                "Max units (all lines)" if _multi_line else "Max units (tighter cap)",
+                f"{_bl_total:,}" if (_multi_line and _bl_total > 0)
+                else (f"{_pm:,}" if _pu > 0 else f"{total_units:,}"),
+                help=(
+                    "Sum of the parallel production lines' caps — each line "
+                    "(Compressor/Generator/EBOSS/PM) scaled to its OWN bottleneck, "
+                    "so one line isn't throttled by another's. Per-line breakdown below."
+                ) if _multi_line else
+                "The smaller of the labor and throughput caps for the current mix.",
             )
             cL.metric(
                 "Labor-capped units",
@@ -4218,7 +4288,10 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                     "concurrent bays or shortening cycle time."
                 ),
             )
-            cP.caption(f"Bottleneck: **{_pb}** · {_pu:.0%} util")
+            cP.caption(
+                f"Sum across {len(_bl['lines'])} lines · global bottleneck **{_pb}**"
+                if _multi_line else f"Bottleneck: **{_pb}** · {_pu:.0%} util"
+            )
             cL.caption(f"Bottleneck: **{_lb}** · {_lu:.0%} util")
             cT.caption(f"Bottleneck: **{_tb}** · {_tu:.0%} util")
             st.caption(
@@ -4226,6 +4299,8 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                 "current SKU mix proportionally until the named station "
                 "hits its safe capacity."
             )
+            if _multi_line:
+                _render_buildable_by_line(_bl, _bl_total)
 
             # ---------------------------------------------------------
             # Per-area unit caps — what each production area can support
@@ -7837,7 +7912,7 @@ def main():
         if units.empty:
             _empty_state("Capacity")
         else:
-            tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type, total_units=len(units))
+            tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type, total_units=len(units), units=units)
     with tabs[3]:
         if units.empty:
             _empty_state("Recommendations")

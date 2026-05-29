@@ -8,9 +8,9 @@ import pandas as pd
 import pytest
 
 from core.labor_calculator import (
-    classify_unit, compute_unit_labor, unit_labor_split, expand_schedule,
-    station_demand_table, cycle_for_unit, weighted_avg_cycle,
-    build_capacity_table, _status_emoji, _overall_status,
+    classify_unit, classify_fg_category, compute_unit_labor, unit_labor_split,
+    expand_schedule, station_demand_table, cycle_for_unit, weighted_avg_cycle,
+    build_capacity_table, buildable_by_line, _status_emoji, _overall_status,
     battery_demand_by_sku, battery_demand_by_type,
 )
 from core.constants import STATION_KEYS, DEFAULT_BATT_RAW, DEFAULT_NAMEPLATE_PREP
@@ -387,3 +387,103 @@ class TestBatteryDemand:
         g = battery_demand_by_type(self._units()).set_index("batt_type")
         assert g.loc["125-20", "total_batteries"] == 6
         assert g.loc["25-12", "total_batteries"] == 1
+
+
+# --------------------------------------------------------------------------
+# classify_fg_category / buildable_by_line (line-aware buildable units)
+# --------------------------------------------------------------------------
+class TestClassifyFgCategory:
+    def test_compressor(self):
+        assert classify_fg_category("PDS100-001") == "Compressor"
+
+    def test_generator(self):
+        assert classify_fg_category("SDG125-006") == "Generator"
+
+    def test_eboss_full_unit(self):
+        assert classify_fg_category("BOSS125-001") == "EBOSS"
+
+    def test_pm_headskid(self):
+        assert classify_fg_category("BOSS125HS-001") == "PM"
+
+    def test_pm_even_with_trailer_anomaly(self):
+        # HS units are PM even if the catalog gives them a little trailer labor.
+        assert classify_fg_category("BOSS70HS-001") == "PM"
+
+    def test_other(self):
+        assert classify_fg_category("") == "Other"
+        assert classify_fg_category("WIDGET-1") == "Other"
+
+
+class TestBuildableByLine:
+    def _cap(self, rows):
+        """rows: {station_display: (HC, labor_util_safe, thru_util_safe)}."""
+        df = pd.DataFrame(
+            [{"HC": hc, "labor_util_safe": lu, "thru_util_safe": tu}
+             for (hc, lu, tu) in rows.values()],
+            index=list(rows.keys()),
+        )
+        df.index.name = "station_display"
+        return df
+
+    def test_single_line_back_compat(self):
+        # One line → equals floor(N / global max-util), like the old single cap.
+        units = make_units_df([{"fg_base": "BOSS125-001", "GenAcc": 10, "Warehouse": 5}
+                               for _ in range(100)])
+        cap = self._cap({"Gen Accessories": (4, 0.5, 0.0),
+                         "Warehouse (Pick)": (4, 0.1, 0.0)})
+        r = buildable_by_line(units, cap)
+        assert r["total"] == 200          # 100 / 0.5
+        assert len(r["lines"]) == 1
+        assert r["lines"][0]["binding_station"] == "Gen Accessories"
+
+    def test_exclusive_lines_no_cross_throttle(self):
+        # Compressor (PDS) uses Com Accessories (util 2.0); Generator (SDG) uses
+        # Gen Accessories (util 0.5). The compressor cap must NOT be dragged down
+        # by the generator-only station, and vice-versa.
+        units = make_units_df(
+            [{"fg_base": "PDS100-001", "ComAcc": 10, "Warehouse": 5} for _ in range(10)]
+            + [{"fg_base": "SDG125-006", "GenAcc": 10, "Warehouse": 5} for _ in range(20)]
+        )
+        cap = self._cap({"Com Accessories": (4, 2.0, 0.0),
+                         "Gen Accessories": (4, 0.5, 0.0),
+                         "Warehouse (Pick)": (4, 0.1, 0.0)})
+        r = buildable_by_line(units, cap)
+        by = {row["line"]: row for row in r["lines"]}
+        assert by["Compressor"]["buildable"] == 5     # 10 / 2.0
+        assert by["Compressor"]["binding_station"] == "Com Accessories"
+        assert by["Generator"]["buildable"] == 40     # 20 / 0.5 (uncapped)
+        assert r["total"] == 45
+
+    def test_shared_station_caps_both_and_stays_feasible(self):
+        # Warehouse is shared (combined util 2.0) and binds both lines.
+        units = make_units_df(
+            [{"fg_base": "PDS100-001", "ComAcc": 10, "Warehouse": 5} for _ in range(10)]
+            + [{"fg_base": "SDG125-006", "GenAcc": 10, "Warehouse": 5} for _ in range(10)]
+        )
+        cap = self._cap({"Com Accessories": (4, 0.5, 0.0),
+                         "Gen Accessories": (4, 0.5, 0.0),
+                         "Warehouse (Pick)": (4, 2.0, 0.0)})
+        r = buildable_by_line(units, cap)
+        by = {row["line"]: row for row in r["lines"]}
+        assert by["Compressor"]["buildable"] == 5     # capped by Warehouse 2.0
+        assert by["Generator"]["buildable"] == 5
+        assert by["Compressor"]["binding_station"] == "Warehouse (Pick)"
+        assert r["total"] == 10
+
+    def test_throughput_can_bind(self):
+        units = make_units_df([{"fg_base": "BOSS125-001", "Battery": 10} for _ in range(60)])
+        cap = self._cap({"Battery Assembly": (8, 0.2, 1.5)})  # throughput-bound
+        r = buildable_by_line(units, cap)
+        assert r["lines"][0]["binding_kind"] == "throughput"
+        assert r["lines"][0]["buildable"] == 40       # 60 / 1.5
+
+    def test_unstaffed_station_makes_line_infeasible(self):
+        units = make_units_df([{"fg_base": "PDS100-001", "ComAcc": 10} for _ in range(10)])
+        cap = self._cap({"Com Accessories": (0, 0.0, 0.0)})  # HC=0
+        r = buildable_by_line(units, cap)
+        assert r["lines"][0]["infeasible"] is True
+        assert r["lines"][0]["buildable"] == 0
+        assert r["total"] == 0
+
+    def test_empty(self):
+        assert buildable_by_line(pd.DataFrame(), self._cap({"X": (1, 0.5, 0)})) == {"lines": [], "total": 0}

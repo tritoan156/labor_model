@@ -29,6 +29,32 @@ def classify_unit(fg_base: str) -> str:
     return "STD"
 
 
+def classify_fg_category(fg_base: str) -> str:
+    """Map an FG base SKU to its production LINE.
+
+    The plant runs parallel production lines whose outputs ADD up:
+      - "Compressor" — PDS* (portable diesel compressors)
+      - "Generator"  — SDG* (generators, usually trailer-mounted, so they also
+                       use the Trailer station)
+      - "PM"         — BOSS head/skid-only units (Power Module; classify_unit=="HS")
+      - "EBOSS"      — full BOSS units (head + trailer + PM)
+      - "Other"      — anything else (none in the catalog today; kept as its own
+                       line so nothing is ever silently dropped)
+
+    Which STATIONS each line uses is NOT encoded here — it is read per unit from
+    the catalog labor in ``buildable_by_line`` — so shared stations (e.g. Trailer
+    used by both Generator and EBOSS) are handled automatically.
+    """
+    s = str(fg_base or "").upper().strip()
+    if s.startswith("PDS"):
+        return "Compressor"
+    if s.startswith("SDG"):
+        return "Generator"
+    if s.startswith("BOSS"):
+        return "PM" if classify_unit(s) == "HS" else "EBOSS"
+    return "Other"
+
+
 def compute_unit_labor(fg_base: str, acc_sku: str | None,
                        machine_df: pd.DataFrame, acc_df: pd.DataFrame) -> dict:
     """Return per-station labor (person-mins) for one unit.
@@ -526,6 +552,92 @@ def _overall_status(row) -> str:
     if "🟡" in statuses:
         return "🟡 TIGHT"
     return "🟢 OK"
+
+
+def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame) -> dict:
+    """Line-aware buildable-unit cap.
+
+    The plant runs parallel production lines (see :func:`classify_fg_category`)
+    whose outputs ADD up. The current SKU mix can be scaled WITHIN each line
+    independently up to that line's own bottleneck; one line is NOT throttled by
+    another line's constraint (e.g. PDS/compressor is not limited by the Battery
+    station, which only EBOSS/PM use).
+
+    For each line::
+
+        buildable(line) = floor( planned_units(line) / max_util(line) )
+        max_util(line)  = max, over the stations that line uses, of
+                          max(labor_util_safe, thru_util_safe)
+
+    where the station utilizations come from ``capacity`` (built by
+    :func:`build_capacity_table`) and are computed from the COMBINED demand of
+    every line that uses the station. That makes this a *constrained sum*: the
+    per-line caps provably never sum to more than any station's capacity, because
+    a station shared by several lines caps each of them by ``1/util`` and
+    ``Σ demand/util = capacity``. The planned line mix is preserved.
+
+    A station a line needs but with HC=0 makes that line infeasible (buildable 0),
+    mirroring the missing-station handling elsewhere.
+
+    Returns ``{"lines": [ {line, planned, buildable, binding_station,
+    binding_kind, max_util, infeasible} ... ], "total": int}`` (lines sorted by
+    name). Empty inputs return ``{"lines": [], "total": 0}``.
+    """
+    if (units_df is None or units_df.empty
+            or capacity is None or capacity.empty
+            or "fg_base" not in units_df.columns):
+        return {"lines": [], "total": 0}
+
+    def _station_util(disp: str):
+        """(util, kind) for a station display name; inf if needed-but-unstaffed."""
+        if disp not in capacity.index:
+            return 0.0, "labor"
+        row = capacity.loc[disp]
+        if int(row.get("HC", 0) or 0) <= 0:
+            return float("inf"), "labor"
+        lu = float(row.get("labor_util_safe", 0) or 0)
+        tu = float(row.get("thru_util_safe", 0) or 0)
+        return (lu, "labor") if lu >= tu else (tu, "throughput")
+
+    line_of = units_df["fg_base"].map(classify_fg_category)
+    rows = []
+    total = 0
+    for line in sorted(set(line_of)):
+        sub = units_df[line_of == line]
+        planned = int(len(sub))
+        if planned == 0:
+            continue
+        max_util = 0.0
+        binding = ""
+        binding_kind = "labor"
+        infeasible = False
+        for st_key in STATION_KEYS:
+            if st_key not in sub.columns or float(sub[st_key].sum()) <= 0:
+                continue  # this line doesn't use this station
+            disp = STATION_KEY_TO_DISPLAY[st_key]
+            util, kind = _station_util(disp)
+            if util == float("inf"):
+                infeasible, max_util, binding, binding_kind = True, util, disp, kind
+                break
+            if util > max_util:
+                max_util, binding, binding_kind = util, disp, kind
+        if infeasible:
+            buildable = 0
+        elif max_util <= 0:
+            buildable = planned
+        else:
+            buildable = int(planned // max_util)
+        total += buildable
+        rows.append({
+            "line": line,
+            "planned": planned,
+            "buildable": buildable,
+            "binding_station": binding or "—",
+            "binding_kind": binding_kind,
+            "max_util": (None if max_util in (0.0, float("inf")) else round(max_util, 4)),
+            "infeasible": infeasible,
+        })
+    return {"lines": rows, "total": int(total)}
 
 
 # ---------------------------------------------------------------

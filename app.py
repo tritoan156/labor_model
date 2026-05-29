@@ -4166,6 +4166,71 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                 "current SKU mix proportionally until the named station "
                 "hits its safe capacity."
             )
+
+            # ---------------------------------------------------------
+            # Per-area unit caps — what each production area can support
+            # on its own, ignoring bottlenecks elsewhere. Lets a planner
+            # see (e.g.) the Accessories or Trailer ceiling separate from
+            # an easily-relievable constraint like Shipping.
+            # ---------------------------------------------------------
+            from core.constants import STATION_AREA_GROUPS
+
+            grouped = {s for stns in STATION_AREA_GROUPS.values() for s in stns}
+            area_groups = dict(STATION_AREA_GROUPS)
+            leftover = [s for s in capacity.index if s not in grouped]
+            if leftover:
+                area_groups["Other"] = leftover
+
+            area_rows = []
+            for area, stations in area_groups.items():
+                sub = capacity[capacity.index.isin(stations)]
+                if sub.empty:
+                    continue
+                _amu = _max_units_at_current_mix(sub, total_units)
+                _a_pm = int(_amu.get("potential_max_units", 0) or 0)
+                _a_pu = float(_amu.get("potential_util_safe", 0) or 0)
+                # Only meaningful when the area actually carries demand.
+                if _a_pu <= 0:
+                    continue
+                area_rows.append({
+                    "Area": area,
+                    "Max units": _a_pm,
+                    "Bottleneck": _amu.get("potential_bottleneck", "") or "—",
+                    "Util %": round(_a_pu * 100),
+                    "Blocked?": "⚠️ unstaffed" if _amu.get("infeasible") else "",
+                })
+
+            if area_rows:
+                area_df = (
+                    pd.DataFrame(area_rows)
+                    .sort_values("Max units")
+                    .reset_index(drop=True)
+                )
+                with st.expander("🗂️ Unit caps by production area", expanded=False):
+                    st.caption(
+                        "Each area's ceiling for the current mix, computed from "
+                        "only that area's stations. The lowest-cap area is the "
+                        "true binding area — others (e.g. Shipping) can often be "
+                        "relieved later by adding HC there."
+                    )
+                    st.dataframe(
+                        area_df, use_container_width=True, hide_index=True,
+                        column_config={
+                            "Area": st.column_config.TextColumn(
+                                "Area", help="Production area (grouped stations)."),
+                            "Max units": st.column_config.NumberColumn(
+                                "Max units", format="%d",
+                                help="Units of the current mix this area alone can build."),
+                            "Bottleneck": st.column_config.TextColumn(
+                                "Bottleneck", help="The binding station within the area."),
+                            "Util %": st.column_config.NumberColumn(
+                                "Util %", format="%d%%",
+                                help="The bottleneck station's utilization at the current plan."),
+                            "Blocked?": st.column_config.TextColumn(
+                                "Blocked?", help="Flagged when a needed station in the area has no HC."),
+                        },
+                    )
+
             st.markdown("---")
 
     # =============================================================

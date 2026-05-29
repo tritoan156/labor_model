@@ -156,6 +156,25 @@ STATION_KEYS = [
     "AccKIT", "Final", "PDI", "QC", "Ship", "ETO",
 ]
 
+# === Production-area groupings (for the Capacity tab's per-area cap view) ===
+# Groups stations into the physical/organizational areas planners think in, so
+# the Capacity tab can show a binding unit cap per area. This lets a planner see
+# what (e.g.) the Accessories or Trailer area can support on its own, separate
+# from an easily-relievable bottleneck elsewhere (Shipping is often the binding
+# station but is quick to add capacity to). Keys are display labels; values are
+# lists of STATION_DEFAULTS display names. A station may appear in only one
+# group; any station not listed here is bucketed under "Other" at render time.
+STATION_AREA_GROUPS = {
+    "Prep / Warehouse":   ["Warehouse (Pick)", "Wire Assembly"],
+    "Battery":            ["Battery Assembly"],
+    "Accessories":        ["PM Acc (Headunit)", "Gen Accessories",
+                           "Com Accessories", "Accessories KIT"],
+    "Trailer":            ["Trailer Assembly"],
+    "ETO":                ["ETO"],
+    "Final / PDI / QC":   ["Final Assembly", "PDI", "QC"],
+    "Shipping":           ["Ship"],
+}
+
 # Map internal key → display name
 STATION_KEY_TO_DISPLAY = {
     "Warehouse": "Warehouse (Pick)",

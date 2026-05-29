@@ -4238,6 +4238,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
             # does. Surfaces the per-station + per-area space ceiling that's
             # otherwise buried in the full-detail expander.
             # ---------------------------------------------------------
+            _space_days = int(inputs.get("days", 0) or 0)
             stn_rows = []
             for st_disp, row in capacity.iterrows():
                 need_day = float(row.get("need_per_day", 0) or 0)
@@ -4255,6 +4256,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                     "Cycle min/unit": round(float(row.get("avg_cycle", 0) or 0), 1),
                     "Units/day per cell": round(cap_day / conc, 1) if conc > 0 else 0.0,
                     "Max units/day (cells)": int(round(cap_day)),
+                    "Max units/plan (cells)": int(round(cap_day * _space_days)),
                     "Max units (this plan)": int(total_units // util),
                     "Cells used %": round(util * 100),
                     "Status": row.get("thru_status_safe", "") or "—",
@@ -4309,6 +4311,9 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                             "Max units/day (cells)": st.column_config.NumberColumn(
                                 "Max units/day (cells)", format="%d",
                                 help="Cells × units/day per cell. 🔋 Battery row is batteries/day."),
+                            "Max units/plan (cells)": st.column_config.NumberColumn(
+                                "Max units/plan (cells)", format="%d",
+                                help="Total this station's cells can process over the plan = Max units/day × working days (efficiency & safety applied). 🔋 Battery row is batteries/plan."),
                             "Max units (this plan)": st.column_config.NumberColumn(
                                 "Max units (this plan)", format="%d",
                                 help="How far the current mix can scale before this station's cells saturate."),

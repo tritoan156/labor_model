@@ -2041,7 +2041,7 @@ def _render_calendar_view(
                 ]
             ).sort_values("Labor (p-min)", ascending=True)
             if mix_df.empty:
-                st.caption("_No labor recorded for this week's units._")
+                st.info("ℹ️ No labor recorded for this week's units.")
             else:
                 _bar = px.bar(
                     mix_df, x="Labor (p-min)", y="Station",
@@ -4097,7 +4097,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
 def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, total_units: int = 0):
     st.header("📊 Capacity vs Demand")
     st.markdown(
-        "**Are stations comfortably staffed for this plan?** "
+        "**Can each station's capacity keep up with this plan's demand?** "
         "Each row is one station. Use the chart for a visual scan, the simple table for the headline numbers."
     )
     st.caption(
@@ -4137,30 +4137,25 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
             cP.metric(
                 "Max units (tighter cap)",
                 f"{_pm:,}" if _pu > 0 else f"{total_units:,}",
-                help=(
-                    f"The smaller of the labor and throughput caps. "
-                    f"Bottleneck: **{_pb}** at {_pu:.0%} util."
-                ),
+                help="The smaller of the labor and throughput caps for the current mix.",
             )
             cL.metric(
                 "Labor-capped units",
                 f"{_lm:,}" if _lu > 0 else "—",
                 help=(
-                    f"Person-minute constraint. Bottleneck: **{_lb}** at "
-                    f"{_lu:.0%} of safe labor capacity. Relieve by adding "
-                    "HC, working days, or shift minutes."
+                    "Person-minute constraint. Relieve by adding HC, "
+                    "working days, or shift minutes."
                 ),
             )
             cT.metric(
                 "Throughput-capped units",
                 f"{_tm:,}" if _tu > 0 else "—",
                 help=(
-                    f"Bays × cycle-time constraint. Bottleneck: **{_tb}** "
-                    f"at {_tu:.0%} of safe throughput. Relieve by adding "
+                    "Bays × cycle-time constraint. Relieve by adding "
                     "concurrent bays or shortening cycle time."
                 ),
             )
-            cP.caption(f"Bottleneck: **{_pb}**")
+            cP.caption(f"Bottleneck: **{_pb}** · {_pu:.0%} util")
             cL.caption(f"Bottleneck: **{_lb}** · {_lu:.0%} util")
             cT.caption(f"Bottleneck: **{_tb}** · {_tu:.0%} util")
             st.caption(
@@ -4397,8 +4392,9 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     st.markdown("---")
     st.markdown("#### 👥 People you could move (rotation candidates)")
     st.caption(
-        "Stations sorted from most idle to most loaded. The greener the row, the more "
-        "people are free to cross-train and help bottleneck stations."
+        "Stations sorted from most idle to most loaded. A ✅ / 🟡 **Rotation "
+        "potential** tag means people there are free to cross-train and help "
+        "bottleneck stations; 🟠 / 🔴 rows have little or none to spare."
     )
 
     idle_rows = []
@@ -4720,7 +4716,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
     edited = st.data_editor(
         display_df,
         use_container_width=True, num_rows="fixed",
-        key="fv_machine_editor", height=600,
+        key=f"fv_machine_editor_{int(only_used)}", height=600,
         column_config=col_cfg, hide_index=True,
     )
 
@@ -4846,7 +4842,7 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     edited = st.data_editor(
         display_df,
         use_container_width=True, num_rows="fixed",
-        key="fv_acc_editor", height=600,
+        key=f"fv_acc_editor_{int(only_used)}", height=600,
         column_config=col_cfg, hide_index=True,
     )
     st.caption(
@@ -5668,15 +5664,20 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
         "**How long does it take to build one of each unit?**  \n"
         "ℹ️ Lead Time assumes a **single person** building the whole unit start-to-finish. "
         "Real production runs in parallel across stations, so the actual elapsed time is much shorter. "
-        "Use lead time to compare units to each other, not to predict ship dates.\n\n"
-        "• **Total Labor** — sum of person-minutes across every station the unit touches.  \n"
-        "• **Machine / Accessory Labor** — that total split by source: the FG (machine) "
-        "catalog vs the accessory catalog. They add up to Total Labor.  \n"
-        "• **Lead Time (days)** — wall-clock days if **one person** built the whole unit "
-        f"alone = `Total Labor ÷ ({inputs['shift']} min × efficiency)`.  \n"
-        "• **Sum of Cycles** — wall-clock minutes if every station was done sequentially "
-        "with your current Crew settings (upper bound — real flow has parallel sub-assembly)."
+        "Use lead time to compare units to each other, not to predict ship dates."
     )
+    with st.expander("What the columns mean"):
+        st.markdown(
+            "• **Total Labor** — sum of person-minutes across every station the unit touches.  \n"
+            "• **Machine / Accessory Labor** — that total split by source: the FG (machine) "
+            "catalog vs the accessory catalog. They add up to Total Labor.  \n"
+            "• **(p-hr) columns** — the same figure as the matching (p-min) column, "
+            "converted to person-hours (`p-min ÷ 60`); not a separate measurement.  \n"
+            "• **Lead Time (days)** — wall-clock days if **one person** built the whole unit "
+            f"alone = `Total Labor ÷ ({inputs['shift']} min × efficiency)`.  \n"
+            "• **Sum of Cycles** — wall-clock minutes if every station was done sequentially "
+            "with your current Crew settings (upper bound — real flow has parallel sub-assembly)."
+        )
 
     shift = inputs["shift"]
     efficiency = max(inputs["efficiency"], 0.01)  # avoid div-by-zero
@@ -5926,9 +5927,9 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
     st.markdown(
         "**Where does this unit go on the floor?** Pick an FG SKU "
         "(+ optional Accessory) to see the route. The graph is built from "
-        "**editable per-class edges** stored in `data/process_flow.json` — use "
-        "the **🔧 Edit process flow** panel below to correct the manufacturing "
-        "precedence for your facility."
+        "**editable per-class edges** managed in the **🔧 Edit process flow** "
+        "panel below — no need to touch any file by hand. Use it to correct the "
+        "manufacturing precedence for your facility."
     )
 
     # ---- Load edges from JSON -------------------------------------------
@@ -6645,7 +6646,7 @@ def _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_a
         rec_df,
         use_container_width=True, height=520, hide_index=True,
         num_rows="fixed",
-        key="recon_editor",
+        key=f"recon_editor_{int(only_used)}_{'-'.join(sorted(side_filter))}",
         column_config={
             "Apply": st.column_config.CheckboxColumn(
                 "Apply",

@@ -952,6 +952,8 @@ def _load_schedule_df(
         _load_machine_df(_csv_mtime("machine_clean.csv")), location,
     )
     acc_df_full = _load_acc_df(_csv_mtime("acc_clean.csv"))
+    # Accessory SKU set for auto-stripping customer-decal suffixes on load.
+    acc_skus = set(acc_df_full["SKU"].astype(str))
 
     # The Plan-month picker is authoritative — show it on the confirmation pill
     # (and use it for auto-spread) rather than the CSV's own PRODUCTION MONTH.
@@ -961,9 +963,18 @@ def _load_schedule_df(
         _plan_label = f"{calendar.month_name[_pm]} {_py}"
 
     def _finalize(df: pd.DataFrame, source: str) -> pd.DataFrame:
-        """Common post-load step: auto-spread blank PRODUCTION DAY rows so
-        the weekly heatmap has something to chart, then stash the summary."""
+        """Common post-load step: auto-strip customer-decal suffixes from the
+        displayed SKU columns, auto-spread blank PRODUCTION DAY rows so the
+        weekly heatmap has something to chart, then stash the summary."""
         if df is not None and not df.empty:
+            # Auto-clean customer-decal suffixes (e.g. BOSS70-001HRC →
+            # BOSS70-001) on every load so the suffixed text never leaks into
+            # the Sequence editor, Calendar, or downloaded CSV. Idempotent —
+            # a no-op on already-clean data. Orphan suffixes (base not in
+            # catalog) are intentionally left untouched by the helper.
+            df, _n_fg, _n_acc = _strip_customer_suffixes_from_schedule(
+                df, machine_skus, acc_skus,
+            )
             _auto_spread_dates(
                 df, machine_df_full, acc_df_full, location,
                 target_month_hint=target_month_hint,

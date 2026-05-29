@@ -4231,6 +4231,122 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                         },
                     )
 
+            # ---------------------------------------------------------
+            # Space limits — max units driven by physical cells/stations
+            # (throughput), not by headcount. Adding people doesn't relieve
+            # a space-bound station; only adding cells or cutting cycle time
+            # does. Surfaces the per-station + per-area space ceiling that's
+            # otherwise buried in the full-detail expander.
+            # ---------------------------------------------------------
+            stn_rows = []
+            for st_disp, row in capacity.iterrows():
+                need_day = float(row.get("need_per_day", 0) or 0)
+                cap_day = float(row.get("thru_cap_safe", 0) or 0)
+                util = float(row.get("thru_util_safe", 0) or 0)
+                # Only stations carrying demand AND with a defined cell cap
+                # are space-constrained; skip the rest.
+                if need_day <= 0 or cap_day <= 0 or util <= 0:
+                    continue
+                conc = int(row.get("Conc", 0) or 0)
+                is_batt = "Battery" in str(st_disp)
+                stn_rows.append({
+                    "Station": f"🔋 {st_disp}" if is_batt else str(st_disp),
+                    "Stations/Cells": conc,
+                    "Cycle min/unit": round(float(row.get("avg_cycle", 0) or 0), 1),
+                    "Units/day per cell": round(cap_day / conc, 1) if conc > 0 else 0.0,
+                    "Max units/day (cells)": int(round(cap_day)),
+                    "Max units (this plan)": int(total_units // util),
+                    "Cells used %": round(util * 100),
+                    "Status": row.get("thru_status_safe", "") or "—",
+                })
+
+            # Per-area space roll-up (reuses area_groups built just above).
+            sp_area_rows = []
+            for area, stations in area_groups.items():
+                sub = capacity[capacity.index.isin(stations)]
+                if sub.empty:
+                    continue
+                _smu = _max_units_at_current_mix(sub, total_units)
+                _s_tu = float(_smu.get("thru_max_util_safe", 0) or 0)
+                if _s_tu <= 0:
+                    continue
+                sp_area_rows.append({
+                    "Area": area,
+                    "Max units (cells)": int(_smu.get("thru_max_units", 0) or 0),
+                    "Limiting cell": _smu.get("thru_bottleneck", "") or "—",
+                    "Cells used %": round(_s_tu * 100),
+                })
+
+            if stn_rows:
+                with st.expander(
+                    "🏗️ Space limits — max units by cells/stations", expanded=False
+                ):
+                    st.caption(
+                        "Throughput is set by **physical cells, not people** — "
+                        "adding HC won't lift these. Relieve a space-bound "
+                        "station by adding **Stations/Cells** in the 👥 Station "
+                        "headcount panel or shortening its cycle time."
+                    )
+                    stn_df = (
+                        pd.DataFrame(stn_rows)
+                        .sort_values("Max units (this plan)")
+                        .reset_index(drop=True)
+                    )
+                    st.dataframe(
+                        stn_df, use_container_width=True, hide_index=True,
+                        column_config={
+                            "Station": st.column_config.TextColumn(
+                                "Station", help="🔋 Battery is measured in batteries/day, not units/day."),
+                            "Stations/Cells": st.column_config.NumberColumn(
+                                "Stations/Cells", format="%d",
+                                help="Parallel cells/bays you have at this station today."),
+                            "Cycle min/unit": st.column_config.NumberColumn(
+                                "Cycle min/unit", format="%.1f",
+                                help="Calendar minutes one cell spends per unit (labor ÷ crew)."),
+                            "Units/day per cell": st.column_config.NumberColumn(
+                                "Units/day per cell", format="%.1f",
+                                help="Extra units/day each added cell buys = (shift ÷ cycle) × buffers."),
+                            "Max units/day (cells)": st.column_config.NumberColumn(
+                                "Max units/day (cells)", format="%d",
+                                help="Cells × units/day per cell. 🔋 Battery row is batteries/day."),
+                            "Max units (this plan)": st.column_config.NumberColumn(
+                                "Max units (this plan)", format="%d",
+                                help="How far the current mix can scale before this station's cells saturate."),
+                            "Cells used %": st.column_config.NumberColumn(
+                                "Cells used %", format="%d%%",
+                                help="Share of this station's cell-time the plan consumes. >100% = space bottleneck."),
+                            "Status": st.column_config.TextColumn(
+                                "Status", help="Throughput health: 🟢 OK · 🟡 Tight · 🟠 Near cap · 🔴 Over."),
+                        },
+                    )
+                    st.caption(
+                        "Lowest **Max units (this plan)** = your space bottleneck. "
+                        "The 🔋 Battery row is counted in **batteries/day**."
+                    )
+
+                    if sp_area_rows:
+                        st.markdown("**By production area**")
+                        sp_area_df = (
+                            pd.DataFrame(sp_area_rows)
+                            .sort_values("Max units (cells)")
+                            .reset_index(drop=True)
+                        )
+                        st.dataframe(
+                            sp_area_df, use_container_width=True, hide_index=True,
+                            column_config={
+                                "Area": st.column_config.TextColumn(
+                                    "Area", help="Production area (grouped stations)."),
+                                "Max units (cells)": st.column_config.NumberColumn(
+                                    "Max units (cells)", format="%d",
+                                    help="Units this area's cells alone can build at the current mix."),
+                                "Limiting cell": st.column_config.TextColumn(
+                                    "Limiting cell", help="The space-binding station within the area."),
+                                "Cells used %": st.column_config.NumberColumn(
+                                    "Cells used %", format="%d%%",
+                                    help="The limiting cell's utilization at the current plan."),
+                            },
+                        )
+
             st.markdown("---")
 
     # =============================================================

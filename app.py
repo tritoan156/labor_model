@@ -24,6 +24,15 @@ from core.data_loader import (
     resolve_item_time, unique_abbrs,
     ScheduleColumnError,
 )
+import importlib as _importlib
+import core.labor_calculator as _labor_calculator
+# Streamlit Cloud reruns app.py on every git push but does NOT always re-import
+# changed submodules — it can keep an OLD core.* module cached in sys.modules,
+# making newly-added functions look "missing" (ImportError) until a manual
+# reboot. Reload defensively so a code push self-heals: the on-disk file is
+# current, so reload() re-executes it and picks up any new names.
+if not hasattr(_labor_calculator, "buildable_by_line"):
+    _importlib.reload(_labor_calculator)
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,

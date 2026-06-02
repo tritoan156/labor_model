@@ -1,0 +1,41 @@
+{
+  "Spartanburg": {
+    "Spartanburg June 06/02": {
+      "saved_at": "2026-06-02T11:59:24-07:00",
+      "assumptions": {
+        "units": 419,
+        "total_earned_hours": 3867.4666666666667,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.2,
+        "new_hire_productivity": 0.5,
+        "absenteeism": 0.05,
+        "safety": 1.0,
+        "shift_minutes": 480,
+        "working_days": 22,
+        "available_hc": 47.0,
+        "schedule_label": "June 2026"
+      },
+      "metrics": {
+        "total_earned_hours": 3867.4666666666667,
+        "total_units": 419,
+        "units_per_day": 19.045454545454547,
+        "available_headcount": 47.0,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.2,
+        "new_hire_productivity": 0.5,
+        "absenteeism": 0.05,
+        "safety": 1.0,
+        "adjusted_efficiency": 0.45,
+        "effective_hours_per_person": 75.24,
+        "net_available_hours": 8272.0,
+        "available_earned_hours": 3536.2799999999997,
+        "headcount_needed_aggregate": 51.401736664894564,
+        "headcount_needed_station": 54.0,
+        "missed_units_aggregate": 35.88064883127634,
+        "missed_units_station": 79,
+        "coverage_pct": 91.43659932427772,
+        "verdict": "No Good"
+      }
+    }
+  }
+}

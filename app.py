@@ -6518,6 +6518,13 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
             "Cycle Time (min)": total_cycle,
         }])
         breakdown_df = pd.concat([breakdown_df, total_row], ignore_index=True)
+        # The TOTAL row puts "—" in an otherwise-integer column, making it a
+        # mixed-type object column that pyarrow can't serialize (it tries
+        # int64). Cast to uniform string so Arrow serializes cleanly — no
+        # noisy "Serialization … unsuccessful" warning.
+        breakdown_df["Crew working in parallel"] = (
+            breakdown_df["Crew working in parallel"].astype(str)
+        )
 
         st.dataframe(
             breakdown_df, use_container_width=True, hide_index=True, height=460,
@@ -6773,6 +6780,8 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
                 else _crew_for(sv["key"])
             ),
         })
+    # Sort numerically by depth BEFORE the TOTAL row (which carries non-numeric
+    # sentinels) is appended.
     breakdown_df = pd.DataFrame(table_rows).sort_values(by="Stage / depth")
     total_row = pd.DataFrame([{
         "Stage / depth": "",
@@ -6783,6 +6792,11 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
         "Crew (parallel)": "—",
     }])
     breakdown_df = pd.concat([breakdown_df, total_row], ignore_index=True)
+    # The TOTAL row puts "" / "—" into otherwise-integer columns, making them
+    # mixed-type object columns that pyarrow can't serialize (it tries int64).
+    # Cast those columns to uniform string so Arrow serializes cleanly.
+    for _c in ("Stage / depth", "Crew (parallel)"):
+        breakdown_df[_c] = breakdown_df[_c].astype(str)
     st.dataframe(
         breakdown_df, use_container_width=True, hide_index=True, height=420,
     )

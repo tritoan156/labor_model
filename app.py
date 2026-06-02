@@ -31,13 +31,14 @@ import core.labor_calculator as _labor_calculator
 # making newly-added functions look "missing" (ImportError) until a manual
 # reboot. Reload defensively so a code push self-heals: the on-disk file is
 # current, so reload() re-executes it and picks up any new names.
-if not hasattr(_labor_calculator, "buildable_by_line"):
+if not hasattr(_labor_calculator, "executive_summary"):
     _importlib.reload(_labor_calculator)
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
     compute_unit_labor, unit_labor_split,
     classify_fg_category, buildable_by_line,
+    executive_summary, adjusted_efficiency, labor_availability_factor,
 )
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
@@ -47,6 +48,13 @@ from core.constants import (
 )
 from core.facility_storage import (
     load_facility_crew_df, save_facility_crew_to_github,
+)
+from core.facility_settings_storage import (
+    get_facility_settings, save_facility_settings_to_github,
+)
+from core.exec_scenario_storage import (
+    list_exec_scenarios, get_exec_scenario,
+    save_exec_scenario_to_github, delete_exec_scenario_on_github,
 )
 from core.catalog_storage import (
     save_catalog_to_github,
@@ -3173,6 +3181,69 @@ def render_sidebar() -> dict:
             ),
         )
 
+        # ------------------------------------------------------------
+        # Workforce availability — new-hire ramp + absenteeism. These
+        # reduce LABOR capacity only (never physical throughput / cells),
+        # so they shift Required-HC, labor utilization and buildable
+        # units, but leave the Space-limits view untouched. Seeded from
+        # this facility's saved planning assumptions and re-savable.
+        # ------------------------------------------------------------
+        st.markdown("**🧑‍🏭 Workforce availability**")
+        _fs_saved = get_facility_settings(location)
+        _nh_key = f"new_hire_pct_pct_{location}"
+        _np_key = f"new_hire_prod_pct_{location}"
+        _ab_key = f"absenteeism_pct_{location}"
+        for _k, _frac in ((_nh_key, _fs_saved["new_hire_pct"]),
+                          (_np_key, _fs_saved["new_hire_productivity"]),
+                          (_ab_key, _fs_saved["absenteeism"])):
+            if _k not in st.session_state:
+                st.session_state[_k] = int(round(_frac * 100))
+
+        new_hire_pct = st.slider(
+            "New hire %", 0, 100, step=5, key=_nh_key,
+            help="Share of the crew who are new hires (still ramping up).",
+        ) / 100.0
+        new_hire_productivity = st.slider(
+            "New-hire productivity %", 0, 100, step=5, key=_np_key,
+            help="A new hire's pace vs a seasoned worker (50% = half speed).",
+        ) / 100.0
+        absenteeism = st.slider(
+            "Absenteeism %", 0, 30, step=1, key=_ab_key,
+            help="Share of paid time not worked (absences) — reduces available labor.",
+        ) / 100.0
+
+        _adj_eff = efficiency * (1.0 - new_hire_pct * (1.0 - new_hire_productivity))
+        st.caption(
+            f"Adjusted efficiency **{_adj_eff*100:.1f}%** "
+            f"(base {efficiency*100:.0f}% × new-hire drag), "
+            f"absenteeism −{absenteeism*100:.0f}%. "
+            "Affects labor / Required-HC & buildable — **not** Space-limits."
+        )
+
+        if st.button(f"💾 Save planning assumptions for {location}",
+                     use_container_width=True, key=f"save_assump_{location}"):
+            token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+            if not token:
+                st.error(
+                    "GitHub token not configured. Ask your admin to add "
+                    "`github_token` to Streamlit Secrets."
+                )
+            else:
+                try:
+                    with st.spinner(f"Saving {location} assumptions to GitHub..."):
+                        save_facility_settings_to_github(location, {
+                            "new_hire_pct": new_hire_pct,
+                            "new_hire_productivity": new_hire_productivity,
+                            "absenteeism": absenteeism,
+                        }, token)
+                    _track_and_flush("assumptions_save", facility=location)
+                    st.success(
+                        f"✅ Saved! {location} reuses these next time "
+                        "(after redeploy ~1 min)."
+                    )
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
+
     # ----------------------------------------------------------------
     # STEP 4 — Station headcount (per facility), behind an expander
     # ----------------------------------------------------------------
@@ -3483,6 +3554,9 @@ Every catalog / scenario / schedule / flow save triggers a Streamlit Cloud rebui
         "location": location,
         "safety": safety,
         "efficiency": efficiency,
+        "new_hire_pct": new_hire_pct,
+        "new_hire_productivity": new_hire_productivity,
+        "absenteeism": absenteeism,
         "days": days,
         "shift": shift,
         "crew_config": edited,
@@ -3536,6 +3610,9 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
             cap_w = build_capacity_table(
                 units_w, inputs["crew_config"], inputs["shift"], week_days,
                 inputs["safety"], inputs["efficiency"],
+                new_hire_pct=inputs.get("new_hire_pct", 0.0),
+                new_hire_productivity=inputs.get("new_hire_productivity", 1.0),
+                absenteeism=inputs.get("absenteeism", 0.0),
             )
         except Exception:
             continue
@@ -3742,6 +3819,258 @@ def _render_buildable_by_line(bl: dict, total: int) -> None:
             },
         )
         st.caption(f"Total buildable = **{total:,}** units (sum of the lines).")
+
+
+# =============================================================
+# Executive Summary tab
+# =============================================================
+def _pct100(frac) -> int:
+    """Fraction in [0,1] → integer percent for seeding a 0–100 slider."""
+    try:
+        v = float(frac)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v != v:  # NaN
+        v = 0.0
+    v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+    return int(round(v * 100))
+
+
+def _exec_summary_rows(m: dict) -> list[tuple[str, str]]:
+    """Format an executive_summary() metrics dict into ordered (label, value)
+    rows matching the legacy planning spreadsheet."""
+    def _pct(x):
+        return "—" if x is None else f"{x * 100:.0f}%"
+
+    def _num(x, d=1):
+        return "—" if x is None else f"{x:,.{d}f}"
+
+    safety = m.get("safety", 1.0)
+    hc_station = m.get("headcount_needed_station")
+    missed_station = m.get("missed_units_station")
+    return [
+        ("Units/day", _num(m.get("units_per_day", 0), 1)),
+        ("Units", f"{int(m.get('total_units', 0)):,}"),
+        ("Total Hours Earned", _num(m.get("total_earned_hours", 0), 0)),
+        ("New Hire %", _pct(m.get("new_hire_pct", 0))),
+        ("New-Hire Productivity", _pct(m.get("new_hire_productivity", 0))),
+        ("Base Efficiency", _pct(m.get("base_efficiency", 0))),
+        ("Adjusted Efficiency", _pct(m.get("adjusted_efficiency", 0))),
+        ("Absenteeism", _pct(m.get("absenteeism", 0))),
+        ("Safety buffer", _pct(1.0 - float(safety or 0))),
+        ("Headcount Needed (aggregate)", _num(m.get("headcount_needed_aggregate", 0), 2)),
+        ("Headcount Needed (station-aware)",
+         _num(hc_station, 0) if hc_station is not None else "—"),
+        ("Available Headcount", _num(m.get("available_headcount", 0), 0)),
+        ("Net Available Hours", _num(m.get("net_available_hours", 0), 0)),
+        ("Available Earned Hours", _num(m.get("available_earned_hours", 0), 1)),
+        ("Missed Units (aggregate)", _num(m.get("missed_units_aggregate", 0), 1)),
+        ("Missed Units (station-aware)",
+         (f"{int(missed_station):,}" if missed_station is not None else "—")),
+        ("Verdict", m.get("verdict", "—")),
+    ]
+
+
+def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
+    """Monthly executive labor summary (mirrors the legacy planning sheet),
+    with per-facility save/reload and a side-by-side multi-facility table."""
+    location = inputs.get("location", "Henderson")
+    month_label = inputs.get("plan_month_label", "")
+    st.markdown(f"### 📋 Executive Summary — {location}"
+                f"{(' · ' + month_label) if month_label else ''}")
+    st.caption(
+        "Monthly labor roll-up in the style of the planning sheet. **New-hire ramp** "
+        "and **absenteeism** (set in the sidebar under *Working-time settings*) reduce "
+        "available labor; safety is shown as a buffer. Headcount Needed and Missed "
+        "Units are shown both as a simple **aggregate** (treats labor as fully "
+        "shareable) and **station-aware** (respects per-station bottlenecks)."
+    )
+
+    has_live = units is not None and not units.empty
+    metrics = None
+    avail_hc = 0.0
+    if has_live:
+        total_earned_minutes = float(units["total_labor"].sum())
+        try:
+            avail_hc = float(inputs["crew_config"]["HC"].sum())
+        except Exception:
+            avail_hc = 0.0
+        station_required_hc = None
+        station_buildable = None
+        if capacity is not None and not capacity.empty:
+            try:
+                station_required_hc = float(capacity["required_hc"].sum())
+            except Exception:
+                station_required_hc = None
+            try:
+                station_buildable = int(buildable_by_line(units, capacity).get("total", 0))
+            except Exception:
+                station_buildable = None
+
+        metrics = executive_summary(
+            total_earned_minutes=total_earned_minutes,
+            total_units=int(total_units or len(units)),
+            available_hc=avail_hc,
+            shift_minutes=int(inputs.get("shift", 480)),
+            working_days=int(inputs.get("days", 20)),
+            base_efficiency=float(inputs.get("efficiency", 0.5)),
+            new_hire_pct=float(inputs.get("new_hire_pct", 0.0)),
+            new_hire_productivity=float(inputs.get("new_hire_productivity", 1.0)),
+            absenteeism=float(inputs.get("absenteeism", 0.0)),
+            safety=float(inputs.get("safety", 1.0)),
+            station_required_hc=station_required_hc,
+            station_buildable=station_buildable,
+        )
+
+    if has_live and metrics is not None:
+        col_live, col_save = st.columns([2, 1])
+        with col_live:
+            st.markdown(f"**Current settings — {location}**")
+            live_df = pd.DataFrame(
+                _exec_summary_rows(metrics), columns=["Metric", location]
+            ).set_index("Metric")
+            st.dataframe(live_df, use_container_width=True)
+            hc_need = metrics["headcount_needed_aggregate"]
+            if metrics["verdict"] == "Good":
+                st.success(
+                    f"✅ **Good** — {avail_hc:.0f} available ≥ {hc_need:.1f} needed "
+                    "(aggregate)."
+                )
+            else:
+                st.error(
+                    f"⛔ **No Good** — short ~{hc_need - avail_hc:.1f} people "
+                    f"({avail_hc:.0f} available vs {hc_need:.1f} needed); "
+                    f"~{metrics['missed_units_aggregate']:.0f} units at risk."
+                )
+
+        with col_save:
+            st.markdown("**💾 Save this scenario**")
+            _placeholder = f"{location} {month_label}".strip()
+            _save_name = st.text_input(
+                "Scenario name", key=f"exec_save_name_{location}",
+                placeholder=_placeholder or "e.g. Cypress May",
+            )
+            if st.button("💾 Save executive scenario",
+                         key=f"exec_save_btn_{location}", use_container_width=True):
+                token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+                name = (_save_name or "").strip()
+                if not name:
+                    st.warning("Enter a scenario name first.")
+                elif not token:
+                    st.error("GitHub token not configured. Ask your admin to add "
+                             "`github_token` to Streamlit Secrets.")
+                else:
+                    assumptions = {
+                        "units": metrics["total_units"],
+                        "total_earned_hours": metrics["total_earned_hours"],
+                        "base_efficiency": metrics["base_efficiency"],
+                        "new_hire_pct": metrics["new_hire_pct"],
+                        "new_hire_productivity": metrics["new_hire_productivity"],
+                        "absenteeism": metrics["absenteeism"],
+                        "safety": metrics["safety"],
+                        "shift_minutes": int(inputs.get("shift", 480)),
+                        "working_days": int(inputs.get("days", 20)),
+                        "available_hc": avail_hc,
+                        "schedule_label": month_label,
+                    }
+                    try:
+                        with st.spinner("Saving executive scenario..."):
+                            save_exec_scenario_to_github(
+                                location, name, assumptions, metrics, token)
+                        _track_and_flush("exec_scenario_save",
+                                         facility=location, name=name)
+                        st.success(f"✅ Saved **{name}**. Visible to all after "
+                                   "redeploy (~1 min).")
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")
+
+            saved = list_exec_scenarios(location)
+            if saved:
+                pick = st.selectbox("Saved scenarios", saved, key=f"exec_pick_{location}")
+                c1, c2 = st.columns(2)
+                if c1.button("📥 Re-apply", key=f"exec_load_{location}",
+                             use_container_width=True):
+                    a = (get_exec_scenario(location, pick) or {}).get("assumptions", {})
+                    st.session_state[f"new_hire_pct_pct_{location}"] = _pct100(a.get("new_hire_pct", 0))
+                    st.session_state[f"new_hire_prod_pct_{location}"] = _pct100(a.get("new_hire_productivity", 0.5))
+                    st.session_state[f"absenteeism_pct_{location}"] = _pct100(a.get("absenteeism", 0.05))
+                    st.success(f"Re-applied workforce assumptions from **{pick}**.")
+                    st.rerun()
+                if c2.button("🗑 Delete", key=f"exec_del_{location}",
+                             use_container_width=True):
+                    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+                    if not token:
+                        st.error("GitHub token not configured.")
+                    else:
+                        try:
+                            delete_exec_scenario_on_github(location, pick, token)
+                            st.success(f"Deleted **{pick}**.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
+    else:
+        st.info("📭 Load a schedule to compute the live summary. Saved scenarios "
+                "(if any) still appear below.")
+
+    # --- Multi-facility side-by-side (from saved frozen snapshots) ------
+    st.markdown("---")
+    st.markdown("#### 🏭 Side-by-side comparison (saved scenarios)")
+    st.caption("Pick a saved scenario per facility to compare them like the "
+               "executive sheet. Each column is **frozen** as of its save.")
+    fac_cols = st.columns(len(LOCATIONS))
+    chosen = {}
+    for i, fac in enumerate(LOCATIONS):
+        names = list_exec_scenarios(fac)
+        with fac_cols[i]:
+            if names:
+                # default to the last name (most recently named) in the list
+                chosen[fac] = st.selectbox(
+                    fac, ["—"] + names, index=len(names), key=f"exec_cmp_{fac}")
+            else:
+                st.caption(f"**{fac}** — none saved")
+                chosen[fac] = "—"
+
+    cols_data = {}
+    for fac in LOCATIONS:
+        nm = chosen.get(fac, "—")
+        if nm and nm != "—":
+            m = (get_exec_scenario(fac, nm) or {}).get("metrics", {})
+            if m:
+                cols_data[f"{fac} — {nm}"] = dict(_exec_summary_rows(m))
+
+    if cols_data:
+        # Row order taken from a reference render so it matches the live table.
+        _ref = metrics if metrics is not None else {"safety": 1.0}
+        order = [r[0] for r in _exec_summary_rows(_ref)]
+        cmp_df = pd.DataFrame(cols_data).reindex(order)
+
+        def _style_verdict(row):
+            if row.name != "Verdict":
+                return ["" for _ in row]
+            out = []
+            for v in row:
+                if str(v) == "Good":
+                    out.append("color:white; background-color:#1a9850; font-weight:700")
+                elif str(v) == "No Good":
+                    out.append("color:white; background-color:#d73027; font-weight:700")
+                else:
+                    out.append("")
+            return out
+
+        try:
+            st.dataframe(cmp_df.style.apply(_style_verdict, axis=1),
+                         use_container_width=True)
+        except Exception:
+            st.dataframe(cmp_df, use_container_width=True)
+        st.download_button(
+            "📥 Download comparison CSV",
+            cmp_df.to_csv().encode("utf-8"),
+            file_name="executive_summary.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("Save a scenario for each facility (above) to build the "
+                "side-by-side comparison.")
 
 
 def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", weekly_util=None):
@@ -7625,6 +7954,9 @@ def main():
         capacity = build_capacity_table(
             units, inputs["crew_config"], inputs["shift"], inputs["days"],
             inputs["safety"], inputs["efficiency"],
+            new_hire_pct=inputs.get("new_hire_pct", 0.0),
+            new_hire_productivity=inputs.get("new_hire_productivity", 1.0),
+            absenteeism=inputs.get("absenteeism", 0.0),
         )
         batt_sku = battery_demand_by_sku(units)
         batt_type = battery_demand_by_type(units)
@@ -7884,6 +8216,7 @@ def main():
     # consolidated into the single 📁 Data & Setup tab.
     tabs = st.tabs([
         "🏠 Overview",
+        "📋 Executive Summary",
         "📆 Calendar",
         "📊 Capacity",
         "🔧 Recommendations",
@@ -7907,6 +8240,10 @@ def main():
         else:
             tab_overview(units, capacity, batt_type, inputs, schedule_month, weekly_util=weekly_util)
     with tabs[1]:
+        # Executive Summary — renders its own info banner when there's no
+        # live schedule, and still shows saved cross-facility scenarios.
+        tab_exec_summary(units, capacity, inputs, total_units=len(units))
+    with tabs[2]:
         # Calendar — week & day rollups. ALWAYS use the full (unfiltered)
         # schedule here so the planner sees the entire month's per-week
         # rollup regardless of the sidebar Time-window setting. The helper
@@ -7917,25 +8254,25 @@ def main():
             plan_month=inputs.get("plan_month"),
             plan_month_label=inputs.get("plan_month_label", ""),
         )
-    with tabs[2]:
+    with tabs[3]:
         if units.empty:
             _empty_state("Capacity")
         else:
             tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type, total_units=len(units), units=units)
-    with tabs[3]:
+    with tabs[4]:
         if units.empty:
             _empty_state("Recommendations")
         else:
             tab_mitigation(capacity, batt_sku, units, inputs)
-    with tabs[4]:
+    with tabs[5]:
         if units.empty:
             _empty_state("Build Time")
         else:
             tab_cycle_time(units, inputs, machine_df, acc_df)
-    with tabs[5]:
+    with tabs[6]:
         # Process Flow can show the editable flow even without a schedule
         tab_process_flow(units, machine_df, acc_df, inputs)
-    with tabs[6]:
+    with tabs[7]:
         tab_data_setup(
             machine_df=machine_df, acc_df=acc_df, schedule_df=schedule_df,
             item_master_df=item_master_df, item_packages_df=item_packages_df,

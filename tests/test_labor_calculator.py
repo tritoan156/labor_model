@@ -12,6 +12,7 @@ from core.labor_calculator import (
     expand_schedule, station_demand_table, cycle_for_unit, weighted_avg_cycle,
     build_capacity_table, buildable_by_line, _status_emoji, _overall_status,
     battery_demand_by_sku, battery_demand_by_type,
+    labor_availability_factor, adjusted_efficiency, executive_summary,
 )
 from core.constants import STATION_KEYS, DEFAULT_BATT_RAW, DEFAULT_NAMEPLATE_PREP
 
@@ -326,6 +327,33 @@ class TestBuildCapacityTable:
         cap = build_capacity_table(units, crew, 480, 0, 1.0, 0.5)  # no raise
         assert cap.loc["QC"]["required_hc"] == 0
 
+    def test_workforce_factor_hits_labor_not_throughput(self):
+        # New-hire ramp + absenteeism reduce LABOR capacity / raise Required-HC,
+        # but must leave physical throughput (thru_cap_safe / thru_util_safe)
+        # byte-for-byte identical — Space-limits is judged on cells, not staffing.
+        units = make_units_df([{"QC": 100}, {"QC": 100}])
+        crew = make_crew({"QC": (4, 4, 1)})
+        base = build_capacity_table(units, crew, 480, 20, 1.0, 0.5)
+        adj = build_capacity_table(units, crew, 480, 20, 1.0, 0.5,
+                                   new_hire_pct=0.2, new_hire_productivity=0.5,
+                                   absenteeism=0.05)
+        f = labor_availability_factor(0.2, 0.5, 0.05)  # 0.9 * 0.95 = 0.855
+        # Throughput side: unchanged
+        assert adj.loc["QC"]["thru_cap_safe"] == pytest.approx(base.loc["QC"]["thru_cap_safe"])
+        assert adj.loc["QC"]["thru_util_safe"] == pytest.approx(base.loc["QC"]["thru_util_safe"])
+        # Labor side: scaled by the factor
+        assert adj.loc["QC"]["labor_cap_safe"] == pytest.approx(base.loc["QC"]["labor_cap_safe"] * f)
+        assert adj.loc["QC"]["labor_util_safe"] == pytest.approx(base.loc["QC"]["labor_util_safe"] / f)
+
+    def test_workforce_factor_defaults_are_noop(self):
+        units = make_units_df([{"QC": 100}, {"QC": 100}])
+        crew = make_crew({"QC": (4, 4, 1)})
+        base = build_capacity_table(units, crew, 480, 20, 1.0, 0.5)
+        same = build_capacity_table(units, crew, 480, 20, 1.0, 0.5,
+                                    new_hire_pct=0.0, new_hire_productivity=1.0,
+                                    absenteeism=0.0)
+        assert same.loc["QC"]["labor_cap_safe"] == pytest.approx(base.loc["QC"]["labor_cap_safe"])
+
 
 # --------------------------------------------------------------------------
 # status emojis
@@ -487,3 +515,95 @@ class TestBuildableByLine:
 
     def test_empty(self):
         assert buildable_by_line(pd.DataFrame(), self._cap({"X": (1, 0.5, 0)})) == {"lines": [], "total": 0}
+
+
+# --------------------------------------------------------------------------
+# Workforce-availability factors
+# --------------------------------------------------------------------------
+class TestWorkforceFactors:
+    def test_labor_availability_factor(self):
+        # (1 - 0.10*(1-0.50)) * (1 - 0.05) = 0.95 * 0.95 = 0.9025
+        assert labor_availability_factor(0.10, 0.50, 0.05) == pytest.approx(0.95 * 0.95)
+        # No new hires, no absenteeism → 1.0 (no-op)
+        assert labor_availability_factor(0.0, 1.0, 0.0) == pytest.approx(1.0)
+        # All new hires at 0% productivity, 0 absent → 0.0
+        assert labor_availability_factor(1.0, 0.0, 0.0) == pytest.approx(0.0)
+
+    def test_labor_availability_factor_clamps(self):
+        # Out-of-range / bad inputs clamp to [0,1] rather than blow up.
+        # nh 2.0 → 1.0; prod 0.5; absent 0 → (1 - 1.0*0.5) = 0.5
+        assert labor_availability_factor(2.0, 0.5, 0.0) == pytest.approx(0.5)
+        # NaN new-hire share → treated as 0 → no drag → 1.0
+        assert labor_availability_factor(float("nan"), 0.5, 0.0) == pytest.approx(1.0)
+
+    def test_adjusted_efficiency_matches_legacy_sheet(self):
+        # The three facility columns from the legacy planning spreadsheet.
+        assert adjusted_efficiency(0.45, 0.10, 0.50) == pytest.approx(0.4275)
+        assert adjusted_efficiency(0.45, 0.40, 0.50) == pytest.approx(0.36)
+        assert adjusted_efficiency(0.50, 0.20, 0.50) == pytest.approx(0.45)
+
+    def test_adjusted_efficiency_excludes_absenteeism(self):
+        # Absenteeism is reported/applied separately, never folded into adj-eff.
+        assert adjusted_efficiency(0.50, 0.0, 1.0) == pytest.approx(0.50)
+
+
+# --------------------------------------------------------------------------
+# executive_summary — reproduces the legacy monthly planning spreadsheet
+# --------------------------------------------------------------------------
+class TestExecutiveSummary:
+    def _run(self, earned_hr, units, hc, base, nh, prod):
+        return executive_summary(
+            total_earned_minutes=earned_hr * 60, total_units=units,
+            available_hc=hc, shift_minutes=480, working_days=20,
+            base_efficiency=base, new_hire_pct=nh, new_hire_productivity=prod,
+            absenteeism=0.05, safety=1.0,
+        )
+
+    def test_cypress_column(self):
+        r = self._run(1784, 226, 23, 0.45, 0.10, 0.50)
+        assert r["adjusted_efficiency"] == pytest.approx(0.4275)
+        assert r["headcount_needed_aggregate"] == pytest.approx(27.46, abs=0.05)
+        assert r["net_available_hours"] == pytest.approx(3680.0)        # 23*160
+        assert r["available_earned_hours"] == pytest.approx(1494.54, abs=0.05)
+        assert r["missed_units_aggregate"] == pytest.approx(36.7, abs=0.1)
+        assert r["verdict"] == "No Good"
+
+    def test_henderson_column(self):
+        r = self._run(2927, 200, 42, 0.45, 0.40, 0.50)
+        assert r["adjusted_efficiency"] == pytest.approx(0.36)
+        assert r["headcount_needed_aggregate"] == pytest.approx(53.49, abs=0.05)
+        assert r["available_earned_hours"] == pytest.approx(2298.24, abs=0.05)
+        assert r["missed_units_aggregate"] == pytest.approx(43.0, abs=0.1)
+        assert r["verdict"] == "No Good"
+
+    def test_spartanburg_column(self):
+        r = self._run(2505, 368, 36, 0.50, 0.20, 0.50)
+        assert r["adjusted_efficiency"] == pytest.approx(0.45)
+        assert r["headcount_needed_aggregate"] == pytest.approx(36.62, abs=0.05)
+        assert r["available_earned_hours"] == pytest.approx(2462.4, abs=0.05)
+        assert r["missed_units_aggregate"] == pytest.approx(6.3, abs=0.1)
+        assert r["verdict"] == "No Good"
+
+    def test_good_verdict_when_staffed(self):
+        # Same Cypress demand but plenty of staff → Good, zero missed.
+        r = self._run(1784, 226, 40, 0.45, 0.10, 0.50)
+        assert r["verdict"] == "Good"
+        assert r["missed_units_aggregate"] == pytest.approx(0.0)
+
+    def test_station_aware_passthrough(self):
+        r = executive_summary(
+            total_earned_minutes=1784 * 60, total_units=226, available_hc=23,
+            shift_minutes=480, working_days=20, base_efficiency=0.45,
+            new_hire_pct=0.10, new_hire_productivity=0.50, absenteeism=0.05,
+            safety=1.0, station_required_hc=31.0, station_buildable=180,
+        )
+        assert r["headcount_needed_station"] == pytest.approx(31.0)
+        assert r["missed_units_station"] == 46          # 226 - 180
+
+    def test_zero_demand_is_good(self):
+        r = executive_summary(
+            total_earned_minutes=0, total_units=0, available_hc=10,
+            shift_minutes=480, working_days=20, base_efficiency=0.5,
+        )
+        assert r["verdict"] == "Good"
+        assert r["missed_units_aggregate"] == pytest.approx(0.0)

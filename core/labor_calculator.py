@@ -55,6 +55,55 @@ def classify_fg_category(fg_base: str) -> str:
     return "Other"
 
 
+# ---------------------------------------------------------------
+# Workforce-availability factors (new-hire ramp + absenteeism)
+# ---------------------------------------------------------------
+
+def _clamp01(x) -> float:
+    """Clamp a value to [0, 1]; non-numeric / NaN → 0.0."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:  # NaN
+        return 0.0
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+
+
+def labor_availability_factor(new_hire_pct: float = 0.0,
+                              new_hire_productivity: float = 1.0,
+                              absenteeism: float = 0.0) -> float:
+    """Fraction of nominal labor actually available, given two drags:
+
+      * new-hire ramp — a share ``new_hire_pct`` of the crew works at only
+        ``new_hire_productivity`` of a seasoned worker's pace, so the crew-wide
+        multiplier is ``(1 - new_hire_pct * (1 - new_hire_productivity))``.
+      * absenteeism — a share ``absenteeism`` of paid time is simply not worked,
+        multiplying availability by ``(1 - absenteeism)``.
+
+    All args are fractions in [0, 1]. Returns a multiplier in [0, 1] applied to
+    LABOR capacity only — never to physical throughput / cells.
+    """
+    nh = _clamp01(new_hire_pct)
+    prod = _clamp01(new_hire_productivity)
+    absent = _clamp01(absenteeism)
+    return (1.0 - nh * (1.0 - prod)) * (1.0 - absent)
+
+
+def adjusted_efficiency(base_efficiency: float,
+                        new_hire_pct: float = 0.0,
+                        new_hire_productivity: float = 1.0) -> float:
+    """Base efficiency reduced by new-hire ramp only (for DISPLAY).
+
+    Mirrors the legacy planning spreadsheet's "Adjusted Efficiency" row:
+    ``base * (1 - new_hire_pct * (1 - new_hire_productivity))``. Absenteeism is
+    reported and applied as its own separate term, so it is NOT folded in here.
+    """
+    nh = _clamp01(new_hire_pct)
+    prod = _clamp01(new_hire_productivity)
+    return float(base_efficiency) * (1.0 - nh * (1.0 - prod))
+
+
 def compute_unit_labor(fg_base: str, acc_sku: str | None,
                        machine_df: pd.DataFrame, acc_df: pd.DataFrame) -> dict:
     """Return per-station labor (person-mins) for one unit.
@@ -404,7 +453,10 @@ def weighted_avg_cycle(units_df: pd.DataFrame, station: str, crew: int) -> float
 def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
                           shift_minutes: int, working_days: int,
                           safety_factor: float,
-                          efficiency_factor: float = 1.0) -> pd.DataFrame:
+                          efficiency_factor: float = 1.0,
+                          new_hire_pct: float = 0.0,
+                          new_hire_productivity: float = 1.0,
+                          absenteeism: float = 0.0) -> pd.DataFrame:
     """Build the headline capacity-vs-demand table.
 
     Args:
@@ -412,6 +464,10 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
       crew_config: DataFrame indexed by station_display with cols HC, Conc, Crew
       shift_minutes, working_days, safety_factor, efficiency_factor: scalar inputs.
         Effective capacity per HC = shift × days × efficiency × safety.
+      new_hire_pct, new_hire_productivity, absenteeism: workforce drags. These
+        multiply a labor-availability factor into LABOR capacity and Required-HC
+        ONLY (never into ``thru_cap_safe``), so physical throughput / Space-limits
+        are unaffected by staffing availability. Defaults make them a no-op.
 
     Returns DataFrame indexed by station display name with columns:
       HC, Conc, Crew,
@@ -424,6 +480,12 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
       overall_status
     """
     demand_tbl = station_demand_table(units_df)
+
+    # Labor-availability drag (new-hire ramp + absenteeism). Applied to LABOR
+    # capacity and Required-HC only — NEVER to physical throughput (cells), so
+    # the Space-limits view stays judged purely on equipment, not staffing.
+    labor_factor = labor_availability_factor(
+        new_hire_pct, new_hire_productivity, absenteeism)
 
     rows = []
     for st_key in STATION_KEYS:
@@ -441,11 +503,12 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
         #   raw  = theoretical maximum (HC × shift × days)
         #   safe = raw × efficiency × safety  (planning capacity)
         labor_cap_raw = hc * shift_minutes * working_days
-        labor_cap_safe = labor_cap_raw * efficiency_factor * safety_factor
+        labor_cap_safe = labor_cap_raw * efficiency_factor * safety_factor * labor_factor
 
         # Required HC to meet labor demand at the safe rate (rounded up).
-        # Uses efficiency × safety so the number reflects realistic planning.
-        denom = shift_minutes * working_days * efficiency_factor * safety_factor
+        # Uses efficiency × safety × labor-availability so the number reflects
+        # realistic planning (new-hire ramp + absenteeism raise the HC needed).
+        denom = shift_minutes * working_days * efficiency_factor * safety_factor * labor_factor
         if denom > 0:
             required_hc = int(math.ceil(labor_demand / denom)) if labor_demand > 0 else 0
         else:
@@ -638,6 +701,91 @@ def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame) -> dict:
             "infeasible": infeasible,
         })
     return {"lines": rows, "total": int(total)}
+
+
+# ---------------------------------------------------------------
+# Executive summary (monthly labor roll-up, mirrors legacy spreadsheet)
+# ---------------------------------------------------------------
+
+def executive_summary(*, total_earned_minutes: float, total_units: int,
+                      available_hc: float, shift_minutes: int, working_days: int,
+                      base_efficiency: float, new_hire_pct: float = 0.0,
+                      new_hire_productivity: float = 1.0, absenteeism: float = 0.0,
+                      safety: float = 1.0,
+                      station_required_hc: float | None = None,
+                      station_buildable: int | None = None) -> dict:
+    """Monthly executive labor summary (mirrors the legacy planning spreadsheet).
+
+    Aggregate (poolable-labor) view: treats total earned hours as fully shareable
+    across stations, exactly like the legacy sheet. The station-aware figures
+    (which respect per-station bottlenecks) are passed in by the caller via
+    ``station_required_hc`` / ``station_buildable`` and surfaced alongside.
+
+    Formulas (all hours are person-hours)::
+
+        total_earned_hours         = total_earned_minutes / 60
+        adjusted_efficiency        = base * (1 - NH*(1-NHprod))            [display]
+        effective_hours_per_person = (shift*days/60) * adj_eff * (1-absent) * safety
+        headcount_needed_aggregate = earned / effective_hours_per_person
+        net_available_hours        = available_hc * shift*days/60          [gross]
+        available_earned_hours     = available_hc * effective_hours_per_person
+        missed_units_aggregate     = units * max(0, 1 - avail_earned/earned)
+        verdict                    = "Good" if available_hc >= hc_needed else "No Good"
+
+    ``safety`` is the app's multiplier (1.00 = no buffer, like the legacy
+    "Safety Factor 0%"). Returns a flat dict of every row the table renders.
+    """
+    earned_hr = float(total_earned_minutes or 0.0) / 60.0
+    units = int(total_units or 0)
+    avail_hc = float(available_hc or 0.0)
+    hours_per_person = (float(shift_minutes or 0) * float(working_days or 0)) / 60.0
+
+    adj_eff = adjusted_efficiency(base_efficiency, new_hire_pct, new_hire_productivity)
+    absent = _clamp01(absenteeism)
+    safety_mult = _clamp01(safety)
+    eff_hours_per_person = hours_per_person * adj_eff * (1.0 - absent) * safety_mult
+
+    hc_needed_agg = (earned_hr / eff_hours_per_person) if eff_hours_per_person > 0 else 0.0
+    net_available_hours = avail_hc * hours_per_person
+    available_earned_hours = avail_hc * eff_hours_per_person
+
+    if earned_hr > 0:
+        coverage = available_earned_hours / earned_hr
+        missed_agg = units * max(0.0, 1.0 - coverage)
+    else:
+        coverage = 1.0
+        missed_agg = 0.0
+
+    verdict = "Good" if avail_hc >= hc_needed_agg else "No Good"
+
+    # Station-aware figures (optional — computed by the caller from the live
+    # capacity table, which already includes the same labor factor).
+    hc_needed_station = (float(station_required_hc)
+                         if station_required_hc is not None else None)
+    missed_station = (max(0, units - int(station_buildable))
+                      if station_buildable is not None else None)
+
+    return {
+        "total_earned_hours": earned_hr,
+        "total_units": units,
+        "units_per_day": (units / working_days) if working_days else 0.0,
+        "available_headcount": avail_hc,
+        "base_efficiency": float(base_efficiency),
+        "new_hire_pct": _clamp01(new_hire_pct),
+        "new_hire_productivity": _clamp01(new_hire_productivity),
+        "absenteeism": absent,
+        "safety": safety_mult,
+        "adjusted_efficiency": adj_eff,
+        "effective_hours_per_person": eff_hours_per_person,
+        "net_available_hours": net_available_hours,
+        "available_earned_hours": available_earned_hours,
+        "headcount_needed_aggregate": hc_needed_agg,
+        "headcount_needed_station": hc_needed_station,
+        "missed_units_aggregate": missed_agg,
+        "missed_units_station": missed_station,
+        "coverage_pct": coverage * 100.0,
+        "verdict": verdict,
+    }
 
 
 # ---------------------------------------------------------------

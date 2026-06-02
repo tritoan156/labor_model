@@ -37,5 +37,44 @@
         "verdict": "No Good"
       }
     }
+  },
+  "Cypress": {
+    "Cypress June 06/02": {
+      "saved_at": "2026-06-02T12:04:58-07:00",
+      "assumptions": {
+        "units": 195,
+        "total_earned_hours": 2126.45,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.15,
+        "new_hire_productivity": 0.5,
+        "absenteeism": 0.05,
+        "safety": 1.0,
+        "shift_minutes": 480,
+        "working_days": 22,
+        "available_hc": 19.0,
+        "schedule_label": "June 2026"
+      },
+      "metrics": {
+        "total_earned_hours": 2126.45,
+        "total_units": 195,
+        "units_per_day": 8.863636363636363,
+        "available_headcount": 19.0,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.15,
+        "new_hire_productivity": 0.5,
+        "absenteeism": 0.05,
+        "safety": 1.0,
+        "adjusted_efficiency": 0.4625,
+        "effective_hours_per_person": 77.33,
+        "net_available_hours": 3344.0,
+        "available_earned_hours": 1469.27,
+        "headcount_needed_aggregate": 27.498383551015127,
+        "headcount_needed_station": 31.0,
+        "missed_units_aggregate": 60.26480754308823,
+        "missed_units_station": 88,
+        "coverage_pct": 69.09497049072398,
+        "verdict": "No Good"
+      }
+    }
   }
 }

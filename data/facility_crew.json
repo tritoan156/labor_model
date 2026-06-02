@@ -88,17 +88,17 @@
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 16,
+      "HC": 15,
       "Conc": 16,
       "Crew": 1
     },
     "Com Accessories": {
-      "HC": 13,
+      "HC": 12,
       "Conc": 16,
       "Crew": 1
     },
     "Trailer Assembly": {
-      "HC": 5,
+      "HC": 4,
       "Conc": 8,
       "Crew": 1
     },
@@ -108,17 +108,17 @@
       "Crew": 1
     },
     "Accessories KIT": {
-      "HC": 0,
-      "Conc": 0,
+      "HC": 1,
+      "Conc": 1,
       "Crew": 1
     },
     "Final Assembly": {
-      "HC": 0,
-      "Conc": 0,
+      "HC": 1,
+      "Conc": 1,
       "Crew": 1
     },
     "PDI": {
-      "HC": 3,
+      "HC": 2,
       "Conc": 6,
       "Crew": 1
     },
@@ -128,7 +128,7 @@
       "Crew": 1
     },
     "Ship": {
-      "HC": 3,
+      "HC": 2,
       "Conc": 3,
       "Crew": 1
     }

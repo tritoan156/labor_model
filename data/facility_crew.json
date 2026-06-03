@@ -165,12 +165,12 @@
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 6,
+      "HC": 5,
       "Conc": 8,
       "Crew": 1
     },
     "Com Accessories": {
-      "HC": 6,
+      "HC": 7,
       "Conc": 6,
       "Crew": 1
     },
@@ -208,6 +208,16 @@
       "HC": 2,
       "Conc": 1,
       "Crew": 1
+    },
+    "Lead": {
+      "HC": 0,
+      "Conc": 0,
+      "Crew": 0
+    },
+    "Other": {
+      "HC": 0,
+      "Conc": 0,
+      "Crew": 0
     }
   }
 }

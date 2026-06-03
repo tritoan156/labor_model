@@ -3232,6 +3232,16 @@ def render_sidebar() -> dict:
         _np_key = f"new_hire_prod_pct_{location}"
         _ab_key = f"absenteeism_pct_{location}"
         _ot_key = f"overtime_pct_{location}"
+        # A scenario "Re-apply" (Executive Summary tab) stashes its assumptions
+        # under a NON-widget key. Apply them HERE — before the sliders below are
+        # instantiated — because Streamlit forbids writing a widget's
+        # session_state key once that widget has been created in the same run.
+        _pending = st.session_state.pop(f"_exec_reapply_{location}", None)
+        if _pending is not None:
+            st.session_state[_nh_key] = _pct100(_pending.get("new_hire_pct", 0))
+            st.session_state[_np_key] = _pct100(_pending.get("new_hire_productivity", 0.5))
+            st.session_state[_ab_key] = _pct100(_pending.get("absenteeism", 0.05))
+            st.session_state[_ot_key] = _pct100(_pending.get("overtime", 0.0))
         for _k, _frac in ((_nh_key, _fs_saved["new_hire_pct"]),
                           (_np_key, _fs_saved["new_hire_productivity"]),
                           (_ab_key, _fs_saved["absenteeism"]),
@@ -4001,6 +4011,9 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
     with per-facility save/reload and a side-by-side multi-facility table."""
     location = inputs.get("location", "Henderson")
     month_label = inputs.get("plan_month_label", "")
+    _reapplied = st.session_state.pop(f"_exec_reapply_toast_{location}", None)
+    if _reapplied:
+        st.success(f"Re-applied workforce assumptions from **{_reapplied}**.")
     st.markdown(f"### 📋 Executive Summary — {location}"
                 f"{(' · ' + month_label) if month_label else ''}")
     st.caption(
@@ -4144,11 +4157,16 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 if c1.button("📥 Re-apply", key=f"exec_load_{location}",
                              use_container_width=True):
                     a = (get_exec_scenario(location, pick) or {}).get("assumptions", {})
-                    st.session_state[f"new_hire_pct_pct_{location}"] = _pct100(a.get("new_hire_pct", 0))
-                    st.session_state[f"new_hire_prod_pct_{location}"] = _pct100(a.get("new_hire_productivity", 0.5))
-                    st.session_state[f"absenteeism_pct_{location}"] = _pct100(a.get("absenteeism", 0.05))
-                    st.session_state[f"overtime_pct_{location}"] = _pct100(a.get("overtime", 0.0))
-                    st.success(f"Re-applied workforce assumptions from **{pick}**.")
+                    # Stash under a NON-widget key; the sidebar applies it to the
+                    # slider widgets on the next run, before they're instantiated
+                    # (writing a widget key after instantiation raises).
+                    st.session_state[f"_exec_reapply_{location}"] = {
+                        "new_hire_pct": a.get("new_hire_pct", 0),
+                        "new_hire_productivity": a.get("new_hire_productivity", 0.5),
+                        "absenteeism": a.get("absenteeism", 0.05),
+                        "overtime": a.get("overtime", 0.0),
+                    }
+                    st.session_state[f"_exec_reapply_toast_{location}"] = pick
                     st.rerun()
                 if c2.button("🗑 Delete", key=f"exec_del_{location}",
                              use_container_width=True):

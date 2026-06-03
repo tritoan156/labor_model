@@ -11,17 +11,17 @@
       "Crew": 1
     },
     "Battery Assembly": {
-      "HC": 8,
+      "HC": 9,
       "Conc": 6,
       "Crew": 2
     },
     "PM Acc (Headunit)": {
-      "HC": 3,
+      "HC": 2,
       "Conc": 12,
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 8,
+      "HC": 7,
       "Conc": 12,
       "Crew": 1
     },
@@ -41,7 +41,7 @@
       "Crew": 2
     },
     "Accessories KIT": {
-      "HC": 1,
+      "HC": 0,
       "Conc": 1,
       "Crew": 1
     },
@@ -61,17 +61,17 @@
       "Crew": 1
     },
     "Ship": {
-      "HC": 1,
+      "HC": 2,
       "Conc": 1,
       "Crew": 1
     },
     "Lead": {
-      "HC": 0,
+      "HC": 3,
       "Conc": 0,
       "Crew": 0
     },
     "Other": {
-      "HC": 0,
+      "HC": 3,
       "Conc": 0,
       "Crew": 0
     }

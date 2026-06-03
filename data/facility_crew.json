@@ -51,7 +51,7 @@
       "Crew": 2
     },
     "PDI": {
-      "HC": 2,
+      "HC": 3,
       "Conc": 6,
       "Crew": 1
     },
@@ -64,6 +64,16 @@
       "HC": 1,
       "Conc": 1,
       "Crew": 1
+    },
+    "Lead": {
+      "HC": 0,
+      "Conc": 0,
+      "Crew": 0
+    },
+    "Other": {
+      "HC": 0,
+      "Conc": 0,
+      "Crew": 0
     }
   },
   "Spartanburg": {

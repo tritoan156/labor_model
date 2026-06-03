@@ -3897,9 +3897,11 @@ def _pct100(frac) -> int:
     return int(round(v * 100))
 
 
-def _exec_summary_rows(m: dict) -> list[tuple[str, str]]:
-    """Format an executive_summary() metrics dict into ordered (label, value)
-    rows matching the legacy planning spreadsheet."""
+def _exec_summary_sections(m: dict) -> list[tuple[str, list[tuple[str, str]]]]:
+    """Group an executive_summary() metrics dict into ordered, labeled sections
+    so the table reads as a logical input→output narrative: what we're building →
+    the levers → the resources → the result. Every metric is included; nothing
+    is dropped. Returns [(section_title, [(label, value), ...]), ...]."""
     def _pct(x):
         return "—" if x is None else f"{x * 100:.0f}%"
 
@@ -3910,35 +3912,65 @@ def _exec_summary_rows(m: dict) -> list[tuple[str, str]]:
     hc_station = m.get("headcount_needed_station")
     missed_station = m.get("missed_units_station")
     return [
-        ("Units/day", _num(m.get("units_per_day", 0), 1)),
-        ("Units", f"{int(m.get('total_units', 0)):,}"),
-        ("Total Hours Earned", _num(m.get("total_earned_hours", 0), 0)),
-        ("Man-hours / unit (standard)", _num(m.get("mh_per_unit", 0), 2)),
-        ("Man-hours / unit (effective)", _num(m.get("mh_per_unit_loaded", 0), 2)),
-        ("Avail hrs / unit (all staff, incl. support)",
-         _num(m.get("total_available_hours_per_unit", 0), 2)),
-        ("New Hire %", _pct(m.get("new_hire_pct", 0))),
-        ("New-Hire Productivity", _pct(m.get("new_hire_productivity", 0))),
-        ("Base Efficiency", _pct(m.get("base_efficiency", 0))),
-        ("Adjusted Efficiency", _pct(m.get("adjusted_efficiency", 0))),
-        ("Absenteeism", _pct(m.get("absenteeism", 0))),
-        ("Overtime", _pct(m.get("overtime", 0))),
-        ("Safety buffer", _pct(1.0 - float(safety or 0))),
-        ("Headcount Needed (aggregate)", _num(m.get("headcount_needed_aggregate", 0), 2)),
-        ("Headcount Needed (station-aware)",
-         _num(hc_station, 0) if hc_station is not None else "—"),
-        ("Available Headcount (production)", _num(m.get("available_headcount", 0), 0)),
-        ("Support HC (Lead/Other)", _num(m.get("support_headcount", 0), 0)),
-        ("Total Headcount", _num(m.get("total_headcount", 0), 0)),
-        ("Net Available Hours (production)", _num(m.get("net_available_hours", 0), 0)),
-        ("Total Available Hours (incl. support)",
-         _num(m.get("total_available_hours", 0), 0)),
-        ("Available Earned Hours", _num(m.get("available_earned_hours", 0), 1)),
-        ("Missed Units (aggregate)", _num(m.get("missed_units_aggregate", 0), 1)),
-        ("Missed Units (station-aware)",
-         (f"{int(missed_station):,}" if missed_station is not None else "—")),
-        ("Verdict", m.get("verdict", "—")),
+        ("📦 Plan & work content", [
+            ("Units", f"{int(m.get('total_units', 0)):,}"),
+            ("Units/day", _num(m.get("units_per_day", 0), 1)),
+            ("Total Hours Earned", _num(m.get("total_earned_hours", 0), 0)),
+            ("Man-hours / unit (standard)", _num(m.get("mh_per_unit", 0), 2)),
+            ("Man-hours / unit (effective)", _num(m.get("mh_per_unit_loaded", 0), 2)),
+            ("Avail hrs / unit (all staff)",
+             _num(m.get("total_available_hours_per_unit", 0), 2)),
+        ]),
+        ("⚙️ Assumptions (your levers)", [
+            ("Base Efficiency", _pct(m.get("base_efficiency", 0))),
+            ("New Hire %", _pct(m.get("new_hire_pct", 0))),
+            ("New-Hire Productivity", _pct(m.get("new_hire_productivity", 0))),
+            ("Adjusted Efficiency", _pct(m.get("adjusted_efficiency", 0))),
+            ("Absenteeism", _pct(m.get("absenteeism", 0))),
+            ("Overtime", _pct(m.get("overtime", 0))),
+            ("Safety buffer", _pct(1.0 - float(safety or 0))),
+        ]),
+        ("👥 Workforce & hours (what you have)", [
+            ("Available Headcount (production)", _num(m.get("available_headcount", 0), 0)),
+            ("Support HC (Lead/Other)", _num(m.get("support_headcount", 0), 0)),
+            ("Total Headcount", _num(m.get("total_headcount", 0), 0)),
+            ("Net Available Hours (production)", _num(m.get("net_available_hours", 0), 0)),
+            ("Total Available Hours (incl. support)",
+             _num(m.get("total_available_hours", 0), 0)),
+            ("Available Earned Hours", _num(m.get("available_earned_hours", 0), 1)),
+        ]),
+        ("🎯 Result (can we do it?)", [
+            ("Headcount Needed (aggregate)", _num(m.get("headcount_needed_aggregate", 0), 2)),
+            ("Headcount Needed (station-aware)",
+             _num(hc_station, 0) if hc_station is not None else "—"),
+            ("Missed Units (aggregate)", _num(m.get("missed_units_aggregate", 0), 1)),
+            ("Missed Units (station-aware)",
+             (f"{int(missed_station):,}" if missed_station is not None else "—")),
+            ("Verdict", m.get("verdict", "—")),
+        ]),
     ]
+
+
+def _exec_summary_rowmap(m: dict) -> dict:
+    """Flat {label: value} map across all sections (for comparison columns)."""
+    return {label: val
+            for _sec, rows in _exec_summary_sections(m)
+            for (label, val) in rows}
+
+
+def _style_exec_verdict(row):
+    """Styler: green/red the Verdict row's cells (Good / No Good)."""
+    if row.name != "Verdict":
+        return ["" for _ in row]
+    out = []
+    for v in row:
+        if str(v) == "Good":
+            out.append("color:white; background-color:#1a9850; font-weight:700")
+        elif str(v) == "No Good":
+            out.append("color:white; background-color:#d73027; font-weight:700")
+        else:
+            out.append("")
+    return out
 
 
 def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
@@ -4002,10 +4034,19 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
         col_live, col_save = st.columns([2, 1])
         with col_live:
             st.markdown(f"**Current settings — {location}**")
-            live_df = pd.DataFrame(
-                _exec_summary_rows(metrics), columns=["Metric", location]
-            ).set_index("Metric")
-            st.dataframe(live_df, use_container_width=True)
+            for _sec_title, _sec_rows in _exec_summary_sections(metrics):
+                st.markdown(f"**{_sec_title}**")
+                _sec_df = pd.DataFrame(
+                    _sec_rows, columns=["Metric", location]
+                ).set_index("Metric")
+                if any(lbl == "Verdict" for lbl, _ in _sec_rows):
+                    try:
+                        st.dataframe(_sec_df.style.apply(_style_exec_verdict, axis=1),
+                                     use_container_width=True)
+                    except Exception:
+                        st.dataframe(_sec_df, use_container_width=True)
+                else:
+                    st.dataframe(_sec_df, use_container_width=True)
             hc_need = metrics["headcount_needed_aggregate"]
             if metrics["verdict"] == "Good":
                 st.success(
@@ -4126,41 +4167,45 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 st.caption(f"**{fac}** — none saved")
                 chosen[fac] = "—"
 
-    cols_data = {}
+    # {facility column label: flat {metric: value} map}
+    rowmaps = {}
     for fac in LOCATIONS:
         nm = chosen.get(fac, "—")
         if nm and nm != "—":
             m = (get_exec_scenario(fac, nm) or {}).get("metrics", {})
             if m:
-                cols_data[f"{fac} — {nm}"] = dict(_exec_summary_rows(m))
+                rowmaps[f"{fac} — {nm}"] = _exec_summary_rowmap(m)
 
-    if cols_data:
-        # Row order taken from a reference render so it matches the live table.
-        _ref = metrics if metrics is not None else {"safety": 1.0}
-        order = [r[0] for r in _exec_summary_rows(_ref)]
-        cmp_df = pd.DataFrame(cols_data).reindex(order)
+    if rowmaps:
+        # Canonical section/label order is value-independent — derive it once.
+        for _sec_title, _ref_rows in _exec_summary_sections({}):
+            st.markdown(f"**{_sec_title}**")
+            _labels = [lbl for lbl, _ in _ref_rows]
+            _sec_df = pd.DataFrame(
+                {col: [rowmaps[col].get(lbl, "—") for lbl in _labels]
+                 for col in rowmaps},
+                index=_labels,
+            )
+            if "Verdict" in _labels:
+                try:
+                    st.dataframe(_sec_df.style.apply(_style_exec_verdict, axis=1),
+                                 use_container_width=True)
+                except Exception:
+                    st.dataframe(_sec_df, use_container_width=True)
+            else:
+                st.dataframe(_sec_df, use_container_width=True)
 
-        def _style_verdict(row):
-            if row.name != "Verdict":
-                return ["" for _ in row]
-            out = []
-            for v in row:
-                if str(v) == "Good":
-                    out.append("color:white; background-color:#1a9850; font-weight:700")
-                elif str(v) == "No Good":
-                    out.append("color:white; background-color:#d73027; font-weight:700")
-                else:
-                    out.append("")
-            return out
-
-        try:
-            st.dataframe(cmp_df.style.apply(_style_verdict, axis=1),
-                         use_container_width=True)
-        except Exception:
-            st.dataframe(cmp_df, use_container_width=True)
+        # One combined CSV carrying the Section grouping.
+        _records = []
+        for _sec_title, _ref_rows in _exec_summary_sections({}):
+            for lbl, _ in _ref_rows:
+                rec = {"Section": _sec_title, "Metric": lbl}
+                for col in rowmaps:
+                    rec[col] = rowmaps[col].get(lbl, "—")
+                _records.append(rec)
         st.download_button(
             "📥 Download comparison CSV",
-            cmp_df.to_csv().encode("utf-8"),
+            pd.DataFrame(_records).to_csv(index=False).encode("utf-8"),
             file_name="executive_summary.csv",
             mime="text/csv",
         )

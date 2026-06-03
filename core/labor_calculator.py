@@ -762,6 +762,15 @@ def executive_summary(*, total_earned_minutes: float, total_units: int,
     safety_mult = _clamp01(safety)
     eff_hours_per_person = hours_per_person * adj_eff * (1.0 - absent) * safety_mult
 
+    # Man-hours per unit. ``mh_per_unit`` is the STANDARD work content (earned
+    # hours ÷ units). ``mh_per_unit_loaded`` is how many PAID man-hours each unit
+    # actually consumes at this scenario's efficiency = standard ÷ productive
+    # fraction (base eff × new-hire ramp × (1-absent)). Overtime and safety move
+    # capacity / buffer, not per-unit labor cost, so they're excluded here.
+    mh_per_unit = (earned_hr / units) if units > 0 else 0.0
+    _prod_frac = adj_eff * (1.0 - absent)
+    mh_per_unit_loaded = (mh_per_unit / _prod_frac) if _prod_frac > 0 else 0.0
+
     hc_needed_agg = (earned_hr / eff_hours_per_person) if eff_hours_per_person > 0 else 0.0
     net_available_hours = avail_hc * hours_per_person
     available_earned_hours = avail_hc * eff_hours_per_person
@@ -791,6 +800,8 @@ def executive_summary(*, total_earned_minutes: float, total_units: int,
         "total_earned_hours": earned_hr,
         "total_units": units,
         "units_per_day": (units / working_days) if working_days else 0.0,
+        "mh_per_unit": mh_per_unit,
+        "mh_per_unit_loaded": mh_per_unit_loaded,
         "available_headcount": avail_hc,
         "support_headcount": support,
         "total_headcount": total_headcount,

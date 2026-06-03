@@ -640,6 +640,22 @@ class TestExecutiveSummary:
             assert withsupp[k] == pytest.approx(base[k])
         assert withsupp["verdict"] == base["verdict"]
 
+    def test_mh_per_unit_standard_and_loaded(self):
+        # Spartanburg-like: 3,719 earned hrs / 419 units ≈ 8.875 mh/unit standard.
+        r = self._run(3719, 419, 44, 0.50, 0.20, 0.75)
+        assert r["mh_per_unit"] == pytest.approx(3719 / 419)
+        # Loaded = standard ÷ (adj_eff × (1-absent)); adj_eff=0.475, absent=0.05.
+        assert r["mh_per_unit_loaded"] == pytest.approx((3719 / 419) / (0.475 * 0.95))
+        # Overtime must NOT change either mh/unit (it moves capacity, not content).
+        ot = executive_summary(
+            total_earned_minutes=3719 * 60, total_units=419, available_hc=44,
+            shift_minutes=480, working_days=22, base_efficiency=0.50,
+            new_hire_pct=0.20, new_hire_productivity=0.75, absenteeism=0.05,
+            safety=1.0, overtime=0.10,
+        )
+        assert ot["mh_per_unit"] == pytest.approx(r["mh_per_unit"])
+        assert ot["mh_per_unit_loaded"] == pytest.approx(r["mh_per_unit_loaded"])
+
     def test_overtime_scales_hours_and_lowers_hc_needed(self):
         base = self._run(1784, 226, 23, 0.45, 0.10, 0.50)
         ot = executive_summary(

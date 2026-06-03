@@ -68,7 +68,7 @@
   },
   "Spartanburg": {
     "Warehouse (Pick)": {
-      "HC": 2,
+      "HC": 3,
       "Conc": 3,
       "Crew": 1
     },
@@ -88,7 +88,7 @@
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 15,
+      "HC": 14,
       "Conc": 16,
       "Crew": 1
     },

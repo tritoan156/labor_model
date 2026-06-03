@@ -3958,19 +3958,42 @@ def _exec_summary_rowmap(m: dict) -> dict:
             for (label, val) in rows}
 
 
-def _style_exec_verdict(row):
-    """Styler: green/red the Verdict row's cells (Good / No Good)."""
-    if row.name != "Verdict":
-        return ["" for _ in row]
-    out = []
-    for v in row:
-        if str(v) == "Good":
-            out.append("color:white; background-color:#1a9850; font-weight:700")
-        elif str(v) == "No Good":
-            out.append("color:white; background-color:#d73027; font-weight:700")
-        else:
-            out.append("")
+# Section titles — used to detect & shade the divider rows in the single table.
+_EXEC_SECTION_TITLES = frozenset(t for t, _ in _exec_summary_sections({}))
+
+
+def _exec_rows_with_headers(m: dict) -> list[tuple[str, str]]:
+    """Flatten the sections into one ordered (label, value) list, inserting each
+    section title as a divider row (blank value) so the whole thing renders as a
+    single table with shaded group separators."""
+    out: list[tuple[str, str]] = []
+    for title, rows in _exec_summary_sections(m):
+        out.append((title, ""))
+        out.extend(rows)
     return out
+
+
+def _style_exec_table(row):
+    """Row styler for the single exec-summary table: shade the section-divider
+    rows (color band) and color the Verdict row (Good green / No Good red).
+    Detects row type by the 'Metric' column value (table uses hide_index)."""
+    metric = str(row.get("Metric", ""))
+    if metric in _EXEC_SECTION_TITLES:
+        return ["background-color:#dde6f0; color:#1f2d3d; font-weight:700"] * len(row)
+    if metric == "Verdict":
+        styles = []
+        for col in row.index:
+            v = row[col]
+            if col == "Metric":
+                styles.append("font-weight:700")
+            elif str(v) == "Good":
+                styles.append("color:white; background-color:#1a9850; font-weight:700")
+            elif str(v) == "No Good":
+                styles.append("color:white; background-color:#d73027; font-weight:700")
+            else:
+                styles.append("")
+        return styles
+    return ["" for _ in row]
 
 
 def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
@@ -4034,19 +4057,13 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
         col_live, col_save = st.columns([2, 1])
         with col_live:
             st.markdown(f"**Current settings — {location}**")
-            for _sec_title, _sec_rows in _exec_summary_sections(metrics):
-                st.markdown(f"**{_sec_title}**")
-                _sec_df = pd.DataFrame(
-                    _sec_rows, columns=["Metric", location]
-                ).set_index("Metric")
-                if any(lbl == "Verdict" for lbl, _ in _sec_rows):
-                    try:
-                        st.dataframe(_sec_df.style.apply(_style_exec_verdict, axis=1),
-                                     use_container_width=True)
-                    except Exception:
-                        st.dataframe(_sec_df, use_container_width=True)
-                else:
-                    st.dataframe(_sec_df, use_container_width=True)
+            _live_df = pd.DataFrame(
+                _exec_rows_with_headers(metrics), columns=["Metric", location])
+            try:
+                st.dataframe(_live_df.style.apply(_style_exec_table, axis=1),
+                             use_container_width=True, hide_index=True)
+            except Exception:
+                st.dataframe(_live_df, use_container_width=True, hide_index=True)
             hc_need = metrics["headcount_needed_aggregate"]
             if metrics["verdict"] == "Good":
                 st.success(
@@ -4177,35 +4194,30 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 rowmaps[f"{fac} — {nm}"] = _exec_summary_rowmap(m)
 
     if rowmaps:
-        # Canonical section/label order is value-independent — derive it once.
+        _cols = list(rowmaps.keys())
+        # Single table; section titles become shaded divider rows (blank cells).
+        _disp = []
         for _sec_title, _ref_rows in _exec_summary_sections({}):
-            st.markdown(f"**{_sec_title}**")
-            _labels = [lbl for lbl, _ in _ref_rows]
-            _sec_df = pd.DataFrame(
-                {col: [rowmaps[col].get(lbl, "—") for lbl in _labels]
-                 for col in rowmaps},
-                index=_labels,
-            )
-            if "Verdict" in _labels:
-                try:
-                    st.dataframe(_sec_df.style.apply(_style_exec_verdict, axis=1),
-                                 use_container_width=True)
-                except Exception:
-                    st.dataframe(_sec_df, use_container_width=True)
-            else:
-                st.dataframe(_sec_df, use_container_width=True)
+            _disp.append({"Metric": _sec_title, **{c: "" for c in _cols}})
+            for lbl, _ in _ref_rows:
+                _disp.append({"Metric": lbl,
+                              **{c: rowmaps[c].get(lbl, "—") for c in _cols}})
+        _cmp_df = pd.DataFrame(_disp, columns=["Metric"] + _cols)
+        try:
+            st.dataframe(_cmp_df.style.apply(_style_exec_table, axis=1),
+                         use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(_cmp_df, use_container_width=True, hide_index=True)
 
-        # One combined CSV carrying the Section grouping.
-        _records = []
+        # CSV carries the Section grouping in its own column (no divider rows).
+        _csv_records = []
         for _sec_title, _ref_rows in _exec_summary_sections({}):
             for lbl, _ in _ref_rows:
-                rec = {"Section": _sec_title, "Metric": lbl}
-                for col in rowmaps:
-                    rec[col] = rowmaps[col].get(lbl, "—")
-                _records.append(rec)
+                _csv_records.append({"Section": _sec_title, "Metric": lbl,
+                                     **{c: rowmaps[c].get(lbl, "—") for c in _cols}})
         st.download_button(
             "📥 Download comparison CSV",
-            pd.DataFrame(_records).to_csv(index=False).encode("utf-8"),
+            pd.DataFrame(_csv_records).to_csv(index=False).encode("utf-8"),
             file_name="executive_summary.csv",
             mime="text/csv",
         )

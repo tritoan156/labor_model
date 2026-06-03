@@ -42,6 +42,52 @@
         "coverage_pct": 103.36242510072469,
         "verdict": "Good"
       }
+    },
+    "Spartanburg June 06/03": {
+      "saved_at": "2026-06-03T13:28:36-07:00",
+      "assumptions": {
+        "units": 419,
+        "total_earned_hours": 3625.7166666666667,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.2,
+        "new_hire_productivity": 0.75,
+        "absenteeism": 0.05,
+        "overtime": 0.1,
+        "safety": 1.0,
+        "shift_minutes": 480,
+        "working_days": 22,
+        "available_hc": 44.0,
+        "support_hc": 4.0,
+        "schedule_label": "June 2026"
+      },
+      "metrics": {
+        "total_earned_hours": 3625.7166666666667,
+        "total_units": 419,
+        "units_per_day": 19.045454545454547,
+        "mh_per_unit": 8.653261734287987,
+        "mh_per_unit_loaded": 19.17620328928086,
+        "total_available_hours_per_unit": 22.17852028639618,
+        "available_headcount": 44.0,
+        "support_headcount": 4.0,
+        "total_headcount": 48.0,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.2,
+        "new_hire_productivity": 0.75,
+        "absenteeism": 0.05,
+        "overtime": 0.1,
+        "safety": 1.0,
+        "adjusted_efficiency": 0.475,
+        "effective_hours_per_person": 87.362,
+        "net_available_hours": 8518.4,
+        "total_available_hours": 9292.8,
+        "available_earned_hours": 3843.928,
+        "headcount_needed_aggregate": 41.50221682959029,
+        "headcount_needed_station": 45.0,
+        "missed_units_aggregate": 0.0,
+        "missed_units_station": 18,
+        "coverage_pct": 106.01843313735675,
+        "verdict": "Good"
+      }
     }
   },
   "Cypress": {

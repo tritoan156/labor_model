@@ -4124,6 +4124,13 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                     st.error("GitHub token not configured. Ask your admin to add "
                              "`github_token` to Streamlit Secrets.")
                 else:
+                    # Freeze the per-station headcount so the side-by-side shows
+                    # the staffing as-of-save (matches the frozen metrics).
+                    try:
+                        _crew_hc = {str(s): int(h) for s, h in
+                                    inputs["crew_config"]["HC"].items()}
+                    except Exception:
+                        _crew_hc = {}
                     assumptions = {
                         "units": metrics["total_units"],
                         "total_earned_hours": metrics["total_earned_hours"],
@@ -4137,6 +4144,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                         "working_days": int(inputs.get("days", 20)),
                         "available_hc": avail_hc,
                         "support_hc": support_hc,
+                        "crew_hc": _crew_hc,
                         "schedule_label": month_label,
                     }
                     try:
@@ -4202,14 +4210,27 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 st.caption(f"**{fac}** — none saved")
                 chosen[fac] = "—"
 
-    # {facility column label: flat {metric: value} map}
+    # {facility column label: flat {metric: value} map}, plus the per-station
+    # headcount snapshot for each column (frozen at save; live crew as fallback
+    # for scenarios saved before crew_hc was captured).
     rowmaps = {}
+    crewmaps = {}
     for fac in LOCATIONS:
         nm = chosen.get(fac, "—")
         if nm and nm != "—":
-            m = (get_exec_scenario(fac, nm) or {}).get("metrics", {})
+            block = get_exec_scenario(fac, nm) or {}
+            m = block.get("metrics", {})
             if m:
-                rowmaps[f"{fac} — {nm}"] = _exec_summary_rowmap(m)
+                col = f"{fac} — {nm}"
+                rowmaps[col] = _exec_summary_rowmap(m)
+                ch = (block.get("assumptions", {}) or {}).get("crew_hc") or {}
+                if not ch:
+                    try:
+                        ch = {str(s): int(h) for s, h
+                              in load_facility_crew_df(fac)["HC"].items()}
+                    except Exception:
+                        ch = {}
+                crewmaps[col] = ch
 
     if rowmaps:
         _cols = list(rowmaps.keys())
@@ -4227,12 +4248,40 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
         except Exception:
             st.dataframe(_cmp_df, use_container_width=True, hide_index=True)
 
+        # Per-station headcount side-by-side (only stations staffed somewhere).
+        _station_order = list(STATION_DEFAULTS.keys()) + list(SUPPORT_ROLES)
+        _present = [s for s in _station_order
+                    if any(int(crewmaps[c].get(s, 0)) > 0 for c in _cols)]
+        if _present:
+            st.markdown("**👷 Station headcount**")
+            _hc_rows = [{"Station": s, **{c: int(crewmaps[c].get(s, 0)) for c in _cols}}
+                        for s in _present]
+            _hc_rows.append({"Station": "Total",
+                             **{c: int(sum(crewmaps[c].values())) for c in _cols}})
+            _hc_df = pd.DataFrame(_hc_rows, columns=["Station"] + _cols)
+
+            def _style_total(row):
+                if str(row.get("Station", "")) == "Total":
+                    return ["background-color:#dde6f0; font-weight:700"] * len(row)
+                return ["" for _ in row]
+            try:
+                st.dataframe(_hc_df.style.apply(_style_total, axis=1),
+                             use_container_width=True, hide_index=True)
+            except Exception:
+                st.dataframe(_hc_df, use_container_width=True, hide_index=True)
+
         # CSV carries the Section grouping in its own column (no divider rows).
         _csv_records = []
         for _sec_title, _ref_rows in _exec_summary_sections({}):
             for lbl, _ in _ref_rows:
                 _csv_records.append({"Section": _sec_title, "Metric": lbl,
                                      **{c: rowmaps[c].get(lbl, "—") for c in _cols}})
+        for s in _present:
+            _csv_records.append({"Section": "Station headcount", "Metric": s,
+                                 **{c: int(crewmaps[c].get(s, 0)) for c in _cols}})
+        if _present:
+            _csv_records.append({"Section": "Station headcount", "Metric": "Total",
+                                 **{c: int(sum(crewmaps[c].values())) for c in _cols}})
         st.download_button(
             "📥 Download comparison CSV",
             pd.DataFrame(_csv_records).to_csv(index=False).encode("utf-8"),

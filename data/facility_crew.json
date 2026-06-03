@@ -131,6 +131,16 @@
       "HC": 2,
       "Conc": 3,
       "Crew": 1
+    },
+    "Lead": {
+      "HC": 2,
+      "Conc": 0,
+      "Crew": 0
+    },
+    "Other": {
+      "HC": 2,
+      "Conc": 0,
+      "Crew": 0
     }
   },
   "Cypress": {

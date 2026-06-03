@@ -16,7 +16,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-from .constants import STATION_DEFAULTS
+from .constants import STATION_DEFAULTS, SUPPORT_ROLES
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FACILITY_CREW_PATH = DATA_DIR / "facility_crew.json"
@@ -52,6 +52,10 @@ def load_facility_crew_df(facility: str) -> pd.DataFrame:
     Also merges in any STATION_DEFAULTS keys that are missing from the saved
     config — so adding a new station (e.g. Com Accessories) doesn't disappear
     from facilities whose JSON was saved before the station existed.
+
+    Non-production SUPPORT_ROLES (Lead/Other) are always appended last (in fixed
+    order). They carry HC only; their Conc/Crew default to 0 and are ignored by
+    the capacity model.
     """
     all_cfg = load_all_facility_configs()
     facility_cfg = dict(all_cfg.get(facility) or _default_facility_config())
@@ -62,21 +66,27 @@ def load_facility_crew_df(facility: str) -> pd.DataFrame:
     for st_name, (hc, conc, crew) in STATION_DEFAULTS.items():
         if st_name not in facility_cfg:
             facility_cfg[st_name] = {"HC": 0, "Conc": 0, "Crew": crew}
+    # Backfill support roles (Lead/Other) so they appear for every facility.
+    for role in SUPPORT_ROLES:
+        if role not in facility_cfg:
+            facility_cfg[role] = {"HC": 0, "Conc": 0, "Crew": 0}
 
-    # Preserve the STATION_DEFAULTS ordering for display consistency
+    def _row(name: str) -> dict:
+        v = facility_cfg[name]
+        return {"Station": name, "HC": v["HC"], "Conc": v["Conc"], "Crew": v["Crew"]}
+
     ordered = []
+    # 1) Stations in STATION_DEFAULTS order
     for st_name in STATION_DEFAULTS.keys():
-        v = facility_cfg.get(st_name)
-        if v is not None:
-            ordered.append({
-                "Station": st_name, "HC": v["HC"], "Conc": v["Conc"], "Crew": v["Crew"],
-            })
-    # Tack on any stations that were saved but aren't in STATION_DEFAULTS (rare)
-    for st_name, v in facility_cfg.items():
-        if st_name not in STATION_DEFAULTS:
-            ordered.append({
-                "Station": st_name, "HC": v["HC"], "Conc": v["Conc"], "Crew": v["Crew"],
-            })
+        if st_name in facility_cfg:
+            ordered.append(_row(st_name))
+    # 2) Any saved stations not in STATION_DEFAULTS and not support roles (rare)
+    for st_name in facility_cfg:
+        if st_name not in STATION_DEFAULTS and st_name not in SUPPORT_ROLES:
+            ordered.append(_row(st_name))
+    # 3) Support roles last, in fixed SUPPORT_ROLES order
+    for role in SUPPORT_ROLES:
+        ordered.append(_row(role))
 
     return pd.DataFrame(ordered).set_index("Station")
 

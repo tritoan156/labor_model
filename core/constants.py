@@ -156,6 +156,14 @@ STATION_KEYS = [
     "AccKIT", "Final", "PDI", "QC", "Ship", "ETO",
 ]
 
+# Non-production support roles shown in the headcount editor (e.g. leads,
+# material handlers). They are deliberately NOT stations (not in STATION_KEYS /
+# STATION_DEFAULTS), so build_capacity_table ignores them — they carry no labor
+# demand, throughput, or required-HC. They count only toward TOTAL headcount and
+# total available labor-hours (a cost / staffing view), never production
+# capacity. Only the "People" (HC) column is meaningful for them.
+SUPPORT_ROLES = ("Lead", "Other")
+
 # === Production-area groupings (for the Capacity tab's per-area cap view) ===
 # Groups stations into the physical/organizational areas planners think in, so
 # the Capacity tab can show a binding unit cap per area. This lets a planner see

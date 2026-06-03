@@ -43,6 +43,7 @@ DEFAULT_SETTINGS = {
     "new_hire_pct": 0.0,
     "new_hire_productivity": 0.5,
     "absenteeism": 0.05,
+    "overtime": 0.0,
 }
 _KEYS = tuple(DEFAULT_SETTINGS.keys())
 

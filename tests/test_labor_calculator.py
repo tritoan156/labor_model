@@ -354,6 +354,18 @@ class TestBuildCapacityTable:
                                     absenteeism=0.0)
         assert same.loc["QC"]["labor_cap_safe"] == pytest.approx(base.loc["QC"]["labor_cap_safe"])
 
+    def test_overtime_lifts_labor_and_throughput(self):
+        # Overtime extends working time, so BOTH labor and throughput capacity
+        # scale by (1+overtime) — and required_hc drops. Contrast the labor-only
+        # workforce factor above (which leaves thru_cap_safe untouched).
+        units = make_units_df([{"QC": 100} for _ in range(40)])
+        crew = make_crew({"QC": (4, 4, 1)})
+        base = build_capacity_table(units, crew, 480, 20, 1.0, 0.5)
+        ot = build_capacity_table(units, crew, 480, 20, 1.0, 0.5, overtime=0.25)
+        assert ot.loc["QC"]["labor_cap_safe"] == pytest.approx(base.loc["QC"]["labor_cap_safe"] * 1.25)
+        assert ot.loc["QC"]["thru_cap_safe"] == pytest.approx(base.loc["QC"]["thru_cap_safe"] * 1.25)
+        assert ot.loc["QC"]["required_hc"] <= base.loc["QC"]["required_hc"]
+
 
 # --------------------------------------------------------------------------
 # status emojis
@@ -607,3 +619,37 @@ class TestExecutiveSummary:
         )
         assert r["verdict"] == "Good"
         assert r["missed_units_aggregate"] == pytest.approx(0.0)
+
+    def test_support_hc_counts_in_totals_only(self):
+        # Lead/Other add to total headcount + total available hours, but never
+        # change the production verdict / earned hours / headcount-needed.
+        base = self._run(1784, 226, 23, 0.45, 0.10, 0.50)
+        withsupp = executive_summary(
+            total_earned_minutes=1784 * 60, total_units=226, available_hc=23,
+            shift_minutes=480, working_days=20, base_efficiency=0.45,
+            new_hire_pct=0.10, new_hire_productivity=0.50, absenteeism=0.05,
+            safety=1.0, support_hc=5,
+        )
+        assert withsupp["available_headcount"] == pytest.approx(23)      # production
+        assert withsupp["support_headcount"] == pytest.approx(5)
+        assert withsupp["total_headcount"] == pytest.approx(28)
+        assert withsupp["total_available_hours"] == pytest.approx(28 * 160)
+        # Production figures identical to the no-support run:
+        for k in ("headcount_needed_aggregate", "available_earned_hours",
+                  "net_available_hours", "missed_units_aggregate"):
+            assert withsupp[k] == pytest.approx(base[k])
+        assert withsupp["verdict"] == base["verdict"]
+
+    def test_overtime_scales_hours_and_lowers_hc_needed(self):
+        base = self._run(1784, 226, 23, 0.45, 0.10, 0.50)
+        ot = executive_summary(
+            total_earned_minutes=1784 * 60, total_units=226, available_hc=23,
+            shift_minutes=480, working_days=20, base_efficiency=0.45,
+            new_hire_pct=0.10, new_hire_productivity=0.50, absenteeism=0.05,
+            safety=1.0, overtime=0.25,
+        )
+        assert ot["overtime"] == pytest.approx(0.25)
+        assert ot["effective_hours_per_person"] == pytest.approx(base["effective_hours_per_person"] * 1.25)
+        assert ot["available_earned_hours"] == pytest.approx(base["available_earned_hours"] * 1.25)
+        assert ot["headcount_needed_aggregate"] == pytest.approx(base["headcount_needed_aggregate"] / 1.25)
+        assert ot["net_available_hours"] == pytest.approx(base["net_available_hours"] * 1.25)

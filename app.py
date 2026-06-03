@@ -25,13 +25,17 @@ from core.data_loader import (
     ScheduleColumnError,
 )
 import importlib as _importlib
+import inspect as _inspect
 import core.labor_calculator as _labor_calculator
 # Streamlit Cloud reruns app.py on every git push but does NOT always re-import
 # changed submodules — it can keep an OLD core.* module cached in sys.modules,
-# making newly-added functions look "missing" (ImportError) until a manual
-# reboot. Reload defensively so a code push self-heals: the on-disk file is
-# current, so reload() re-executes it and picks up any new names.
-if not hasattr(_labor_calculator, "executive_summary"):
+# making newly-added functions look "missing" (ImportError) — or, worse, keep an
+# old function whose SIGNATURE lacks a newly-added parameter (TypeError when we
+# pass it). Reload defensively so a code push self-heals: the on-disk file is
+# current, so reload() re-executes it and picks up new names AND new params.
+if (not hasattr(_labor_calculator, "executive_summary")
+        or "overtime" not in _inspect.signature(
+            _labor_calculator.executive_summary).parameters):
     _importlib.reload(_labor_calculator)
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
@@ -43,7 +47,7 @@ from core.labor_calculator import (
 from core.constants import (
     LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
     DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
-    STATION_KEYS, CUSTOMER_SUFFIXES,
+    STATION_KEYS, SUPPORT_ROLES, CUSTOMER_SUFFIXES,
     now_local, today_local_str, week_of_month, week_of_month_series,
 )
 from core.facility_storage import (
@@ -168,6 +172,25 @@ def _fmt_min_hr(value, *, with_thousands: bool = True, hr_decimals: int = 1) -> 
     hrs = v / 60.0
     mins_str = f"{mins:,}" if with_thousands else f"{mins}"
     return f"{mins_str} p-min · {hrs:.{hr_decimals}f} p-hr"
+
+
+def _split_crew_hc(crew_config) -> tuple[int, int, int]:
+    """Split a crew_config's headcount into (production, support, total).
+
+    Support roles (SUPPORT_ROLES = Lead/Other) are non-production: they count
+    toward TOTAL headcount only, never the production figure used for the
+    Required-HC gap / Executive-Summary verdict.
+    """
+    if crew_config is None or getattr(crew_config, "empty", True):
+        return 0, 0, 0
+    try:
+        support_mask = crew_config.index.isin(SUPPORT_ROLES)
+        support = int(crew_config.loc[support_mask, "HC"].sum())
+        production = int(crew_config.loc[~support_mask, "HC"].sum())
+    except Exception:
+        production = int(crew_config["HC"].sum())
+        support = 0
+    return production, support, production + support
 
 
 @st.cache_data(show_spinner=False)
@@ -3193,9 +3216,11 @@ def render_sidebar() -> dict:
         _nh_key = f"new_hire_pct_pct_{location}"
         _np_key = f"new_hire_prod_pct_{location}"
         _ab_key = f"absenteeism_pct_{location}"
+        _ot_key = f"overtime_pct_{location}"
         for _k, _frac in ((_nh_key, _fs_saved["new_hire_pct"]),
                           (_np_key, _fs_saved["new_hire_productivity"]),
-                          (_ab_key, _fs_saved["absenteeism"])):
+                          (_ab_key, _fs_saved["absenteeism"]),
+                          (_ot_key, _fs_saved["overtime"])):
             if _k not in st.session_state:
                 st.session_state[_k] = int(round(_frac * 100))
 
@@ -3220,6 +3245,19 @@ def render_sidebar() -> dict:
             "Affects labor / Required-HC & buildable — **not** Space-limits."
         )
 
+        st.markdown("**⏱️ Overtime**")
+        overtime = st.slider(
+            "Overtime %", 0, 100, step=5, key=_ot_key,
+            help="Extra working time vs the standard shift (e.g. +20% ≈ a 6th "
+                 "day; +100% = double). Extends the effective shift, so it "
+                 "raises BOTH labor capacity AND station throughput.",
+        ) / 100.0
+        if overtime > 0:
+            st.caption(
+                f"+{overtime*100:.0f}% working time → lifts labor **and** "
+                "throughput / Space-limits (cells run longer)."
+            )
+
         if st.button(f"💾 Save planning assumptions for {location}",
                      use_container_width=True, key=f"save_assump_{location}"):
             token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
@@ -3235,6 +3273,7 @@ def render_sidebar() -> dict:
                             "new_hire_pct": new_hire_pct,
                             "new_hire_productivity": new_hire_productivity,
                             "absenteeism": absenteeism,
+                            "overtime": overtime,
                         }, token)
                     _track_and_flush("assumptions_save", facility=location)
                     st.success(
@@ -3250,7 +3289,10 @@ def render_sidebar() -> dict:
     with st.sidebar.expander(f"👥 Station headcount for {location}", expanded=False):
         st.caption(
             "Edit how many people work at each station. Set **People = 0** "
-            "for any station that doesn't exist at this facility."
+            "for any station that doesn't exist at this facility. "
+            "**Lead** and **Other** are support roles — only **People** counts; "
+            "they add to total headcount & labor hours but aren't assigned to a "
+            "production station (no demand / throughput)."
         )
 
         crew_default_df = load_facility_crew_df(location)
@@ -3304,12 +3346,14 @@ def render_sidebar() -> dict:
                 except Exception as e:
                     st.error(f"Save failed: {e}")
 
-        # Live totals
-        total_hc = int(edited["HC"].sum())
-        active_stations = int((edited["HC"] > 0).sum())
+        # Live totals — split production vs support (Lead/Other)
+        prod_hc, supp_hc, total_hc = _split_crew_hc(edited)
+        _prod_rows = edited.loc[~edited.index.isin(SUPPORT_ROLES)]
+        active_stations = int((_prod_rows["HC"] > 0).sum())
+        _supp_note = f" ({prod_hc} production + {supp_hc} support)" if supp_hc else ""
         st.markdown(
-            f"**👥 Total headcount:** {total_hc}  \n"
-            f"**🏭 Active stations:** {active_stations} of {len(edited)}"
+            f"**👥 Total headcount:** {total_hc}{_supp_note}  \n"
+            f"**🏭 Active stations:** {active_stations} of {len(_prod_rows)}"
         )
 
     # ----------------------------------------------------------------
@@ -3557,6 +3601,7 @@ Every catalog / scenario / schedule / flow save triggers a Streamlit Cloud rebui
         "new_hire_pct": new_hire_pct,
         "new_hire_productivity": new_hire_productivity,
         "absenteeism": absenteeism,
+        "overtime": overtime,
         "days": days,
         "shift": shift,
         "crew_config": edited,
@@ -3613,6 +3658,7 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
                 new_hire_pct=inputs.get("new_hire_pct", 0.0),
                 new_hire_productivity=inputs.get("new_hire_productivity", 1.0),
                 absenteeism=inputs.get("absenteeism", 0.0),
+                overtime=inputs.get("overtime", 0.0),
             )
         except Exception:
             continue
@@ -3857,12 +3903,17 @@ def _exec_summary_rows(m: dict) -> list[tuple[str, str]]:
         ("Base Efficiency", _pct(m.get("base_efficiency", 0))),
         ("Adjusted Efficiency", _pct(m.get("adjusted_efficiency", 0))),
         ("Absenteeism", _pct(m.get("absenteeism", 0))),
+        ("Overtime", _pct(m.get("overtime", 0))),
         ("Safety buffer", _pct(1.0 - float(safety or 0))),
         ("Headcount Needed (aggregate)", _num(m.get("headcount_needed_aggregate", 0), 2)),
         ("Headcount Needed (station-aware)",
          _num(hc_station, 0) if hc_station is not None else "—"),
-        ("Available Headcount", _num(m.get("available_headcount", 0), 0)),
-        ("Net Available Hours", _num(m.get("net_available_hours", 0), 0)),
+        ("Available Headcount (production)", _num(m.get("available_headcount", 0), 0)),
+        ("Support HC (Lead/Other)", _num(m.get("support_headcount", 0), 0)),
+        ("Total Headcount", _num(m.get("total_headcount", 0), 0)),
+        ("Net Available Hours (production)", _num(m.get("net_available_hours", 0), 0)),
+        ("Total Available Hours (incl. support)",
+         _num(m.get("total_available_hours", 0), 0)),
         ("Available Earned Hours", _num(m.get("available_earned_hours", 0), 1)),
         ("Missed Units (aggregate)", _num(m.get("missed_units_aggregate", 0), 1)),
         ("Missed Units (station-aware)",
@@ -3880,21 +3931,25 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 f"{(' · ' + month_label) if month_label else ''}")
     st.caption(
         "Monthly labor roll-up in the style of the planning sheet. **New-hire ramp** "
-        "and **absenteeism** (set in the sidebar under *Working-time settings*) reduce "
-        "available labor; safety is shown as a buffer. Headcount Needed and Missed "
-        "Units are shown both as a simple **aggregate** (treats labor as fully "
-        "shareable) and **station-aware** (respects per-station bottlenecks)."
+        "and **absenteeism** reduce available labor while **overtime** raises it "
+        "(all set in the sidebar under *Working-time settings*); safety is shown as "
+        "a buffer. **Lead/Other** support staff add to total headcount & hours but "
+        "not to production capacity. Headcount Needed and Missed Units are shown "
+        "both as a simple **aggregate** (treats labor as fully shareable) and "
+        "**station-aware** (respects per-station bottlenecks)."
     )
 
     has_live = units is not None and not units.empty
     metrics = None
     avail_hc = 0.0
+    support_hc = 0.0
     if has_live:
         total_earned_minutes = float(units["total_labor"].sum())
-        try:
-            avail_hc = float(inputs["crew_config"]["HC"].sum())
-        except Exception:
-            avail_hc = 0.0
+        # Production HC drives the verdict; support (Lead/Other) counts only in
+        # the total headcount / total available-hours rows.
+        _prod, _supp, _tot = _split_crew_hc(inputs["crew_config"])
+        avail_hc = float(_prod)
+        support_hc = float(_supp)
         station_required_hc = None
         station_buildable = None
         if capacity is not None and not capacity.empty:
@@ -3918,6 +3973,8 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
             new_hire_productivity=float(inputs.get("new_hire_productivity", 1.0)),
             absenteeism=float(inputs.get("absenteeism", 0.0)),
             safety=float(inputs.get("safety", 1.0)),
+            overtime=float(inputs.get("overtime", 0.0)),
+            support_hc=support_hc,
             station_required_hc=station_required_hc,
             station_buildable=station_buildable,
         )
@@ -3967,10 +4024,12 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                         "new_hire_pct": metrics["new_hire_pct"],
                         "new_hire_productivity": metrics["new_hire_productivity"],
                         "absenteeism": metrics["absenteeism"],
+                        "overtime": metrics.get("overtime", 0.0),
                         "safety": metrics["safety"],
                         "shift_minutes": int(inputs.get("shift", 480)),
                         "working_days": int(inputs.get("days", 20)),
                         "available_hc": avail_hc,
+                        "support_hc": support_hc,
                         "schedule_label": month_label,
                     }
                     try:
@@ -3994,6 +4053,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                     st.session_state[f"new_hire_pct_pct_{location}"] = _pct100(a.get("new_hire_pct", 0))
                     st.session_state[f"new_hire_prod_pct_{location}"] = _pct100(a.get("new_hire_productivity", 0.5))
                     st.session_state[f"absenteeism_pct_{location}"] = _pct100(a.get("absenteeism", 0.05))
+                    st.session_state[f"overtime_pct_{location}"] = _pct100(a.get("overtime", 0.0))
                     st.success(f"Re-applied workforce assumptions from **{pick}**.")
                     st.rerun()
                 if c2.button("🗑 Delete", key=f"exec_del_{location}",
@@ -4093,10 +4153,13 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # =============================================================
     total_labor = int(units["total_labor"].sum())
     total_batt = int(units["Bat"].where(units["Battery"] > 0, 0).sum())
-    total_hc = int(inputs["crew_config"]["HC"].sum())
-    active_stations = int((inputs["crew_config"]["HC"] > 0).sum())
+    # Production HC drives the Required-HC gap; support (Lead/Other) is shown
+    # separately so it never makes the plant look falsely overstaffed.
+    production_hc, support_hc, total_hc = _split_crew_hc(inputs["crew_config"])
+    _prod_crew = inputs["crew_config"].loc[~inputs["crew_config"].index.isin(SUPPORT_ROLES)]
+    active_stations = int((_prod_crew["HC"] > 0).sum())
     total_required_hc = int(capacity["required_hc"].sum())
-    total_hc_gap = total_required_hc - total_hc
+    total_hc_gap = total_required_hc - production_hc
 
     over_stations = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
     no_station_list = capacity[capacity["overall_status"] == "🔴 NO STATION"].index.tolist()
@@ -4257,8 +4320,12 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     st.markdown("#### 👥 Headcount picture")
     c5, c6, c7, c8 = st.columns(4)
     c5.metric(
-        "People you have", f"{total_hc}",
-        help=f"Total headcount across {active_stations} active stations.",
+        "People you have", f"{production_hc}",
+        help=(
+            f"Production headcount across {active_stations} active stations."
+            + (f" Plus {support_hc} support (Lead/Other) → {total_hc} total "
+               "headcount." if support_hc else "")
+        ),
     )
     c6.metric(
         "People you need", f"{total_required_hc}",
@@ -7971,6 +8038,7 @@ def main():
             new_hire_pct=inputs.get("new_hire_pct", 0.0),
             new_hire_productivity=inputs.get("new_hire_productivity", 1.0),
             absenteeism=inputs.get("absenteeism", 0.0),
+            overtime=inputs.get("overtime", 0.0),
         )
         batt_sku = battery_demand_by_sku(units)
         batt_type = battery_demand_by_type(units)

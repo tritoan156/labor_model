@@ -26,17 +26,32 @@ from core.data_loader import (
 )
 import importlib as _importlib
 import inspect as _inspect
+import sys as _sys
+import core.constants as _constants
 import core.labor_calculator as _labor_calculator
-# Streamlit Cloud reruns app.py on every git push but does NOT always re-import
-# changed submodules — it can keep an OLD core.* module cached in sys.modules,
-# making newly-added functions look "missing" (ImportError) — or, worse, keep an
-# old function whose SIGNATURE lacks a newly-added parameter (TypeError when we
-# pass it). Reload defensively so a code push self-heals: the on-disk file is
-# current, so reload() re-executes it and picks up new names AND new params.
-if (not hasattr(_labor_calculator, "executive_summary")
-        or "overtime" not in _inspect.signature(
-            _labor_calculator.executive_summary).parameters):
-    _importlib.reload(_labor_calculator)
+# Streamlit Cloud sometimes reruns app.py on a "warm reboot" while keeping the
+# PREVIOUS deploy's core.* modules cached in sys.modules. Names/params added in
+# this push then look "missing" (ImportError, e.g. SUPPORT_ROLES on constants)
+# or a call passes an unknown kwarg (TypeError, e.g. overtime). Detect staleness
+# via sentinels and reload the changed modules in DEPENDENCY ORDER (constants
+# first — every other module imports from it) so a git push self-heals. On a
+# clean deploy nothing is stale and this whole block is skipped.
+_stale = (
+    not hasattr(_constants, "SUPPORT_ROLES")
+    or not hasattr(_labor_calculator, "executive_summary")
+    or "overtime" not in _inspect.signature(
+        _labor_calculator.executive_summary).parameters
+)
+if _stale:
+    for _modname in ("core.constants", "core.labor_calculator",
+                     "core.facility_storage", "core.facility_settings_storage",
+                     "core.exec_scenario_storage"):
+        _mod = _sys.modules.get(_modname)
+        if _mod is not None:
+            try:
+                _importlib.reload(_mod)
+            except Exception:
+                pass
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,

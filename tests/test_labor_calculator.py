@@ -656,6 +656,19 @@ class TestExecutiveSummary:
         assert ot["mh_per_unit"] == pytest.approx(r["mh_per_unit"])
         assert ot["mh_per_unit_loaded"] == pytest.approx(r["mh_per_unit_loaded"])
 
+    def test_total_available_hours_per_unit(self):
+        # ALL staffed hours (production + support, gross incl. OT) ÷ units.
+        r = executive_summary(
+            total_earned_minutes=3719 * 60, total_units=419, available_hc=44,
+            shift_minutes=480, working_days=22, base_efficiency=0.50,
+            new_hire_pct=0.20, new_hire_productivity=0.75, absenteeism=0.05,
+            safety=1.0, support_hc=6,
+        )
+        # (44+6) people × (480×22/60) hrs ÷ 419 units
+        assert r["total_available_hours_per_unit"] == pytest.approx((50 * 176) / 419)
+        assert r["total_available_hours_per_unit"] == pytest.approx(
+            r["total_available_hours"] / 419)
+
     def test_overtime_scales_hours_and_lowers_hc_needed(self):
         base = self._run(1784, 226, 23, 0.45, 0.10, 0.50)
         ot = executive_summary(

@@ -779,6 +779,10 @@ def executive_summary(*, total_earned_minutes: float, total_units: int,
     # labor-hours only — never to the production earned-hours / verdict above.
     total_headcount = avail_hc + support
     total_available_hours = total_headcount * hours_per_person
+    # Fully-burdened paid hours per unit: ALL staffed hours (production +
+    # support, gross incl. OT) spread over the planned units. A supply/cost view
+    # — distinct from the demand-side mh/unit above. Rises with support staff.
+    total_available_hours_per_unit = (total_available_hours / units) if units > 0 else 0.0
 
     if earned_hr > 0:
         coverage = available_earned_hours / earned_hr
@@ -802,6 +806,7 @@ def executive_summary(*, total_earned_minutes: float, total_units: int,
         "units_per_day": (units / working_days) if working_days else 0.0,
         "mh_per_unit": mh_per_unit,
         "mh_per_unit_loaded": mh_per_unit_loaded,
+        "total_available_hours_per_unit": total_available_hours_per_unit,
         "available_headcount": avail_hc,
         "support_headcount": support,
         "total_headcount": total_headcount,

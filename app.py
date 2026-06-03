@@ -3915,6 +3915,8 @@ def _exec_summary_rows(m: dict) -> list[tuple[str, str]]:
         ("Total Hours Earned", _num(m.get("total_earned_hours", 0), 0)),
         ("Man-hours / unit (standard)", _num(m.get("mh_per_unit", 0), 2)),
         ("Man-hours / unit (effective)", _num(m.get("mh_per_unit_loaded", 0), 2)),
+        ("Avail hrs / unit (all staff, incl. support)",
+         _num(m.get("total_available_hours_per_unit", 0), 2)),
         ("New Hire %", _pct(m.get("new_hire_pct", 0))),
         ("New-Hire Productivity", _pct(m.get("new_hire_productivity", 0))),
         ("Base Efficiency", _pct(m.get("base_efficiency", 0))),

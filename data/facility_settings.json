@@ -7,7 +7,7 @@
   },
   "Cypress": {
     "new_hire_pct": 0.3,
-    "new_hire_productivity": 0.9,
+    "new_hire_productivity": 0.75,
     "absenteeism": 0.05,
     "overtime": 0.0
   }

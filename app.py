@@ -4014,6 +4014,23 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                     f"({avail_hc:.0f} available vs {hc_need:.1f} needed); "
                     f"~{metrics['missed_units_aggregate']:.0f} units at risk."
                 )
+            # Clarify the stricter station-aware figure so a "Good" aggregate
+            # verdict doesn't hide a per-station shortfall (rounds up per station
+            # and can't share labor across them, so it's always ≥ the aggregate).
+            _hc_station = metrics.get("headcount_needed_station")
+            if _hc_station is not None:
+                if _hc_station > avail_hc:
+                    st.caption(
+                        f"⚠️ The verdict uses the **aggregate** need. The stricter "
+                        f"**station-aware** need is **{_hc_station:.0f}** — by that "
+                        f"view you're ~{_hc_station - avail_hc:.0f} short. See the "
+                        "📊 Capacity tab's *Gap* column for which stations."
+                    )
+                else:
+                    st.caption(
+                        f"Stricter **station-aware** need is **{_hc_station:.0f}** "
+                        f"(≤ {avail_hc:.0f} available) — covered at the station level too."
+                    )
 
         with col_save:
             st.markdown("**💾 Save this scenario**")

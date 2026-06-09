@@ -6734,6 +6734,17 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
                 "Cycle Time (min)": cycle,
             })
         breakdown_df = pd.DataFrame(breakdown_rows)
+        # Defensive: a pairing whose catalog labor is zero at every station
+        # produces an empty breakdown_rows → an empty DataFrame with no
+        # columns. Skip the table (and the build-summary read-out) with a
+        # friendly note instead of crashing on the missing column.
+        if breakdown_df.empty:
+            st.info(
+                f"No labor recorded for **{chosen}** at any station — every "
+                "catalog cell for this pairing is blank or zero. Check the "
+                "FG / Accessory catalog row, then re-load this tab."
+            )
+            return
         # Add a TOTAL row
         total_lbr = int(breakdown_df["Total Labor (p-min)"].sum())
         total_cycle = round(breakdown_df["Cycle Time (min)"].sum(), 1)

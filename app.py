@@ -318,6 +318,62 @@ def _load_usage_log_cached(_mtime: float):
     return load_usage_log()
 
 
+# ---------------------------------------------------------------------------
+# Cached analysis pipeline.
+#
+# Streamlit reruns the WHOLE script on every widget interaction, and the heavy
+# pipeline (per-unit schedule expansion → capacity table) previously re-ran in
+# full each time — including ~5-6× inside the weekly heatmap. These wrappers
+# cache the two pure functions on the CONTENT of their inputs (Streamlit hashes
+# DataFrames + scalars), so:
+#   • a slider nudge that doesn't change the schedule → expand is a cache HIT;
+#   • a tab click that changes no inputs → BOTH are hits (near-instant);
+#   • only the inputs that actually changed force a recompute.
+# Cache keys cover every input, so there is no staleness risk: edit the
+# schedule / catalog / crew / a setting and the matching key changes.
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False, max_entries=32)
+def _expand_schedule_cached(schedule_df, machine_df, acc_df):
+    """Cached expand_schedule. expand_schedule attaches .attrs
+    (skipped_fg / unknown_acc) that don't reliably survive st.cache_data's
+    pickle round-trip, so return them separately; the wrapper reattaches."""
+    units = expand_schedule(schedule_df, machine_df, acc_df)
+    attrs = {
+        "skipped_fg": list(units.attrs.get("skipped_fg", []) or []),
+        "unknown_acc": list(units.attrs.get("unknown_acc", []) or []),
+    }
+    return units, attrs
+
+
+def _expand_schedule(schedule_df, machine_df, acc_df):
+    """Call the cached expansion and reattach the data-quality .attrs.
+
+    st.cache_data returns a fresh copy on each access, so setting .attrs here
+    never mutates the cached value."""
+    units, attrs = _expand_schedule_cached(schedule_df, machine_df, acc_df)
+    units.attrs["skipped_fg"] = attrs["skipped_fg"]
+    units.attrs["unknown_acc"] = attrs["unknown_acc"]
+    return units
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _build_capacity_table_cached(units, crew_config, shift_minutes, working_days,
+                                 safety_factor, efficiency_factor,
+                                 new_hire_pct, new_hire_productivity,
+                                 absenteeism, overtime):
+    """Cached build_capacity_table (output carries no .attrs, so it caches
+    directly). Scalars are passed positionally so each distinct setting is its
+    own cache key."""
+    return build_capacity_table(
+        units, crew_config, shift_minutes, working_days, safety_factor,
+        efficiency_factor,
+        new_hire_pct=new_hire_pct,
+        new_hire_productivity=new_hire_productivity,
+        absenteeism=absenteeism,
+        overtime=overtime,
+    )
+
+
 def _usage_token() -> "str | None":
     """Token lookup mirroring the catalog save handlers."""
     try:
@@ -3750,19 +3806,19 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
         if slice_df.empty:
             continue
         try:
-            units_w = expand_schedule(slice_df, machine_df, acc_df)
+            units_w = _expand_schedule(slice_df, machine_df, acc_df)
         except Exception:
             continue
         if units_w.empty:
             continue
         try:
-            cap_w = build_capacity_table(
+            cap_w = _build_capacity_table_cached(
                 units_w, inputs["crew_config"], inputs["shift"], week_days,
                 inputs["safety"], inputs["efficiency"],
-                new_hire_pct=inputs.get("new_hire_pct", 0.0),
-                new_hire_productivity=inputs.get("new_hire_productivity", 1.0),
-                absenteeism=inputs.get("absenteeism", 0.0),
-                overtime=inputs.get("overtime", 0.0),
+                inputs.get("new_hire_pct", 0.0),
+                inputs.get("new_hire_productivity", 1.0),
+                inputs.get("absenteeism", 0.0),
+                inputs.get("overtime", 0.0),
             )
         except Exception:
             continue
@@ -8153,7 +8209,7 @@ def main():
     if schedule_df.empty:
         units = pd.DataFrame()
     else:
-        units = expand_schedule(schedule_df, machine_df, acc_df)
+        units = _expand_schedule(schedule_df, machine_df, acc_df)
         if units.empty:
             empty_banner_msg = (
                 "⚠️ Could not expand schedule into units. Check that FG / Accessory SKUs "
@@ -8187,13 +8243,13 @@ def main():
         batt_type = pd.DataFrame(columns=["batt_type", "total_batteries", "units_count",
                                            "pct_of_total"])
     else:
-        capacity = build_capacity_table(
+        capacity = _build_capacity_table_cached(
             units, inputs["crew_config"], inputs["shift"], inputs["days"],
             inputs["safety"], inputs["efficiency"],
-            new_hire_pct=inputs.get("new_hire_pct", 0.0),
-            new_hire_productivity=inputs.get("new_hire_productivity", 1.0),
-            absenteeism=inputs.get("absenteeism", 0.0),
-            overtime=inputs.get("overtime", 0.0),
+            inputs.get("new_hire_pct", 0.0),
+            inputs.get("new_hire_productivity", 1.0),
+            inputs.get("absenteeism", 0.0),
+            inputs.get("overtime", 0.0),
         )
         batt_sku = battery_demand_by_sku(units)
         batt_type = battery_demand_by_type(units)

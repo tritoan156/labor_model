@@ -3,7 +3,7 @@
 Run with:   streamlit run app.py
 
 The app reads CSV inputs from data/, lets the user adjust crew/safety/days
-in the sidebar, and shows 8 dashboards as tabs.
+in the sidebar, and shows the dashboards as top-level tabs.
 """
 from __future__ import annotations
 
@@ -18,40 +18,76 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from core.data_loader import (
-    load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
-    load_item_master, load_item_packages,
-    resolve_item_time, unique_abbrs,
-    ScheduleColumnError,
-)
 import importlib as _importlib
 import inspect as _inspect
 import sys as _sys
-import core.constants as _constants
-import core.labor_calculator as _labor_calculator
-# Streamlit Cloud sometimes reruns app.py on a "warm reboot" while keeping the
-# PREVIOUS deploy's core.* modules cached in sys.modules. Names/params added in
-# this push then look "missing" (ImportError, e.g. SUPPORT_ROLES on constants)
-# or a call passes an unknown kwarg (TypeError, e.g. overtime). Detect staleness
-# via sentinels and reload the changed modules in DEPENDENCY ORDER (constants
-# first — every other module imports from it) so a git push self-heals. On a
-# clean deploy nothing is stale and this whole block is skipped.
+
+# --- Self-heal stale core.* modules on Streamlit Cloud "warm reboots" --------
+# Streamlit Cloud sometimes reruns app.py while keeping the PREVIOUS deploy's
+# core.* modules cached in sys.modules. Names/params added in this push then
+# look "missing" — `from core.X import <newname>` raises ImportError, or a call
+# passes an unknown kwarg (TypeError). This block MUST run BEFORE any
+# `from core.X import <name>` below, so the named imports bind against freshly
+# reloaded modules rather than the stale cached ones.
+#
+# Step 1: bare-import every core module we pull names from, so each is present
+# in sys.modules and can be reloaded. A bare `import core.X` of a stale cached
+# module is safe — it binds the cached object without checking for any specific
+# name (only `from core.X import name` would fail on a missing name).
+import core.constants
+import core.catalog_storage
+import core.facility_storage
+import core.facility_settings_storage
+import core.scenario_storage
+import core.exec_scenario_storage
+import core.uploaded_schedule_storage
+import core.process_flow_storage
+import core.usage_tracker
+import core.data_validator
+import core.data_loader
+import core.labor_calculator
+
+# Step 2: detect staleness via sentinels for names/params added in recent pushes.
 _stale = (
-    not hasattr(_constants, "SUPPORT_ROLES")
-    or not hasattr(_labor_calculator, "executive_summary")
+    not hasattr(core.constants, "SUPPORT_ROLES")
+    or not hasattr(core.labor_calculator, "executive_summary")
     or "overtime" not in _inspect.signature(
-        _labor_calculator.executive_summary).parameters
+        core.labor_calculator.executive_summary).parameters
+    or not hasattr(core.data_loader, "ScheduleColumnError")
 )
 if _stale:
-    for _modname in ("core.constants", "core.labor_calculator",
-                     "core.facility_storage", "core.facility_settings_storage",
-                     "core.exec_scenario_storage"):
+    # Reload in DEPENDENCY ORDER: constants first (every other module imports
+    # from it), then the storage/loader leaf modules, then labor_calculator
+    # (imports constants). Reload only re-executes modules already in
+    # sys.modules; on a clean deploy nothing is stale and this is skipped.
+    for _modname in (
+        "core.constants",
+        "core.catalog_storage",
+        "core.facility_storage",
+        "core.facility_settings_storage",
+        "core.scenario_storage",
+        "core.exec_scenario_storage",
+        "core.uploaded_schedule_storage",
+        "core.process_flow_storage",
+        "core.usage_tracker",
+        "core.data_validator",
+        "core.data_loader",
+        "core.labor_calculator",
+    ):
         _mod = _sys.modules.get(_modname)
         if _mod is not None:
             try:
                 _importlib.reload(_mod)
             except Exception:
                 pass
+
+# --- Now bind the specific names (pulled from the freshly reloaded modules) ---
+from core.data_loader import (
+    load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
+    load_item_master, load_item_packages,
+    resolve_item_time, unique_abbrs,
+    ScheduleColumnError,
+)
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
@@ -2330,8 +2366,34 @@ def _scenario_load(location: str, name: str, seed_key: str, rev_key: str) -> Non
     st.rerun()
 
 
+def _confirm_destructive(confirm_key: str, token: str, warn_msg: str) -> bool:
+    """Two-click guard for an irreversible, team-shared action (delete/reset).
+
+    These actions hit GitHub and affect every user, so we require a second click
+    to confirm — mirroring the save-overwrite pattern. The pending flag stores
+    ``token`` (e.g. the scenario name) and we only treat a click as confirmed
+    when the stashed token STILL matches the current target, so a leftover flag
+    from a previously-selected item can't silently confirm a delete of a
+    different one. Returns True on the confirming (second) click; on the first
+    click it stashes the flag, shows ``warn_msg``, and returns False so the
+    caller aborts.
+    """
+    if st.session_state.get(confirm_key) == token:
+        st.session_state.pop(confirm_key, None)
+        return True
+    st.session_state[confirm_key] = token
+    st.warning(warn_msg)
+    return False
+
+
 def _scenario_delete(location: str, name: str) -> None:
     """Handler for the Delete button."""
+    if not _confirm_destructive(
+        f"_scenario_delete_pending_{location}", name,
+        f"⚠️ Delete scenario **{name}** for everyone? This can't be undone — "
+        "click **🗑 Delete** again to confirm.",
+    ):
+        return
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
@@ -2539,6 +2601,12 @@ def _uploaded_schedule_load(location: str, name: str) -> None:
 
 def _uploaded_schedule_delete(location: str, name: str) -> None:
     """Handler for the Delete button."""
+    if not _confirm_destructive(
+        f"_uploaded_schedule_delete_pending_{location}", name,
+        f"⚠️ Delete saved schedule **{name}** for everyone? This can't be undone "
+        "— click **🗑 Delete** again to confirm.",
+    ):
+        return
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
@@ -3350,6 +3418,17 @@ def render_sidebar() -> dict:
         edited = edited_display.rename(
             columns={"People": "HC", "Stations/Cells": "Conc", "Crew per unit": "Crew"}
         )
+        # Sanitize: clearing a cell in the editor (delete key) leaves NaN, which
+        # would later hit int(NaN) in build_capacity_table / the Build Time
+        # drill-down and red-screen every tab. Coerce each column back to a
+        # clean int with a sensible fill (Crew floors at 1 — a 0-crew station is
+        # an invalid divide). This persists across reruns since the editor frame
+        # is re-derived each run.
+        for _col, _fill in (("HC", 0), ("Conc", 0), ("Crew", 1)):
+            edited[_col] = (
+                pd.to_numeric(edited[_col], errors="coerce")
+                .fillna(_fill).astype(int)
+            )
 
         # Save button
         if st.button(f"💾 Save crew for {location}", use_container_width=True):
@@ -4177,14 +4256,19 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                     st.session_state[f"_exec_reapply_toast_{location}"] = pick
                     st.rerun()
                 if c2.button("🗑 Delete", key=f"exec_del_{location}",
-                             use_container_width=True):
+                             use_container_width=True) and _confirm_destructive(
+                        f"_exec_delete_pending_{location}", pick,
+                        f"⚠️ Delete executive scenario **{pick}** for everyone? "
+                        "This can't be undone — click **🗑 Delete** again to confirm.",
+                ):
                     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
                     if not token:
                         st.error("GitHub token not configured.")
                     else:
                         try:
-                            delete_exec_scenario_on_github(location, pick, token)
-                            st.success(f"Deleted **{pick}**.")
+                            with st.spinner(f"Deleting '{pick}'..."):
+                                delete_exec_scenario_on_github(location, pick, token)
+                            st.success(f"🗑 Deleted **{pick}**.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Delete failed: {e}")
@@ -5315,14 +5399,25 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
             "Notes": note,
             "_sort": idle_pct,
         })
-    idle_df = pd.DataFrame(idle_rows).sort_values("_sort", ascending=False).drop(columns="_sort")
-    st.dataframe(
-        idle_df, use_container_width=True, height=420, hide_index=True,
-        column_config={
-            "Used %": st.column_config.NumberColumn("Used %", format="%d%%"),
-            "Idle %": st.column_config.NumberColumn("Idle %", format="%d%%"),
-        },
-    )
+    # idle_rows is empty only when every station has HC=0 (an all-unstaffed
+    # facility config). Building a DataFrame from [] gives zero columns, so the
+    # .sort_values("_sort") below would KeyError — guard it like the other
+    # empty-frame fixes (Build Time drill-down).
+    if not idle_rows:
+        st.info(
+            "No staffed stations to rotate — every station shows 0 people. "
+            "Add headcount in the sidebar **👥 Station headcount** editor to see "
+            "rotation candidates."
+        )
+    else:
+        idle_df = pd.DataFrame(idle_rows).sort_values("_sort", ascending=False).drop(columns="_sort")
+        st.dataframe(
+            idle_df, use_container_width=True, height=420, hide_index=True,
+            column_config={
+                "Used %": st.column_config.NumberColumn("Used %", format="%d%%"),
+                "Idle %": st.column_config.NumberColumn("Idle %", format="%d%%"),
+            },
+        )
 
     # =============================================================
     # Fix playbook — scenario-aware (works for any bottleneck)
@@ -7121,7 +7216,8 @@ def _render_flow_editor(edges: list) -> None:
                 "🔄 Reset to default",
                 key="flow_reset_btn", use_container_width=True,
             ):
-                _flow_reset()
+                _flow_reset(current_count=len(edited),
+                            default_count=len(PROCESS_FLOW_DEFAULTS))
 
 
 def _flow_save(edited_df) -> None:
@@ -7149,7 +7245,22 @@ def _flow_save(edited_df) -> None:
         st.error(f"❌ Save failed: {e}")
 
 
-def _flow_reset() -> None:
+def _flow_reset(current_count: int | None = None, default_count: int | None = None) -> None:
+    # Process-flow edges are SHARED across all facilities and all users; a reset
+    # replaces every custom edge with the built-in defaults. Require a second
+    # click to confirm and spell out what's lost.
+    _lost = (
+        f"replaces all {current_count} current edge(s) with the "
+        f"{default_count} built-in defaults"
+        if current_count is not None and default_count is not None
+        else "replaces every custom edge with the built-in defaults"
+    )
+    if not _confirm_destructive(
+        "_flow_reset_pending", "reset",
+        f"⚠️ Reset the process flow for **all facilities and all users**? This "
+        f"{_lost} and can't be undone — click **🔄 Reset to default** again to confirm.",
+    ):
+        return
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
@@ -7860,133 +7971,6 @@ def _save_simple_csv(df, file_path, label):
         st.error(f"Save failed: {e}")
 
 
-def tab_source_data(machine_df, acc_df, schedule_df,
-                     item_master_df, item_packages_df):
-    st.header("📁 Source Data")
-    st.caption(
-        "Raw inputs to the model. SKUs used in the current schedule/manual entry "
-        "are highlighted and listed first."
-    )
-
-    # Aggregate qty per FG and Accessory SKU from the schedule
-    used_fg = schedule_df.groupby("FG_BASE")["BUILD QTY"].sum().to_dict() \
-        if not schedule_df.empty else {}
-    used_acc = schedule_df[schedule_df["ACC"] != ""].groupby("ACC")["BUILD QTY"].sum().to_dict() \
-        if not schedule_df.empty else {}
-
-    sub = st.radio(
-        "Choose dataset",
-        [
-            "Schedule",
-            "Machine catalog",
-            "Accessory catalog",
-            "Items",
-            "Item packages",
-            "Reconciliation & Apply",
-        ],
-        horizontal=True,
-    )
-
-    if sub == "Items":
-        _render_item_master_view(item_master_df)
-        return
-    if sub == "Item packages":
-        _render_item_packages_view(item_packages_df, item_master_df)
-        return
-    if sub == "Reconciliation & Apply":
-        _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_acc)
-        return
-
-    if sub == "Schedule":
-        st.dataframe(schedule_df, use_container_width=True, height=600)
-    elif sub == "Machine catalog":
-        only_used = st.checkbox(
-            "Show only SKUs used in current schedule", value=False, key="m_only_used"
-        )
-        m_disp = machine_df.copy()
-        # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
-        if "FN_Assy_old" in m_disp.columns and "FN_Assy" not in m_disp.columns:
-            m_disp = m_disp.rename(columns={"FN_Assy_old": "FN_Assy"})
-        # Defensive: ensure Last Modified column exists (might be missing from stale cache)
-        if "Last Modified" not in m_disp.columns:
-            m_disp["Last Modified"] = ""
-        # Per-machine total labor across the assembly stations.
-        # Bat is a COUNT (not labor) so it's excluded from the sum.
-        machine_labor_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy",
-                              "PDI", "QC", "Ship"]
-        present_cols = [c for c in machine_labor_cols if c in m_disp.columns]
-        m_disp["Total labor (p-min)"] = m_disp[present_cols].fillna(0).sum(axis=1).astype(int)
-        m_disp["Total labor (p-hr)"] = (m_disp["Total labor (p-min)"] / 60.0).round(1)
-        m_disp.insert(0, "Used (qty)", m_disp.index.map(lambda s: used_fg.get(s, 0)))
-        m_disp.insert(1, "In schedule", m_disp["Used (qty)"] > 0)
-        if only_used:
-            m_disp = m_disp[m_disp["In schedule"]]
-        # Sort: used first (by qty desc), then alphabetical
-        m_disp = m_disp.sort_values(
-            by=["In schedule", "Used (qty)"],
-            ascending=[False, False],
-        )
-        # Highlight rows that are in the schedule
-        def _highlight_machine(row):
-            return ["background-color: #FFF3CD"] * len(row) if row["In schedule"] else [""] * len(row)
-        st.dataframe(
-            m_disp.style.apply(_highlight_machine, axis=1),
-            use_container_width=True, height=600,
-        )
-        st.caption(
-            f"🟡 highlighted = used in current schedule "
-            f"({sum(m_disp['In schedule'])} of {len(m_disp)} shown). "
-            "**Total labor** = sum of Warehouse + Wire + Trailer + Final + PDI + QC + Ship "
-            "(person-minutes per unit, excluding accessory + battery labor)."
-        )
-    else:  # Accessory catalog
-        only_used = st.checkbox(
-            "Show only SKUs used in current schedule", value=False, key="a_only_used"
-        )
-        a_disp = acc_df.copy()
-        # Backward-compat: if the loaded DataFrame has the old "Compressor"
-        # column (because cache hasn't refreshed), alias it to "ComAcc".
-        if "Compressor" in a_disp.columns and "ComAcc" not in a_disp.columns:
-            a_disp = a_disp.rename(columns={"Compressor": "ComAcc"})
-        # Defensive: ensure Last Modified column exists (might be missing from stale cache)
-        if "Last Modified" not in a_disp.columns:
-            a_disp["Last Modified"] = ""
-        a_disp.insert(0, "Used (qty)", a_disp.index.map(lambda s: used_acc.get(s, 0)))
-        a_disp.insert(1, "In schedule", a_disp["Used (qty)"] > 0)
-        # Per-accessory total uses the EXACT battery count from machine_clean.csv
-        # for the family. PDS / SDG accessories → 0 (no battery multiplier).
-        acc_labor_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
-                          "PMAcc", "GenAcc", "ComAcc"]
-        # Only sum columns that actually exist (defensive against stale cache)
-        present_labor_cols = [c for c in acc_labor_cols if c in a_disp.columns]
-        non_batt_cols = [c for c in present_labor_cols if c != "BattSubRaw"]
-        bat_counts = a_disp.index.to_series().astype(str).apply(
-            lambda s: _family_battery_count(machine_df, _accessory_family_hint(s))
-        )
-        base = a_disp[non_batt_cols].fillna(0).sum(axis=1)
-        per_batt = a_disp["BattSubRaw"].fillna(0) if "BattSubRaw" in a_disp.columns else pd.Series(0, index=a_disp.index)
-        a_disp["Bat"] = bat_counts.astype(int)
-        a_disp["Total per unit (p-min)"] = (base + per_batt * bat_counts).astype(int)
-        if only_used:
-            a_disp = a_disp[a_disp["In schedule"]]
-        a_disp = a_disp.sort_values(
-            by=["In schedule", "Used (qty)"],
-            ascending=[False, False],
-        )
-        def _highlight_acc(row):
-            return ["background-color: #FFF3CD"] * len(row) if row["In schedule"] else [""] * len(row)
-        st.dataframe(
-            a_disp.style.apply(_highlight_acc, axis=1),
-            use_container_width=True, height=600,
-        )
-        st.caption(
-            f"🟡 highlighted = used in current schedule "
-            f"({sum(a_disp['In schedule'])} of {len(a_disp)} shown). "
-            "**Total per unit** = non-battery labor + `BattSubRaw × Bat`. "
-            "`Bat` is the exact count from the machine catalog for the accessory's FG family."
-        )
-
-
 # =============================================================
 # Main
 # =============================================================
@@ -8464,7 +8448,7 @@ def main():
                         "to see them."
                     )
 
-    # Tabs — 6 top-level tabs, ordered from executive summary → planner detail → admin.
+    # Top-level tabs, ordered from executive summary → planner detail → admin.
     # Batteries content folded into Capacity. Update Labor + Data Quality + Source Data
     # consolidated into the single 📁 Data & Setup tab.
     tabs = st.tabs([

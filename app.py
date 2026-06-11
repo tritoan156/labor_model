@@ -54,6 +54,8 @@ _stale = (
     or "overtime" not in _inspect.signature(
         core.labor_calculator.executive_summary).parameters
     or not hasattr(core.data_loader, "ScheduleColumnError")
+    or "efficiency" not in getattr(
+        core.facility_settings_storage, "DEFAULT_SETTINGS", {})
 )
 if _stale:
     # Reload in DEPENDENCY ORDER: constants first (every other module imports
@@ -3287,8 +3289,8 @@ def render_sidebar() -> dict:
         help=(
             "Slice the analysis to a sub-week of the month so the "
             "recommendations stay relevant as the month progresses. "
-            "Reduce 'Working days' below to match if you switch from "
-            "Whole month → This week (typically 5)."
+            "'Working days' below auto-adjusts to match the window (5 for a "
+            "single week), so capacity and demand cover the same period."
         ),
     )
 
@@ -3299,22 +3301,46 @@ def render_sidebar() -> dict:
     # ----------------------------------------------------------------
     with st.sidebar.expander("⏱️ Working-time settings", expanded=False):
         st.caption("How much capacity you have per person per day.")
-        # 'Working days' defaults to the chosen Plan month's working-day count
-        # so capacity is computed over the same window you're planning. It
-        # re-syncs whenever the Plan month changes, but a manual edit sticks
-        # until you pick a different month (e.g. set 5 to model a single week).
+        # Saved per-facility planning assumptions. Seeds the Safety / Efficiency
+        # sliders (below) and the Workforce / Overtime sliders (further down) so
+        # a facility reuses what was last saved. Read once here, before any of
+        # those widgets are created.
+        _fs_saved = get_facility_settings(location)
+        # 'Working days' auto-follows BOTH the Plan month AND the Time window so
+        # capacity is computed over the SAME period the demand is sliced to.
+        # Otherwise "This week" demand (≈5 days) would be judged against a
+        # full-month capacity and every utilization / Required-HC / verdict
+        # would look ~4× too rosy.
+        #   Whole month            → the plan month's working-day count
+        #   This week              → 5 (one standard work week)
+        #   Remaining (from today) → remaining M–F in the plan month from today
+        # A "This week" / "Remaining" window only actually slices demand when
+        # today falls inside the plan month (see main()); when it doesn't, the
+        # demand stays full-month, so we keep the full-month day count. A manual
+        # edit sticks until the month or window changes.
         _pm_working_days = len(_plan_working_days)
-        if st.session_state.get("_work_days_synced_month") != plan_month:
-            st.session_state["work_days_input"] = _pm_working_days
-            st.session_state["_work_days_synced_month"] = plan_month
+        _now = now_local()
+        _today_in_plan_month = (_now.year, _now.month) == (plan_month[0], plan_month[1])
+        if time_window == "This week" and _today_in_plan_month:
+            _target_days = 5
+        elif time_window == "Remaining (from today)" and _today_in_plan_month:
+            _today = _now.date()
+            _target_days = max(1, sum(1 for d in _plan_working_days if d >= _today))
+        else:
+            _target_days = _pm_working_days
+        _work_days_sig = (plan_month, time_window, _today_in_plan_month)
+        if st.session_state.get("_work_days_synced_sig") != _work_days_sig:
+            st.session_state["work_days_input"] = _target_days
+            st.session_state["_work_days_synced_sig"] = _work_days_sig
         days = st.number_input(
             "Working days in the period",
             min_value=1, max_value=31,
             key="work_days_input",
             help=(
-                f"Defaults to the Plan month's working days "
-                f"({_pm_working_days} for {plan_month_label}). Override for a "
-                "partial period — e.g. set 5 for a single week."
+                f"Auto-follows the Plan month ({_pm_working_days} for "
+                f"{plan_month_label}) and the Time window (5 for a single week, "
+                "remaining M–F for 'Remaining'). Override for a custom period — "
+                "your value sticks until you change the month or window."
             ),
         )
         shift = st.number_input(
@@ -3326,13 +3352,16 @@ def render_sidebar() -> dict:
         safety = st.slider(
             "Planning buffer (safety factor)",
             min_value=0.50, max_value=1.00,
-            value=DEFAULT_SAFETY_FACTOR, step=0.05,
-            help="0.85 leaves a 15% buffer. 1.00 = use 100% of capacity (no buffer).",
+            value=max(0.50, min(1.00, float(_fs_saved.get("safety", DEFAULT_SAFETY_FACTOR)))),
+            step=0.05,
+            help="0.85 leaves a 15% buffer. 1.00 = use 100% of capacity (no buffer). "
+                 "Saved per facility with the 💾 button below.",
         )
         efficiency = st.slider(
             "Productive time (efficiency factor)",
             min_value=0.40, max_value=1.00,
-            value=DEFAULT_EFFICIENCY_FACTOR, step=0.025,
+            value=max(0.40, min(1.00, float(_fs_saved.get("efficiency", DEFAULT_EFFICIENCY_FACTOR)))),
+            step=0.025,
             help=(
                 "Share of paid shift time that becomes productive work — breaks, "
                 "setup, rework, and line-balance loss reduce it (like OEE "
@@ -3351,7 +3380,7 @@ def render_sidebar() -> dict:
         # this facility's saved planning assumptions and re-savable.
         # ------------------------------------------------------------
         st.markdown("**🧑‍🏭 Workforce availability**")
-        _fs_saved = get_facility_settings(location)
+        # _fs_saved was read at the top of this expander.
         _nh_key = f"new_hire_pct_pct_{location}"
         _np_key = f"new_hire_prod_pct_{location}"
         _ab_key = f"absenteeism_pct_{location}"
@@ -3423,6 +3452,8 @@ def render_sidebar() -> dict:
                             "new_hire_productivity": new_hire_productivity,
                             "absenteeism": absenteeism,
                             "overtime": overtime,
+                            "efficiency": efficiency,
+                            "safety": safety,
                         }, token)
                     _track_and_flush("assumptions_save", facility=location)
                     st.success(
@@ -3431,6 +3462,11 @@ def render_sidebar() -> dict:
                     )
                 except Exception as e:
                     st.error(f"Save failed: {e}")
+        st.caption(
+            "Saves **Workforce**, **Overtime**, **Safety buffer** & "
+            "**Efficiency** for this facility. (Working days follows the Plan "
+            "month / Time window; shift length isn't saved.)"
+        )
 
     # ----------------------------------------------------------------
     # STEP 4 — Station headcount (per facility), behind an expander
@@ -5096,8 +5132,8 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                     "Cycle min/unit": round(float(row.get("avg_cycle", 0) or 0), 1),
                     "Units/day per cell": round(cap_day / conc, 1) if conc > 0 else 0.0,
                     "Max units/day (cells)": int(round(cap_day)),
-                    "Max units/plan (cells)": int(round(cap_day * _space_days)),
-                    "Max units (this plan)": int(total_units // util),
+                    "Cell capacity / plan": int(round(cap_day * _space_days)),
+                    "Mix ceiling (units)": int(total_units // util),
                     "Cells used %": round(util * 100),
                     "Status": row.get("thru_status_safe", "") or "—",
                 })
@@ -5115,7 +5151,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                     continue
                 sp_area_rows.append({
                     "Area": area,
-                    "Max units (this plan)": _cap["max_units"],
+                    "Mix ceiling (units)": _cap["max_units"],
                     "Limiting cell": _cap["limiting_cell"],
                     "Cells used %": _cap["cells_used_pct"],
                 })
@@ -5132,7 +5168,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                     )
                     stn_df = (
                         pd.DataFrame(stn_rows)
-                        .sort_values("Max units (this plan)")
+                        .sort_values("Mix ceiling (units)")
                         .reset_index(drop=True)
                     )
                     st.dataframe(
@@ -5152,12 +5188,12 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                             "Max units/day (cells)": st.column_config.NumberColumn(
                                 "Max units/day (cells)", format="%d",
                                 help="Total daily cell throughput = cells × (shift ÷ cycle) × buffers, rounded. 🔋 Battery row is batteries/day."),
-                            "Max units/plan (cells)": st.column_config.NumberColumn(
-                                "Max units/plan (cells)", format="%d",
-                                help="Total this station's cells can process over the plan = Max units/day × working days (efficiency & safety applied). 🔋 Battery row is batteries/plan."),
-                            "Max units (this plan)": st.column_config.NumberColumn(
-                                "Max units (this plan)", format="%d",
-                                help="How far the current mix can scale before this station's cells saturate."),
+                            "Cell capacity / plan": st.column_config.NumberColumn(
+                                "Cell capacity / plan", format="%d",
+                                help="PHYSICAL ceiling: total units this station's cells can process over the plan = Max units/day × working days (efficiency & safety applied). 🔋 Battery row is batteries/plan."),
+                            "Mix ceiling (units)": st.column_config.NumberColumn(
+                                "Mix ceiling (units)", format="%d",
+                                help="MIX ceiling: how far the CURRENT SKU mix can scale before this station's cells saturate. Different from cell capacity — it accounts for what you're actually building."),
                             "Cells used %": st.column_config.NumberColumn(
                                 "Cells used %", format="%d%%",
                                 help="Share of this station's cell-time the plan consumes. >100% = space bottleneck."),
@@ -5166,15 +5202,16 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                         },
                     )
                     st.caption(
-                        "Lowest **Max units (this plan)** = your space bottleneck. "
-                        "The 🔋 Battery row is counted in **batteries/day**."
+                        "Lowest **Mix ceiling (units)** = your space bottleneck "
+                        "(how far the current mix can grow). The 🔋 Battery row is "
+                        "counted in **batteries/day**."
                     )
 
                     if sp_area_rows:
                         st.markdown("**By production area**")
                         sp_area_df = (
                             pd.DataFrame(sp_area_rows)
-                            .sort_values("Max units (this plan)")
+                            .sort_values("Mix ceiling (units)")
                             .reset_index(drop=True)
                         )
                         st.dataframe(
@@ -5182,8 +5219,8 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                             column_config={
                                 "Area": st.column_config.TextColumn(
                                     "Area", help="Production area (grouped stations)."),
-                                "Max units (this plan)": st.column_config.NumberColumn(
-                                    "Max units (this plan)", format="%d",
+                                "Mix ceiling (units)": st.column_config.NumberColumn(
+                                    "Mix ceiling (units)", format="%d",
                                     help="How far the current mix can scale before this area's tightest cell saturates (same metric as the per-station column)."),
                                 "Limiting cell": st.column_config.TextColumn(
                                     "Limiting cell", help="The space-binding station within the area (counts cells regardless of staffing)."),

@@ -31,6 +31,7 @@ from .catalog_storage import (
     save_catalog_to_github,
     GitHubConflict,
 )
+from .constants import DEFAULT_EFFICIENCY_FACTOR, DEFAULT_SAFETY_FACTOR
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SETTINGS_PATH = DATA_DIR / "facility_settings.json"
@@ -38,12 +39,16 @@ GITHUB_FILE_PATH = "data/facility_settings.json"
 
 # Defaults applied when a facility has nothing saved yet. New-hire share and
 # productivity default to "no new-hire drag"; absenteeism defaults to 5% — the
-# planner's standing assumption.
+# planner's standing assumption. Efficiency & safety mirror the app's sidebar
+# defaults so a facility with nothing saved seeds the same values it always
+# showed. All six are fractions in [0, 1], so they ride the same _clamp01 path.
 DEFAULT_SETTINGS = {
     "new_hire_pct": 0.0,
     "new_hire_productivity": 0.5,
     "absenteeism": 0.05,
     "overtime": 0.0,
+    "efficiency": float(DEFAULT_EFFICIENCY_FACTOR),
+    "safety": float(DEFAULT_SAFETY_FACTOR),
 }
 _KEYS = tuple(DEFAULT_SETTINGS.keys())
 

@@ -6798,7 +6798,14 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         st.rerun()
 
 
+@st.fragment
 def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
+    # @st.fragment: this tab's only interactive widget is the per-pairing
+    # drill-down selectbox, which just changes what's displayed. Isolating it as
+    # a fragment means picking a different pairing reruns ONLY this tab instead
+    # of the whole script (all other tabs re-rendering). Safe because the tab is
+    # pure display — no st.rerun() and no session-state writes that main()
+    # consumes, so there's nothing that needs an app-wide rerun.
     from core.constants import STATION_KEY_TO_DISPLAY, STATION_KEYS, HS_FINAL_CREW
 
     st.header("⏱ Build Time per Unit")
@@ -7438,7 +7445,12 @@ def _flow_reset(current_count: int | None = None, default_count: int | None = No
         _show_github_error(e, "Reset")
 
 
+@st.fragment
 def tab_data_validation(machine_df, acc_df, units=None):
+    # @st.fragment: the severity / category multiselect filters below only
+    # re-filter the displayed report, so isolating this view means changing a
+    # filter reruns ONLY the report instead of the whole script. Pure display —
+    # no st.rerun() and no session writes main() consumes.
     st.header("🔍 Data Quality")
     st.caption(
         "Automatic checks over the Machine and Accessory catalogs. Re-runs every "

@@ -5810,13 +5810,14 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
         ),
         fs_col: st.column_config.SelectboxColumn(
             "Final Station",
-            options=["Final", "ComAcc", "GenAcc", "PMAcc"],
+            options=["Final", "Undercarriage", "ComAcc", "GenAcc", "PMAcc"],
             help=(
                 f"Which team's station receives this SKU's FN_Assy labor "
-                f"at **{location}**. Default Final Assembly; choose "
-                f"ComAcc / GenAcc / PMAcc when another team actually builds "
-                f"the unit. Switch facility in the sidebar to edit a "
-                f"different plant's routing."
+                f"at **{location}**. Default Final Assembly; choose another "
+                f"team when they actually build the unit — e.g. **PDS "
+                f"compressors → Undercarriage**, or ComAcc / GenAcc / PMAcc. "
+                f"Switch facility in the sidebar to edit a different plant's "
+                f"routing."
             ),
             required=False,
         ),

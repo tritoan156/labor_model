@@ -2416,7 +2416,7 @@ def _scenario_save(location: str, name: str, seed_key: str, existing_names: list
         )
         st.rerun()
     except Exception as e:
-        st.error(f"❌ Save failed: {e}")
+        _show_github_error(e, "Save")
 
 
 def _scenario_load(location: str, name: str, seed_key: str, rev_key: str) -> None:
@@ -2440,6 +2440,35 @@ def _scenario_load(location: str, name: str, seed_key: str, rev_key: str) -> Non
     track_event("scenario_load", facility=location, name=name)
     st.success(f"Loaded scenario **{name}** — {len(seed)} row(s).")
     st.rerun()
+
+
+def _show_github_error(e, action: str = "Save") -> None:
+    """Render a planner-friendly GitHub error + a collapsed technical detail.
+
+    Maps the common failure modes to plain guidance so a planner isn't shown a
+    raw '401 Client Error: ... for url: https://api.github.com/...' string. The
+    exact exception text is preserved under "Technical details" for admins.
+    """
+    msg = str(e)
+    low = msg.lower()
+    if "401" in msg or "403" in msg or "bad credentials" in low:
+        why = ("the GitHub token is missing, expired, or lacks write access. "
+               "Ask your admin to refresh `github_token` in Streamlit Secrets.")
+    elif "404" in msg or "not found" in low:
+        why = ("the file or repo path wasn't found — the repo may have moved. "
+               "Ask your admin to check the GitHub settings.")
+    elif "409" in msg or "422" in msg or "sha" in low or "conflict" in low:
+        why = ("someone else just saved a change. Reload the page to pick up "
+               "their version, then try again.")
+    elif any(s in low for s in ("connection", "timed out", "timeout", "network",
+                                "max retries", "name resolution", "unreachable")):
+        why = ("GitHub couldn't be reached. Check your connection and try again "
+               "in a minute.")
+    else:
+        why = "something went wrong — see the details below and retry."
+    st.error(f"❌ {action} failed — {why}")
+    with st.expander("Technical details"):
+        st.code(msg)
 
 
 def _confirm_destructive(confirm_key: str, token: str, warn_msg: str) -> bool:
@@ -2487,7 +2516,7 @@ def _scenario_delete(location: str, name: str) -> None:
         )
         st.rerun()
     except Exception as e:
-        st.error(f"❌ Delete failed: {e}")
+        _show_github_error(e, "Delete")
 
 
 # =============================================================
@@ -2653,7 +2682,7 @@ def _uploaded_schedule_save(
         )
         st.rerun()
     except Exception as e:
-        st.error(f"❌ Save failed: {e}")
+        _show_github_error(e, "Save")
 
 
 def _uploaded_schedule_load(location: str, name: str) -> None:
@@ -2700,7 +2729,7 @@ def _uploaded_schedule_delete(location: str, name: str) -> None:
         )
         st.rerun()
     except Exception as e:
-        st.error(f"❌ Delete failed: {e}")
+        _show_github_error(e, "Delete")
 
 
 def _render_sku_browser(machine_df, acc_df, location: str, seed_key: str, rev_key: str) -> None:
@@ -3421,11 +3450,11 @@ def render_sidebar() -> dict:
                 st.session_state[_k] = int(round(_frac * 100))
 
         new_hire_pct = st.slider(
-            "New hire %", 0, 100, step=5, key=_nh_key,
+            "New hire %", 0, 100, step=1, key=_nh_key,
             help="Share of the crew who are new hires (still ramping up).",
         ) / 100.0
         new_hire_productivity = st.slider(
-            "New-hire productivity %", 0, 100, step=5, key=_np_key,
+            "New-hire productivity %", 0, 100, step=1, key=_np_key,
             help="A new hire's pace vs a seasoned worker (50% = half speed).",
         ) / 100.0
         absenteeism = st.slider(
@@ -3443,7 +3472,7 @@ def render_sidebar() -> dict:
 
         st.markdown("**⏱️ Overtime**")
         overtime = st.slider(
-            "Overtime %", 0, 100, step=5, key=_ot_key,
+            "Overtime %", 0, 100, step=1, key=_ot_key,
             help="Extra working time vs the standard shift (e.g. +20% ≈ a 6th "
                  "day; +100% = double). Extends the effective shift, so it "
                  "raises BOTH labor capacity AND station throughput.",
@@ -3479,7 +3508,7 @@ def render_sidebar() -> dict:
                         "(after redeploy ~1 min)."
                     )
                 except Exception as e:
-                    st.error(f"Save failed: {e}")
+                    _show_github_error(e, "Save")
         st.caption(
             "Saves **Workforce**, **Overtime**, **Safety buffer** & "
             "**Efficiency** for this facility. (Working days follows the Plan "
@@ -3558,7 +3587,7 @@ def render_sidebar() -> dict:
                         "after the app redeploys (~1 min)."
                     )
                 except Exception as e:
-                    st.error(f"Save failed: {e}")
+                    _show_github_error(e, "Save")
 
         # Live totals — split production vs support (Lead/Other)
         prod_hc, supp_hc, total_hc = _split_crew_hc(edited)
@@ -4345,7 +4374,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                         st.success(f"✅ Saved **{name}**. Visible to all after "
                                    "redeploy (~1 min).")
                     except Exception as e:
-                        st.error(f"Save failed: {e}")
+                        _show_github_error(e, "Save")
 
             saved = list_exec_scenarios(location)
             if saved:
@@ -4381,7 +4410,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                             st.success(f"🗑 Deleted **{pick}**.")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"Delete failed: {e}")
+                            _show_github_error(e, "Delete")
     else:
         st.info("📭 Load a schedule to compute the live summary. Saved scenarios "
                 "(if any) still appear below.")
@@ -4397,9 +4426,17 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
         names = list_exec_scenarios(fac)
         with fac_cols[i]:
             if names:
-                # default to the last name (most recently named) in the list
+                # list_exec_scenarios returns names sorted by KEY (alphabetical),
+                # so the old index=len(names) defaulted to the alphabetically-last
+                # name while calling it "most recent". Sort by each block's
+                # saved_at and default to the genuine newest (index=1, after "—").
+                names = sorted(
+                    names,
+                    key=lambda n: str((get_exec_scenario(fac, n) or {}).get("saved_at", "")),
+                    reverse=True,
+                )
                 chosen[fac] = st.selectbox(
-                    fac, ["—"] + names, index=len(names), key=f"exec_cmp_{fac}")
+                    fac, ["—"] + names, index=1, key=f"exec_cmp_{fac}")
             else:
                 st.caption(f"**{fac}** — none saved")
                 chosen[fac] = "—"
@@ -5702,11 +5739,12 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
     st.subheader("🗂 Machine catalog")
     _render_stale_data_banner("data/machine_clean.csv")
     st.caption(
-        f"Edit labor times in the table below. SKUs used in the current schedule "
-        f"are highlighted. Click **💾 Save** to push changes to GitHub — all users "
-        f"see new values after redeploy (~1 min). · Routing columns shown are for "
-        f"**{location}** ({fac_code}); switch facility in the sidebar to edit "
-        f"another plant's routing."
+        f"Edit labor times in the table below — **all labor columns are "
+        f"person-minutes per unit** (not hours; `Bat` is a battery count). SKUs "
+        f"used in the current schedule are highlighted. Click **💾 Save** to push "
+        f"changes to GitHub — all users see new values after redeploy (~1 min). · "
+        f"Routing columns shown are for **{location}** ({fac_code}); switch "
+        f"facility in the sidebar to edit another plant's routing."
     )
 
     editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "ETO", "Bat"]
@@ -6163,7 +6201,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
                     return
                 continue
             except Exception as e:
-                st.error(f"❌ Save failed: {e}")
+                _show_github_error(e, "Save")
                 return
 
         commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
@@ -6317,7 +6355,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
                     return
                 continue
             except Exception as e:
-                st.error(f"❌ Save failed: {e}")
+                _show_github_error(e, "Save")
                 return
 
         commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
@@ -7353,7 +7391,7 @@ def _flow_save(edited_df) -> None:
         )
         st.rerun()
     except Exception as e:
-        st.error(f"❌ Save failed: {e}")
+        _show_github_error(e, "Save")
 
 
 def _flow_reset(current_count: int | None = None, default_count: int | None = None) -> None:
@@ -7389,7 +7427,7 @@ def _flow_reset(current_count: int | None = None, default_count: int | None = No
         )
         st.rerun()
     except Exception as e:
-        st.error(f"❌ Reset failed: {e}")
+        _show_github_error(e, "Reset")
 
 
 def tab_data_validation(machine_df, acc_df, units=None):
@@ -7914,7 +7952,7 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
                 return
             continue
         except Exception as e:
-            st.error(f"❌ Save failed: {e}")
+            _show_github_error(e, "Save")
             return
 
     commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
@@ -8140,7 +8178,7 @@ def _save_simple_csv(df, file_path, label):
         _track_and_flush("simple_save", file=file_path, label=label)
         st.success(f"✅ Saved {label}! New values apply after the app redeploys (~1 min).")
     except Exception as e:
-        st.error(f"Save failed: {e}")
+        _show_github_error(e, "Save")
 
 
 # =============================================================
@@ -8693,7 +8731,7 @@ def main():
     # Lightweight provenance + support line at the bottom of every page.
     st.markdown("---")
     st.caption(
-        "Last updated: May 2026 · Questions or issues? Contact "
+        "Questions or issues? Contact "
         "[tnguyen@anacorp.com](mailto:tnguyen@anacorp.com)"
     )
 

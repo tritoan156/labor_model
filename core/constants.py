@@ -135,25 +135,30 @@ CUSTOMER_SUFFIXES = ["HERC", "HRC", "UR", "ES"]
 # === Station definitions ===
 # Station name → (default HC, default Concurrent bays, default Crew per unit)
 STATION_DEFAULTS = {
-    "Warehouse (Pick)":   (2, 2, 1),
-    "Wire Assembly":      (4, 4, 1),
-    "Battery Assembly":   (8, 4, 2),
-    "PM Acc (Headunit)":  (3, 3, 1),
-    "Gen Accessories":    (8, 8, 1),
-    "Com Accessories":    (1, 1, 1),
-    "Trailer Assembly":   (6, 3, 2),
-    "ETO":                (4, 2, 2),
-    "Accessories KIT":    (1, 1, 1),
-    "Final Assembly":     (4, 2, 2),
-    "PDI":                (2, 2, 1),
-    "QC":                 (4, 4, 1),
-    "Ship":               (1, 1, 1),
+    "Warehouse (Pick)":      (2, 2, 1),
+    "Wire Assembly":         (4, 4, 1),
+    "Battery Assembly":      (8, 4, 2),
+    "PM Acc (Headunit)":     (3, 3, 1),
+    "Gen Accessories":       (8, 8, 1),
+    # Undercarriage Assembly: PDS (compressor) chassis step that runs BEFORE Com
+    # Accessories. PDS units route their Final-Assembly labor here (see the
+    # machine catalog's "Final Station" routing). Ships unstaffed (HC=0) — admin
+    # sets real headcount per facility in the sidebar; until then PDS flags 🔴.
+    "Undercarriage Assembly": (0, 1, 1),
+    "Com Accessories":       (1, 1, 1),
+    "Trailer Assembly":      (6, 3, 2),
+    "ETO":                   (4, 2, 2),
+    "Accessories KIT":       (1, 1, 1),
+    "Final Assembly":        (4, 2, 2),
+    "PDI":                   (2, 2, 1),
+    "QC":                    (4, 4, 1),
+    "Ship":                  (1, 1, 1),
 }
 
 # Internal station keys (used in code, not display)
 STATION_KEYS = [
-    "Warehouse", "Wire", "Battery", "PMAcc", "GenAcc", "ComAcc", "Trailer",
-    "AccKIT", "Final", "PDI", "QC", "Ship", "ETO",
+    "Warehouse", "Wire", "Battery", "PMAcc", "GenAcc", "Undercarriage", "ComAcc",
+    "Trailer", "AccKIT", "Final", "PDI", "QC", "Ship", "ETO",
 ]
 
 # Non-production support roles shown in the headcount editor (e.g. leads,
@@ -176,7 +181,8 @@ STATION_AREA_GROUPS = {
     "Prep / Warehouse":   ["Warehouse (Pick)", "Wire Assembly"],
     "Battery":            ["Battery Assembly"],
     "Accessories":        ["PM Acc (Headunit)", "Gen Accessories",
-                           "Com Accessories", "Accessories KIT"],
+                           "Undercarriage Assembly", "Com Accessories",
+                           "Accessories KIT"],
     "Trailer":            ["Trailer Assembly"],
     "ETO":                ["ETO"],
     "Final / PDI / QC":   ["Final Assembly", "PDI", "QC"],
@@ -190,6 +196,7 @@ STATION_KEY_TO_DISPLAY = {
     "Battery": "Battery Assembly",
     "PMAcc": "PM Acc (Headunit)",
     "GenAcc": "Gen Accessories",
+    "Undercarriage": "Undercarriage Assembly",
     "ComAcc": "Com Accessories",
     "Trailer": "Trailer Assembly",
     "AccKIT": "Accessories KIT",

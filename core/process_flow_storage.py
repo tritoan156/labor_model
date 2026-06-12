@@ -47,6 +47,7 @@ DEFAULT_EDGES: List[dict] = [
     {"From": "Warehouse", "To": "Battery", "Class": "All"},
     {"From": "Warehouse", "To": "PMAcc",   "Class": "All"},
     {"From": "Warehouse", "To": "GenAcc",  "Class": "All"},
+    {"From": "Warehouse", "To": "Undercarriage", "Class": "All"},
     {"From": "Warehouse", "To": "ComAcc",  "Class": "All"},
     {"From": "Warehouse", "To": "AccKIT",  "Class": "All"},
     {"From": "Warehouse", "To": "Trailer", "Class": "All"},
@@ -61,6 +62,10 @@ DEFAULT_EDGES: List[dict] = [
     {"From": "Battery",   "To": "PMAcc",   "Class": "All"},
     {"From": "Battery",   "To": "ETO",     "Class": "All"},
     {"From": "AccKIT",    "To": "GenAcc",  "Class": "All"},
+
+    # Undercarriage (PDS only — shows when the unit has Undercarriage labor)
+    # runs BEFORE Com Accessories.
+    {"From": "Undercarriage", "To": "ComAcc", "Class": "All"},
 
     # Sub-assemblies → Final
     {"From": "PMAcc",     "To": "Final",   "Class": "All"},

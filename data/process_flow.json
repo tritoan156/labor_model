@@ -22,6 +22,16 @@
     },
     {
       "From": "Warehouse",
+      "To": "Undercarriage",
+      "Class": "All"
+    },
+    {
+      "From": "Undercarriage",
+      "To": "ComAcc",
+      "Class": "All"
+    },
+    {
+      "From": "Warehouse",
       "To": "ComAcc",
       "Class": "All"
     },

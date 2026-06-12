@@ -211,7 +211,8 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     # key; the loader has already validated against STATION_KEYS, so unknown
     # values can never land here — but we add a final defensive set anyway.
     _VALID = {"Final", "ComAcc", "GenAcc", "PMAcc", "Warehouse", "Wire",
-              "Battery", "Trailer", "AccKIT", "PDI", "QC", "Ship", "ETO"}
+              "Battery", "Trailer", "AccKIT", "PDI", "QC", "Ship", "ETO",
+              "Undercarriage"}
 
     def _station(col, default):
         try:
@@ -243,6 +244,7 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
         "Battery": batt_total,
         "PMAcc": _acc("PMAcc"),
         "GenAcc": _acc("GenAcc"),
+        "Undercarriage": 0.0,  # only PDS routes Final-Assembly labor here
         "ComAcc": _acc("ComAcc"),
         "Trailer": _m("Trailer"),
         "AccKIT": 0.0,

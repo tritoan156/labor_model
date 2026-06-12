@@ -1433,9 +1433,14 @@ def _render_sequencer_view(schedule_df: pd.DataFrame) -> None:
     )
 
     # Reset button — toss any reshape edits so the table reflects the
-    # canonical schedule again.
+    # canonical schedule again. The edits live in the data_editor's widget
+    # state (keyed below), NOT in a separate session key, so the only way to
+    # clear them is to give the editor a NEW key. Bump a revision nonce that
+    # feeds the editor key, forcing a fresh widget seeded from the canonical
+    # schedule. (The old code popped "_sequencer_edits", a key nothing ever
+    # wrote — so Revert silently did nothing.)
     if st.button("↩️ Revert to current sequence", help="Drops any unsaved reshape edits."):
-        st.session_state.pop("_sequencer_edits", None)
+        st.session_state["_seq_rev"] = int(st.session_state.get("_seq_rev", 0)) + 1
         st.rerun()
 
     # Choose which columns to expose in the editor. Keep the editable surface
@@ -1452,6 +1457,19 @@ def _render_sequencer_view(schedule_df: pd.DataFrame) -> None:
     # gets it as a Date.
     if "PRODUCTION DAY" in work.columns:
         work["PRODUCTION DAY"] = pd.to_datetime(work["PRODUCTION DAY"], errors="coerce")
+
+    # Editor key = manual Revert nonce + a signature of the canonical schedule.
+    # The signature auto-resets the editor whenever the underlying schedule is
+    # REPLACED (a saved schedule loaded, a Sequencer proposal accepted, an Apply
+    # committed) — without it, the constant key let stale positional edits
+    # overlay onto different rows of a new schedule. Editing a cell doesn't
+    # change `work`, so the key stays stable and in-progress edits persist.
+    _seq_rev = int(st.session_state.get("_seq_rev", 0))
+    try:
+        _seq_sig = int(pd.util.hash_pandas_object(work, index=False).sum() & 0xFFFFFFFF)
+    except Exception:
+        _seq_sig = len(work)
+    _seq_key = f"sequencer_editor_v{_seq_rev}_{_seq_sig}"
 
     col_cfg = {}
     if "FG SKU ID" in work.columns:
@@ -1493,7 +1511,7 @@ def _render_sequencer_view(schedule_df: pd.DataFrame) -> None:
         use_container_width=True,
         num_rows="fixed",
         column_config=col_cfg,
-        key="sequencer_editor",
+        key=_seq_key,
         height=480,
     )
 
@@ -8042,22 +8060,83 @@ def _render_item_packages_view(packages_df, item_master_df):
 
 
 def _save_simple_csv(df, file_path, label):
-    """Generic save helper — write a DataFrame as CSV to GitHub."""
+    """Save a reference-table DataFrame (items / item-packages) as CSV to GitHub.
+
+    These editors are full-table (``num_rows="dynamic"``) with composite,
+    non-unique keys, so a safe automatic row-merge isn't possible — a save
+    writes the whole file. To avoid SILENTLY reverting a teammate's edit (the
+    old version pushed this container's deploy-time table wholesale, with no
+    SHA), we:
+      1. fetch the latest file from GitHub + its SHA;
+      2. if it differs from this container's deploy-time copy (someone changed
+         it since we loaded), require an explicit second-click confirm so the
+         overwrite is acknowledged, not silent;
+      3. push with the fetched SHA as an optimistic lock, retrying once on a
+         concurrent-commit conflict;
+      4. mirror the saved content locally so a follow-up save in the same
+         session doesn't re-trigger the divergence prompt.
+    A fetch failure raises (caught below → "Save failed"), so a transient blip
+    aborts rather than clobbering.
+    """
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
         return
+
+    # Clean the user's frame once (drop all-empty rows, strip text cells).
+    clean = df.dropna(how="all").copy()
+    for c in clean.select_dtypes(include="object").columns:
+        clean[c] = clean[c].astype(str).str.strip()
+    csv_text = clean.to_csv(index=False)
+
+    _local_path = DATA_DIR / Path(file_path).name
+
     try:
-        # Drop rows where every column is empty/NaN
-        clean = df.dropna(how="all").copy()
-        for c in clean.select_dtypes(include="object").columns:
-            clean[c] = clean[c].astype(str).str.strip()
-        csv_text = clean.to_csv(index=False)
-        with st.spinner(f"Saving {label} to GitHub..."):
-            save_catalog_to_github(
-                csv_text, file_path, token,
-                message=f"Update {label} via app",
-            )
+        fresh_df, fresh_sha = _read_fresh_csv(file_path, token)
+
+        # Did the remote diverge from this container's deploy-time base copy?
+        # (Both sides parsed by the same pd.read_csv, so identical content
+        # compares equal; only a real change trips this.)
+        diverged = False
+        if fresh_sha is not None and not fresh_df.empty:
+            try:
+                base_text = pd.read_csv(_local_path).to_csv(index=False)
+                diverged = (fresh_df.to_csv(index=False) != base_text)
+            except Exception:
+                diverged = False  # can't compare → rely on the SHA lock below
+
+        if diverged and not _confirm_destructive(
+            f"_simple_save_confirm_{file_path}", str(fresh_sha),
+            f"⚠️ **{label}** was changed by someone else since this page loaded. "
+            "Saving overwrites their version with your full table. Reload the "
+            f"page to pick up their changes first, or click **💾 Save {label}** "
+            "again to overwrite anyway.",
+        ):
+            return
+
+        # SHA-locked push + one retry on a concurrent-commit conflict.
+        for attempt in (1, 2):
+            try:
+                with st.spinner(f"Saving {label} to GitHub..."):
+                    save_catalog_to_github(
+                        csv_text, file_path, token,
+                        message=f"Update {label} via app",
+                        sha=fresh_sha,
+                    )
+                break
+            except GitHubConflict:
+                if attempt == 2:
+                    raise
+                _, fresh_sha = _read_fresh_csv(file_path, token)  # refetch + retry
+
+        # Mirror locally so the next save this session sees the new base.
+        try:
+            _local_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(_local_path, "w", encoding="utf-8", newline="") as f:
+                f.write(csv_text)
+        except Exception:
+            pass
+
         _track_and_flush("simple_save", file=file_path, label=label)
         st.success(f"✅ Saved {label}! New values apply after the app redeploys (~1 min).")
     except Exception as e:

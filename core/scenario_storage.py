@@ -73,20 +73,20 @@ def get_scenario(location: str, name: str) -> Optional[dict]:
 def _fetch_existing_from_github(token: str) -> "tuple[dict, str | None]":
     """Pull the current scenarios.json from GitHub and return (parsed_dict, sha).
 
-    Falls back to the local file contents (or empty dict) on any error so the
-    save still has *something* to merge against — better than nothing.
+    A 404 (file doesn't exist yet) comes back as ({}, None) so the first save
+    can proceed. Any OTHER failure — network error, HTTP 5xx, rate-limit,
+    corrupt JSON — is RAISED, not swallowed. Aborting the save (the UI shows
+    "Save failed — retry") is safe; falling back to THIS container's stale
+    deploy-time copy and pushing it would silently clobber every scenario
+    other users saved since our deploy.
     """
-    try:
-        content_bytes, sha = fetch_catalog_csv_from_github(GITHUB_FILE_PATH, token)
-        if not content_bytes:
-            return {}, sha
-        parsed = json.loads(content_bytes.decode("utf-8"))
-        if not isinstance(parsed, dict):
-            return {}, sha
-        return parsed, sha
-    except Exception:
-        # GitHub unreachable / invalid JSON — start from the local copy
-        return load_all_scenarios(), None
+    content_bytes, sha = fetch_catalog_csv_from_github(GITHUB_FILE_PATH, token)
+    if not content_bytes:  # 404 → empty starting point
+        return {}, sha
+    parsed = json.loads(content_bytes.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{GITHUB_FILE_PATH} on GitHub is not a JSON object.")
+    return parsed, sha
 
 
 def _write_local_scenarios(content: str) -> None:

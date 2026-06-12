@@ -94,19 +94,20 @@ def get_facility_settings(location: str) -> dict:
 def _fetch_existing_from_github(token: str) -> "tuple[dict, str | None]":
     """Pull current facility_settings.json from GitHub → (parsed_dict, sha).
 
-    Falls back to the local file on any error so the save still has something to
-    merge against.
+    A 404 (file doesn't exist yet) comes back as ({}, None) so the first save
+    can proceed. Any OTHER failure — network error, HTTP 5xx, rate-limit,
+    corrupt JSON — is RAISED, not swallowed. Aborting the save (the UI shows
+    "Save failed — retry") is safe; falling back to THIS container's stale
+    deploy-time copy and pushing it would silently clobber every other
+    facility's saved assumptions since our deploy.
     """
-    try:
-        content_bytes, sha = fetch_catalog_csv_from_github(GITHUB_FILE_PATH, token)
-        if not content_bytes:
-            return {}, sha
-        parsed = json.loads(content_bytes.decode("utf-8"))
-        if not isinstance(parsed, dict):
-            return {}, sha
-        return parsed, sha
-    except Exception:
-        return load_all_facility_settings(), None
+    content_bytes, sha = fetch_catalog_csv_from_github(GITHUB_FILE_PATH, token)
+    if not content_bytes:  # 404 → empty starting point
+        return {}, sha
+    parsed = json.loads(content_bytes.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{GITHUB_FILE_PATH} on GitHub is not a JSON object.")
+    return parsed, sha
 
 
 def _write_local_settings(content: str) -> None:

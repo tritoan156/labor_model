@@ -2465,6 +2465,24 @@ def _show_github_error(e, action: str = "Save") -> None:
         st.code(msg)
 
 
+def _post_save_redeploy_notice(key_suffix: str) -> None:
+    """Standard "save pushed → Cloud is redeploying" notice + a reload button.
+
+    Every GitHub-writing save triggers a ~1–2 min Streamlit Cloud rebuild before
+    other browsers (and a hard refresh) see the change. Showing this uniformly —
+    with a one-click reload — stops a planner who waits and refreshes from
+    assuming the save failed. ``key_suffix`` keeps the button key unique per
+    call site / facility.
+    """
+    st.info(
+        "⏳ **Streamlit Cloud is now redeploying** with your saved values "
+        "(~1–2 minutes). Other users see them after that; the 🔄 Refresh banner "
+        "at the top of the relevant tab pulls them in mid-session."
+    )
+    if st.button("🔄 I waited — reload now", key=f"reload_after_save_{key_suffix}"):
+        st.rerun()
+
+
 def _confirm_destructive(confirm_key: str, token: str, warn_msg: str) -> bool:
     """Two-click guard for an irreversible, team-shared action (delete/reset).
 
@@ -3497,10 +3515,8 @@ def render_sidebar() -> dict:
                             "safety": safety,
                         }, token)
                     _track_and_flush("assumptions_save", facility=location)
-                    st.success(
-                        f"✅ Saved! {location} reuses these next time "
-                        "(after redeploy ~1 min)."
-                    )
+                    st.success(f"✅ Saved planning assumptions for {location}.")
+                    _post_save_redeploy_notice(f"assump_{location}")
                 except Exception as e:
                     _show_github_error(e, "Save")
         st.caption(
@@ -3576,10 +3592,8 @@ def render_sidebar() -> dict:
                     with st.spinner(f"Saving {location} crew to GitHub..."):
                         save_facility_crew_to_github(location, edited, token)
                     _track_and_flush("crew_save", facility=location)
-                    st.success(
-                        f"✅ Saved! Everyone sees the new {location} values "
-                        "after the app redeploys (~1 min)."
-                    )
+                    st.success(f"✅ Saved crew for {location}.")
+                    _post_save_redeploy_notice(f"crew_{location}")
                 except Exception as e:
                     _show_github_error(e, "Save")
 
@@ -3737,7 +3751,7 @@ Every **💾 Save** button in **📁 Data & Setup** (Machine catalog, Accessory 
 After every successful schedule load, the sidebar shows a green ✅ confirmation like *"Loaded 193 rows from HENDERSON · month May-26"* so you can verify the loader understood your file correctly.
 
 ### Unknown-SKU warning banner
-If your schedule references FG or accessory SKUs that aren't in the catalogs, a yellow banner appears at the **top of the page** listing them. Add the missing SKUs via **📁 Data & Setup → 🗂 Machine catalog → ➕ Add a new machine SKU** (or the equivalent for accessories) and they'll be picked up on the next reload.
+If your schedule references FG or accessory SKUs that aren't in the catalogs, a yellow banner appears at the **top of the page** listing them. Add the missing SKUs via **📁 Data & Setup → 🏭 Machine catalog → ➕ Add a new machine SKU** (or the equivalent for accessories) and they'll be picked up on the next reload.
 
 ### Privacy
 Uploaded CSVs stay **only in your browser** unless you explicitly click **💾 Save schedule**. They aren't written to disk on the server or pushed to GitHub by default.
@@ -4365,8 +4379,8 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                                 location, name, assumptions, metrics, token)
                         _track_and_flush("exec_scenario_save",
                                          facility=location, name=name)
-                        st.success(f"✅ Saved **{name}**. Visible to all after "
-                                   "redeploy (~1 min).")
+                        st.success(f"✅ Saved executive scenario **{name}**.")
+                        _post_save_redeploy_notice(f"exec_{location}")
                     except Exception as e:
                         _show_github_error(e, "Save")
 
@@ -5635,8 +5649,8 @@ def tab_data_setup(
     Data) with a single tab containing radio sub-views. Sub-views in order:
 
       📋 Schedule              — read-only schedule view
-      🗂 Machine catalog       — editable catalog + add-new-SKU form
-      🗂 Accessory catalog     — editable catalog + add-new + XXX placeholder forms
+      🏭 Machine catalog       — editable catalog + add-new-SKU form
+      🔌 Accessory catalog     — editable catalog + add-new + XXX placeholder forms
       🔩 Items                 — unified items table editor
       📦 Item packages         — package definitions editor
       🔬 Reconciliation & Apply — items-vs-aggregate diff + write-back
@@ -5654,8 +5668,8 @@ def tab_data_setup(
             "📋 Schedule",
             "🗓 Sequence",
             "🧹 Customer suffix cleanup",
-            "🗂 Machine catalog",
-            "🗂 Accessory catalog",
+            "🏭 Machine catalog",
+            "🔌 Accessory catalog",
             "🔩 Items",
             "📦 Item packages",
             "🔬 Reconciliation & Apply",
@@ -5694,10 +5708,10 @@ def tab_data_setup(
             machine_df, acc_df,
         )
 
-    elif sub == "🗂 Machine catalog":
+    elif sub == "🏭 Machine catalog":
         tab_floor_verification_machine(machine_df, schedule_df, used_fg, location=location)
 
-    elif sub == "🗂 Accessory catalog":
+    elif sub == "🔌 Accessory catalog":
         tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df)
 
     elif sub == "🔩 Items":
@@ -5730,7 +5744,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
     ak_col = f"AccKIT Station {fac_code}"
     pd_col = f"PDI Station {fac_code}"
 
-    st.subheader("🗂 Machine catalog")
+    st.subheader("🏭 Machine catalog")
     _render_stale_data_banner("data/machine_clean.csv")
     st.caption(
         f"Edit labor times in the table below — **all labor columns are "
@@ -5874,7 +5888,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
 
 def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     """The Accessory-catalog editor — extracted from tab_floor_verification."""
-    st.subheader("🗂 Accessory catalog")
+    st.subheader("🔌 Accessory catalog")
     _render_stale_data_banner("data/acc_clean.csv")
     st.caption(
         "Edit labor times in the table below. SKUs used in the current schedule "
@@ -7425,7 +7439,7 @@ def _flow_reset(current_count: int | None = None, default_count: int | None = No
 
 
 def tab_data_validation(machine_df, acc_df, units=None):
-    st.header("🔍 Data Validation")
+    st.header("🔍 Data Quality")
     st.caption(
         "Automatic checks over the Machine and Accessory catalogs. Re-runs every "
         "time the app reloads — push updated CSVs to GitHub to clear any issues."
@@ -7448,7 +7462,7 @@ def tab_data_validation(machine_df, acc_df, units=None):
             "machine catalog — their units were dropped from the analysis.**  \n"
             f"Missing: `" + "`, `".join(skipped_fg[:25]) + "`"
             + (f" … (+{len(skipped_fg) - 25} more)" if len(skipped_fg) > 25 else "")
-            + "  \nFix by adding these SKUs in **🗂 Machine catalog → ➕ Add a new machine SKU**, "
+            + "  \nFix by adding these SKUs in **🏭 Machine catalog → ➕ Add a new machine SKU**, "
             "or correct typos in the schedule."
         )
     if unknown_acc:
@@ -7457,7 +7471,7 @@ def tab_data_validation(machine_df, acc_df, units=None):
             "in the accessory catalog — those units were built with zero accessory labor.**  \n"
             f"Missing: `" + "`, `".join(unknown_acc[:25]) + "`"
             + (f" … (+{len(unknown_acc) - 25} more)" if len(unknown_acc) > 25 else "")
-            + "  \nFix by adding these SKUs in **🗂 Accessory catalog → ➕ Add a new accessory SKU** "
+            + "  \nFix by adding these SKUs in **🔌 Accessory catalog → ➕ Add a new accessory SKU** "
             "or **➕ Add placeholder accessory (XXX)**."
         )
     if skipped_fg or unknown_acc:
@@ -8170,7 +8184,8 @@ def _save_simple_csv(df, file_path, label):
             pass
 
         _track_and_flush("simple_save", file=file_path, label=label)
-        st.success(f"✅ Saved {label}! New values apply after the app redeploys (~1 min).")
+        st.success(f"✅ Saved {label}.")
+        _post_save_redeploy_notice(f"simple_{Path(file_path).stem}")
     except Exception as e:
         _show_github_error(e, "Save")
 

@@ -268,7 +268,8 @@ def _project_facility_routing(machine_df, location: str):
     out = machine_df.copy()
     for base, default in (("Final Station", "Final"),
                           ("AccKIT Station", "AccKIT"),
-                          ("PDI Station", "PDI")):
+                          ("PDI Station", "PDI"),
+                          ("Wire Station", "Wire")):
         sfx = f"{base} {code}"
         if sfx in out.columns:
             out[base] = out[sfx]
@@ -5744,6 +5745,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
     fs_col = f"Final Station {fac_code}"
     ak_col = f"AccKIT Station {fac_code}"
     pd_col = f"PDI Station {fac_code}"
+    ws_col = f"Wire Station {fac_code}"
 
     st.subheader("🏭 Machine catalog")
     _render_stale_data_banner("data/machine_clean.csv")
@@ -5769,15 +5771,18 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
         display_df[ak_col] = "AccKIT"
     if pd_col not in display_df.columns:
         display_df[pd_col] = "PDI"
+    if ws_col not in display_df.columns:
+        display_df[ws_col] = "Wire"
     # Drop the projected legacy routing columns from the editor view —
     # they're compute helpers, not the source of truth. We also drop the
     # OTHER facilities' columns so the editor only shows ONE set of
     # routing dropdowns matching the sidebar location.
-    _drop_cols = ["Final Station", "AccKIT Station", "PDI Station"]
+    _drop_cols = ["Final Station", "AccKIT Station", "PDI Station", "Wire Station"]
     for _code in ("HND", "SPB", "CYP"):
         if _code == fac_code:
             continue
-        _drop_cols.extend([f"Final Station {_code}", f"AccKIT Station {_code}", f"PDI Station {_code}"])
+        _drop_cols.extend([f"Final Station {_code}", f"AccKIT Station {_code}",
+                           f"PDI Station {_code}", f"Wire Station {_code}"])
     display_df = display_df.drop(columns=[c for c in _drop_cols if c in display_df.columns])
     if "Last Modified" not in display_df.columns:
         display_df["Last Modified"] = ""
@@ -5840,6 +5845,17 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
                 f"**{location}**. Default PDI; reroute when there's no "
                 f"separate PDI team (e.g. PDS → ComAcc, SDG → GenAcc, or "
                 f"fold into QC)."
+            ),
+            required=False,
+        ),
+        ws_col: st.column_config.SelectboxColumn(
+            "Wire Station",
+            options=["Wire", "GenAcc", "ComAcc", "PMAcc", "Final", "Trailer"],
+            help=(
+                f"Which station receives this SKU's Wire-assembly labor at "
+                f"**{location}**. Default Wire Assembly; reroute when this "
+                f"plant has no Wire team (e.g. Cypress: SDG → GenAcc, "
+                f"PDS → ComAcc)."
             ),
             required=False,
         ),

@@ -227,6 +227,10 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     final_station  = _station("Final Station",  "Final")
     acckit_station = _station("AccKIT Station", "AccKIT")
     pdi_station    = _station("PDI Station",    "PDI")
+    # Wire labor is routable too — some plants have no Wire Assembly team, so
+    # their Wire labor is absorbed by another team (default station "Wire").
+    wire_station   = _station("Wire Station",   "Wire")
+    wire_labor     = _m("Wire")
 
     # Source labor lines — populated by their catalog values, then *routed*
     # into the result dict at the chosen station below.
@@ -240,7 +244,7 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
         "Class": cls,
         "Bat": bat,
         "Warehouse": _m("Warehouse") + _acc("Warehouse"),
-        "Wire": _m("Wire"),
+        "Wire": 0.0,  # populated via wire_station routing below (default "Wire")
         "Battery": batt_total,
         "PMAcc": _acc("PMAcc"),
         "GenAcc": _acc("GenAcc"),
@@ -259,6 +263,7 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     result[final_station]  = float(result.get(final_station, 0) or 0) + final_labor
     result[acckit_station] = float(result.get(acckit_station, 0) or 0) + acckit_labor
     result[pdi_station]    = float(result.get(pdi_station, 0) or 0) + pdi_labor
+    result[wire_station]   = float(result.get(wire_station, 0) or 0) + wire_labor
     return result
 
 

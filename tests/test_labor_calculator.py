@@ -22,7 +22,7 @@ from core.constants import STATION_KEYS, DEFAULT_BATT_RAW, DEFAULT_NAMEPLATE_PRE
 # --------------------------------------------------------------------------
 MACHINE_COLS = ["Bat", "Warehouse", "Wire", "Trailer", "QC", "Ship",
                 "FN_Assy", "PDI", "ETO",
-                "Final Station", "AccKIT Station", "PDI Station"]
+                "Final Station", "AccKIT Station", "PDI Station", "Wire Station"]
 ACC_COLS = ["BattSubRaw", "Nameplate Prep", "Warehouse",
             "PMAcc", "GenAcc", "ComAcc", "AccKIT"]
 
@@ -38,6 +38,7 @@ def make_machine_df(rows, include_eto=True):
         r["Final Station"] = "Final"
         r["AccKIT Station"] = "AccKIT"
         r["PDI Station"] = "PDI"
+        r["Wire Station"] = "Wire"
         r.update(ov)
         data[fg] = r
     return pd.DataFrame.from_dict(data, orient="index")
@@ -143,6 +144,24 @@ class TestComputeUnitLabor:
         r = compute_unit_labor("PDS-9", None, m, make_acc_df({}))
         assert r["Final"] == 0
         assert r["ComAcc"] == 45
+
+    def test_routing_wire_default_to_wire(self):
+        # No Wire Station override → wire labor stays at the Wire station.
+        m = make_machine_df({"SDG-1": {"Wire": 30}})
+        r = compute_unit_labor("SDG-1", None, m, make_acc_df({}))
+        assert r["Wire"] == 30
+
+    def test_routing_wire_reroute(self):
+        # A plant with no Wire team folds wire labor into the chosen station
+        # (e.g. Cypress: SDG → GenAcc), leaving Wire at 0 and the total intact.
+        m = make_machine_df({"SDG-1": {"Wire": 30, "Wire Station": "GenAcc"}})
+        r = compute_unit_labor("SDG-1", None, m, make_acc_df({}))
+        assert r["Wire"] == 0
+        assert r["GenAcc"] == 30
+        # PDS → ComAcc variant
+        m2 = make_machine_df({"PDS-2": {"Wire": 20, "Wire Station": "ComAcc"}})
+        r2 = compute_unit_labor("PDS-2", None, m2, make_acc_df({}))
+        assert r2["Wire"] == 0 and r2["ComAcc"] == 20
 
     def test_missing_fg_returns_none(self):
         assert compute_unit_labor("NOPE", None, make_machine_df({"X": {}}),

@@ -154,6 +154,12 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     pdi_station_hnd_col = _find(df.columns, "PDI Station HND")
     pdi_station_spb_col = _find(df.columns, "PDI Station SPB")
     pdi_station_cyp_col = _find(df.columns, "PDI Station CYP")
+    # Wire routing — some plants have no dedicated Wire Assembly team, so the
+    # Wire labor is absorbed by another team there (e.g. Cypress: SDG -> GenAcc,
+    # PDS -> ComAcc). Same per-facility pattern as Final/AccKIT/PDI.
+    wire_station_hnd_col = _find(df.columns, "Wire Station HND")
+    wire_station_spb_col = _find(df.columns, "Wire Station SPB")
+    wire_station_cyp_col = _find(df.columns, "Wire Station CYP")
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
@@ -197,6 +203,9 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["PDI Station HND"]    = _read_station_col(pdi_station_hnd_col,    "PDI")
     out["PDI Station SPB"]    = _read_station_col(pdi_station_spb_col,    "PDI")
     out["PDI Station CYP"]    = _read_station_col(pdi_station_cyp_col,    "PDI")
+    out["Wire Station HND"]   = _read_station_col(wire_station_hnd_col,   "Wire")
+    out["Wire Station SPB"]   = _read_station_col(wire_station_spb_col,   "Wire")
+    out["Wire Station CYP"]   = _read_station_col(wire_station_cyp_col,   "Wire")
     # Last-modified date — empty for rows never edited through the app.
     mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
     out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * n, index=df.index, dtype=object)

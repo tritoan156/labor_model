@@ -55,6 +55,8 @@ _stale = (
         core.labor_calculator.executive_summary).parameters
     or not hasattr(core.data_loader, "ScheduleColumnError")
     or not hasattr(core.data_loader, "build_placeholder_map")
+    or "acc_skus" not in _inspect.signature(
+        core.data_loader.load_schedule).parameters
     or "efficiency" not in getattr(
         core.facility_settings_storage, "DEFAULT_SETTINGS", {})
     or "Undercarriage" not in getattr(core.constants, "STATION_KEYS", [])

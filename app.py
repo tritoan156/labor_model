@@ -1175,7 +1175,7 @@ def _load_schedule_df(
             st.session_state["_seen_upload_sig"] = _upload_sig(uploaded_file)
         df = load_schedule(
             io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
-            placeholder_map=placeholder_map,
+            placeholder_map=placeholder_map, acc_skus=acc_skus,
         )
         return _finalize(df, st.session_state["_active_schedule_source"])
 
@@ -1192,7 +1192,7 @@ def _load_schedule_df(
             st.session_state["_active_schedule_source"] = "upload"
             df = load_schedule(
                 io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
-                placeholder_map=placeholder_map,
+                placeholder_map=placeholder_map, acc_skus=acc_skus,
             )
             return _finalize(df, "upload")
         # Same file as before → fall through to the persisted active schedule.
@@ -1202,14 +1202,14 @@ def _load_schedule_df(
     if active is not None:
         df = load_schedule(
             io.BytesIO(active), location=location, machine_skus=machine_skus,
-            placeholder_map=placeholder_map,
+            placeholder_map=placeholder_map, acc_skus=acc_skus,
         )
         return _finalize(df, st.session_state.get("_active_schedule_source", "saved"))
 
     # 4) Bundled sample
     df = load_schedule(
         location=location, machine_skus=machine_skus,
-        placeholder_map=placeholder_map,
+        placeholder_map=placeholder_map, acc_skus=acc_skus,
     )
     return _finalize(df, "bundled")
 
@@ -3284,15 +3284,22 @@ def render_sidebar() -> dict:
             if isinstance(_rec, dict):
                 _by = _rec.get("by_model") or {}
                 if _rec.get("count") and _by:
-                    _lines = "; ".join(
-                        f"{_n}× **{_m}** → `{_sku}`"
-                        for _m, (_sku, _n) in _by.items()
+                    _accm = _rec.get("acc_by_model") or {}
+                    _parts = []
+                    for _m, (_sku, _n) in _by.items():
+                        _acc = _accm.get(_m)
+                        _acc_txt = f" + `{_acc[0]}`" if _acc else ""
+                        _parts.append(f"{_n}× **{_m}** → `{_sku}`{_acc_txt}")
+                    _lines = "; ".join(_parts)
+                    _acc_note = (
+                        " Accessory-side labor was estimated too."
+                        if _rec.get("acc_count") else ""
                     )
                     st.sidebar.warning(
                         f"⚠️ {_rec['count']} unit(s) had no FG SKU ID — "
-                        f"auto-assigned the catalog **estimation placeholder** so "
-                        f"they're still counted ({_lines}). Their labor is an "
-                        f"**estimate**; replace with real SKUs when available."
+                        f"auto-assigned the catalog **estimation placeholder(s)** so "
+                        f"they're still counted ({_lines}).{_acc_note} Their labor is "
+                        f"an **estimate**; replace with real SKUs when available."
                     )
                 _unm = _rec.get("unmatched") or {}
                 if _unm:

@@ -11,6 +11,7 @@ from core.data_loader import (
     build_placeholder_map,
     load_schedule,
     _norm_model_key,
+    _accessory_counterpart,
 )
 
 SCHEDULE_COLS = [
@@ -142,3 +143,58 @@ class TestPlaceholderRecovery:
         df = load_schedule(p, location="HENDERSON", placeholder_map=pmap)
         assert len(df) == 0
         assert df.attrs["placeholder_recovered"]["count"] == 0
+
+
+class TestAccessoryPairing:
+    """Recovery also pairs the `{stem} AXXX` accessory placeholder with the
+    `{stem} XXX` machine placeholder when the unit's accessory SKU is blank."""
+
+    def _row(self, acc=""):
+        return [{
+            "LOCATION": "HENDERSON", "FG SKU ID": "", "FG ACCRY SKU ID": acc,
+            "BUILD QTY": "1", "PRODUCTION MONTH": "Jul-26",
+            "MODEL TYPE": "EBOSS25-25 Hybrid",
+        }]
+
+    def test_counterpart_mapping(self):
+        assert _accessory_counterpart("BOSS25-25 XXX") == "BOSS25-25 AXXX"
+        assert _accessory_counterpart("BOSS220PM XXX") == "BOSS220PM AXXX"
+        assert _accessory_counterpart("BOSS25-A001") is None  # not an XXX placeholder
+
+    def test_pairs_accessory_when_blank(self, tmp_path):
+        p = _write_schedule(tmp_path, self._row(acc=""))
+        pmap = build_placeholder_map(_catalog())
+        df = load_schedule(p, location="HENDERSON", placeholder_map=pmap,
+                           acc_skus={"BOSS25-25 AXXX"})
+        assert df.iloc[0]["FG SKU ID"] == "BOSS25-25 XXX"
+        assert df.iloc[0]["FG ACCRY SKU ID"] == "BOSS25-25 AXXX"
+        rec = df.attrs["placeholder_recovered"]
+        assert rec["acc_count"] == 1
+        assert rec["acc_by_model"]["EBOSS25-25 Hybrid"] == ("BOSS25-25 AXXX", 1)
+
+    def test_does_not_overwrite_real_accessory(self, tmp_path):
+        p = _write_schedule(tmp_path, self._row(acc="BOSS25-A001"))
+        pmap = build_placeholder_map(_catalog())
+        df = load_schedule(p, location="HENDERSON", placeholder_map=pmap,
+                           acc_skus={"BOSS25-25 AXXX"})
+        assert df.iloc[0]["FG SKU ID"] == "BOSS25-25 XXX"        # machine recovered
+        assert df.iloc[0]["FG ACCRY SKU ID"] == "BOSS25-A001"   # real accessory kept
+        assert df.attrs["placeholder_recovered"]["acc_count"] == 0
+
+    def test_no_acc_skus_means_no_pairing(self, tmp_path):
+        p = _write_schedule(tmp_path, self._row(acc=""))
+        pmap = build_placeholder_map(_catalog())
+        df = load_schedule(p, location="HENDERSON", placeholder_map=pmap)  # no acc_skus
+        assert df.iloc[0]["FG SKU ID"] == "BOSS25-25 XXX"
+        assert df.iloc[0]["ACC"] == ""   # accessory left blank
+        assert df.attrs["placeholder_recovered"]["acc_count"] == 0
+
+    def test_accessory_not_in_catalog_is_skipped(self, tmp_path):
+        # Machine placeholder exists but its accessory counterpart isn't cataloged.
+        p = _write_schedule(tmp_path, self._row(acc=""))
+        pmap = build_placeholder_map(_catalog())
+        df = load_schedule(p, location="HENDERSON", placeholder_map=pmap,
+                           acc_skus={"SOME-OTHER AXXX"})
+        assert df.iloc[0]["FG SKU ID"] == "BOSS25-25 XXX"
+        assert df.iloc[0]["ACC"] == ""   # no matching accessory placeholder -> left blank
+        assert df.attrs["placeholder_recovered"]["acc_count"] == 0

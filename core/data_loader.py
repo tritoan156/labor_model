@@ -630,32 +630,69 @@ def build_placeholder_map(machine_df: pd.DataFrame | None) -> dict:
     return out
 
 
-def _apply_placeholder_recovery(df: pd.DataFrame, placeholder_map: dict | None) -> dict:
+def _accessory_counterpart(machine_sku: str) -> str | None:
+    """Map a machine placeholder SKU to its accessory counterpart.
+
+    The catalog convention pairs a ``{stem} XXX`` machine placeholder with a
+    ``{stem} AXXX`` accessory placeholder (e.g. ``BOSS25-25 XXX`` <->
+    ``BOSS25-25 AXXX``). Returns the accessory SKU, or None when the input
+    isn't an ``XXX`` machine placeholder.
+    """
+    s = str(machine_sku)
+    repl = re.sub(r"\s+XXX$", " AXXX", s, flags=re.IGNORECASE)
+    return repl if repl != s else None
+
+
+def _apply_placeholder_recovery(
+    df: pd.DataFrame, placeholder_map: dict | None, acc_skus: set | None = None,
+) -> dict:
     """In place: backfill a blank ``FG SKU ID`` from ``MODEL TYPE`` using the
     catalog placeholder map, so SKU-less but otherwise valid planned units are
     counted on estimated labor instead of being dropped.
+
+    When a unit is recovered and its ``FG ACCRY SKU ID`` is *also* blank, pair
+    it with the matching ``{stem} AXXX`` accessory placeholder (if that SKU
+    exists in ``acc_skus``) so the unit's accessory-side labor is estimated too,
+    not just the machine side.
 
     Must run *before* the BUILD-QTY / FG-SKU drop filter. Returns a summary the
     UI surfaces as a warning::
 
         {"count": int,
          "by_model": {model_type: (placeholder_sku, n), ...},
-         "unmatched": {model_type: n, ...}}
+         "unmatched": {model_type: n, ...},
+         "acc_count": int,
+         "acc_by_model": {model_type: (accessory_sku, n), ...}}
 
     No-op (zeros) when there's no map, or no MODEL TYPE / FG SKU ID / BUILD QTY
     column to work with.
     """
-    summary: dict = {"count": 0, "by_model": {}, "unmatched": {}}
+    summary: dict = {
+        "count": 0, "by_model": {}, "unmatched": {},
+        "acc_count": 0, "acc_by_model": {},
+    }
     if not placeholder_map:
         return summary
     model_col = _find_column(df.columns, "MODEL TYPE", "MODEL_TYPE", "MODELTYPE")
     if model_col is None or "FG SKU ID" not in df.columns or "BUILD QTY" not in df.columns:
         return summary
 
+    has_acc_col = "FG ACCRY SKU ID" in df.columns
+    acc_set = {str(s).strip().upper() for s in acc_skus} if acc_skus else set()
+
     qty = pd.to_numeric(df["BUILD QTY"], errors="coerce")
     fg = df["FG SKU ID"].astype("object")
     fg_blank = fg.isna() | (fg.fillna("").astype(str).str.strip() == "")
     candidates = df.index[qty.notna() & (qty > 0) & fg_blank]
+    if len(candidates) == 0:
+        return summary
+
+    # Recovery writes string SKUs into these columns. If a column arrived
+    # entirely blank, pandas typed it float64 and a string assignment would
+    # raise — cast to object up front so the writes are always safe.
+    df["FG SKU ID"] = df["FG SKU ID"].astype(object)
+    if has_acc_col:
+        df["FG ACCRY SKU ID"] = df["FG ACCRY SKU ID"].astype(object)
 
     for idx in candidates:
         model_raw = df.at[idx, model_col]
@@ -663,13 +700,26 @@ def _apply_placeholder_recovery(df: pd.DataFrame, placeholder_map: dict | None) 
         if model.lower() in ("", "nan", "none"):
             continue  # no model to match on — leave it to be dropped
         sku = placeholder_map.get(_norm_model_key(model))
-        if sku:
-            df.at[idx, "FG SKU ID"] = sku
-            summary["count"] += 1
-            prev = summary["by_model"].get(model)
-            summary["by_model"][model] = (sku, (prev[1] + 1) if prev else 1)
-        else:
+        if not sku:
             summary["unmatched"][model] = summary["unmatched"].get(model, 0) + 1
+            continue
+        df.at[idx, "FG SKU ID"] = sku
+        summary["count"] += 1
+        prev = summary["by_model"].get(model)
+        summary["by_model"][model] = (sku, (prev[1] + 1) if prev else 1)
+
+        # Accessory side: pair with the `{stem} AXXX` accessory placeholder when
+        # the unit's FG ACCRY SKU ID is blank and that placeholder is cataloged.
+        if has_acc_col and acc_set:
+            acc_sku = _accessory_counterpart(sku)
+            if acc_sku and acc_sku.upper() in acc_set:
+                cur = df.at[idx, "FG ACCRY SKU ID"]
+                cur_blank = (cur is None) or (str(cur).strip().lower() in ("", "nan", "none"))
+                if cur_blank:
+                    df.at[idx, "FG ACCRY SKU ID"] = acc_sku
+                    summary["acc_count"] += 1
+                    aprev = summary["acc_by_model"].get(model)
+                    summary["acc_by_model"][model] = (acc_sku, (aprev[1] + 1) if aprev else 1)
     return summary
 
 
@@ -679,6 +729,7 @@ def load_schedule(
     include_carryover: bool = True,
     machine_skus: set | None = None,
     placeholder_map: dict | None = None,
+    acc_skus: set | None = None,
 ) -> pd.DataFrame:
     """Load production schedule CSV → DataFrame.
 
@@ -719,7 +770,7 @@ def load_schedule(
     # estimation placeholder. Runs *before* the drop filter below so recovered
     # rows survive. Records what it did so the UI can warn the planner that
     # those units are running on ESTIMATED labor.
-    _recovered = _apply_placeholder_recovery(df, placeholder_map)
+    _recovered = _apply_placeholder_recovery(df, placeholder_map, acc_skus)
 
     # 3) Coerce BUILD QTY to integer before filtering, so non-numeric junk
     # (section divider rows, empty strings) becomes NaN → dropped, and 0-qty

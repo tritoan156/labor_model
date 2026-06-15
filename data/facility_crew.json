@@ -11,8 +11,8 @@
       "Crew": 1
     },
     "Battery Assembly": {
-      "HC": 9,
-      "Conc": 6,
+      "HC": 13,
+      "Conc": 8,
       "Crew": 2
     },
     "PM Acc (Headunit)": {
@@ -21,8 +21,13 @@
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 7,
+      "HC": 10,
       "Conc": 12,
+      "Crew": 1
+    },
+    "Undercarriage Assembly": {
+      "HC": 0,
+      "Conc": 0,
       "Crew": 1
     },
     "Com Accessories": {
@@ -31,12 +36,12 @@
       "Crew": 1
     },
     "Trailer Assembly": {
-      "HC": 5,
+      "HC": 6,
       "Conc": 12,
       "Crew": 2
     },
     "ETO": {
-      "HC": 4,
+      "HC": 5,
       "Conc": 2,
       "Crew": 2
     },
@@ -46,7 +51,7 @@
       "Crew": 1
     },
     "Final Assembly": {
-      "HC": 4,
+      "HC": 5,
       "Conc": 4,
       "Crew": 2
     },

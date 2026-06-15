@@ -87,6 +87,7 @@ if _stale:
 # --- Now bind the specific names (pulled from the freshly reloaded modules) ---
 from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
+    build_placeholder_map,
     load_item_master, load_item_packages,
     resolve_item_time, unique_abbrs,
     ScheduleColumnError,
@@ -1095,6 +1096,14 @@ def _load_schedule_df(
     """
     machine_skus = set(_load_machine_df(_csv_mtime("machine_clean.csv"))["SKU"])
 
+    # MODEL TYPE → estimation-placeholder SKU map, so the loader can rescue
+    # planned units that arrive with a BUILD QTY but a blank FG SKU ID (e.g. a
+    # make-to-order hybrid whose finished-good SKU isn't generated yet) instead
+    # of dropping them. Built from the catalog's `XXX` placeholder rows.
+    placeholder_map = build_placeholder_map(
+        _load_machine_df(_csv_mtime("machine_clean.csv"))
+    )
+
     # Auto-spread needs the full machine + accessory frames so it can weight
     # each row by labor (per-station p-min × qty) before running LPT. Both
     # come from the same cached loaders the rest of main() uses. Project the
@@ -1118,6 +1127,12 @@ def _load_schedule_df(
         """Common post-load step: auto-strip customer-decal suffixes from the
         displayed SKU columns, auto-spread blank PRODUCTION DAY rows so the
         weekly heatmap has something to chart, then stash the summary."""
+        # Capture the placeholder-recovery summary now, before the suffix-strip
+        # / auto-spread steps below rebuild the frame and drop .attrs.
+        _recovered = (
+            df.attrs.get("placeholder_recovered")
+            if df is not None and hasattr(df, "attrs") else None
+        )
         if df is not None and not df.empty:
             # Auto-clean customer-decal suffixes (e.g. BOSS70-001HRC →
             # BOSS70-001) on every load so the suffixed text never leaks into
@@ -1131,7 +1146,8 @@ def _load_schedule_df(
                 df, machine_df_full, acc_df_full, location,
                 target_month_hint=target_month_hint,
             )
-        _stash_upload_summary(df, location, source=source, plan_month_label=_plan_label)
+        _stash_upload_summary(df, location, source=source,
+                              plan_month_label=_plan_label, recovered=_recovered)
         return df
 
     # Resolution order. NOTE: the previously-loaded schedule must survive
@@ -1158,6 +1174,7 @@ def _load_schedule_df(
             st.session_state["_seen_upload_sig"] = _upload_sig(uploaded_file)
         df = load_schedule(
             io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
+            placeholder_map=placeholder_map,
         )
         return _finalize(df, st.session_state["_active_schedule_source"])
 
@@ -1174,6 +1191,7 @@ def _load_schedule_df(
             st.session_state["_active_schedule_source"] = "upload"
             df = load_schedule(
                 io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
+                placeholder_map=placeholder_map,
             )
             return _finalize(df, "upload")
         # Same file as before → fall through to the persisted active schedule.
@@ -1183,16 +1201,20 @@ def _load_schedule_df(
     if active is not None:
         df = load_schedule(
             io.BytesIO(active), location=location, machine_skus=machine_skus,
+            placeholder_map=placeholder_map,
         )
         return _finalize(df, st.session_state.get("_active_schedule_source", "saved"))
 
     # 4) Bundled sample
-    df = load_schedule(location=location, machine_skus=machine_skus)
+    df = load_schedule(
+        location=location, machine_skus=machine_skus,
+        placeholder_map=placeholder_map,
+    )
     return _finalize(df, "bundled")
 
 
 def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
-                          plan_month_label: str = "") -> None:
+                          plan_month_label: str = "", recovered: dict | None = None) -> None:
     """Save a one-line description of the just-loaded schedule into session
     state so the sidebar can echo it back to the planner as a green
     confirmation pill. No-op when the DataFrame is empty (caller already
@@ -1221,6 +1243,7 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
             "source": source,
             "auto_spread": (df.attrs.get("auto_spread")
                             if hasattr(df, "attrs") else None),
+            "recovered": recovered,
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
@@ -3251,6 +3274,34 @@ def render_sidebar() -> dict:
                 f"({_src_label})"
                 + _auto_suffix
             )
+            # Placeholder recovery — rows that had a BUILD QTY but no FG SKU ID
+            # were auto-mapped to a catalog estimation placeholder (so they're
+            # counted), or — if no placeholder matched their MODEL TYPE — still
+            # dropped. Warn the planner about both so the count is never a
+            # silent surprise.
+            _rec = _summary.get("recovered")
+            if isinstance(_rec, dict):
+                _by = _rec.get("by_model") or {}
+                if _rec.get("count") and _by:
+                    _lines = "; ".join(
+                        f"{_n}× **{_m}** → `{_sku}`"
+                        for _m, (_sku, _n) in _by.items()
+                    )
+                    st.sidebar.warning(
+                        f"⚠️ {_rec['count']} unit(s) had no FG SKU ID — "
+                        f"auto-assigned the catalog **estimation placeholder** so "
+                        f"they're still counted ({_lines}). Their labor is an "
+                        f"**estimate**; replace with real SKUs when available."
+                    )
+                _unm = _rec.get("unmatched") or {}
+                if _unm:
+                    _ulines = "; ".join(f"{_n}× **{_m}**" for _m, _n in _unm.items())
+                    st.sidebar.warning(
+                        f"⚠️ {sum(_unm.values())} unit(s) had no FG SKU ID **and** no "
+                        f"matching placeholder, so they were dropped ({_ulines}). "
+                        f"Add an `XXX` placeholder for these models (Data & Setup → "
+                        f"Machine catalog) or fill in real SKUs, then re-upload."
+                    )
         elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
     else:

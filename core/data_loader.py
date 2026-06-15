@@ -48,6 +48,7 @@ __all__ = [
     "load_acc_labor",
     "load_schedule",
     "build_manual_schedule",
+    "build_placeholder_map",
     "load_item_master",
     "load_item_packages",
     "resolve_item_time",
@@ -566,11 +567,118 @@ def _coerce_production_month(s: pd.Series) -> pd.Series:
     return s.map(_normalize)
 
 
+# ---------------------------------------------------------------------------
+# Placeholder recovery — rescue SKU-less planned units
+# ---------------------------------------------------------------------------
+# Real-world ERP exports sometimes ship a planned unit that has a BUILD QTY but
+# no FG SKU ID yet (e.g. a make-to-order hybrid whose finished-good SKU hasn't
+# been generated). Those rows used to be dropped silently, undercounting the
+# plan. When the catalog carries an ``XXX`` estimation placeholder for that
+# model (e.g. ``BOSS25-25 XXX`` → "EBOSS 25-25 HYBRID ESTIMATION ASSEMBLY"), we
+# map the row's MODEL TYPE to that placeholder so the unit is counted on
+# ESTIMATED labor and the planner is warned, instead of vanishing.
+
+_PLACEHOLDER_STOPWORDS = re.compile(r"\b(ESTIMATION|ASSEMBLY|ASSY)\b", re.IGNORECASE)
+
+
+def _norm_model_key(text) -> str:
+    """Normalize a model name to a comparison key.
+
+    Uppercases, strips every non-alphanumeric character, and collapses the
+    ``EBOSS`` prefix to ``BOSS`` so the schedule's inconsistent MODEL TYPE
+    values (``"EBOSS25-25 Hybrid"`` vs ``"BOSS70-65 Hybrid"``) line up with the
+    catalog's consistently ``EBOSS``-prefixed placeholder descriptions.
+    """
+    k = re.sub(r"[^A-Z0-9]", "", str(text).upper())
+    if k.startswith("EBOSS"):
+        k = "BOSS" + k[len("EBOSS"):]
+    return k
+
+
+def build_placeholder_map(machine_df: pd.DataFrame | None) -> dict:
+    """Build ``{normalized model key → placeholder SKU}`` from the machine
+    catalog's ``XXX`` estimation placeholders.
+
+    The catalog convention is an ``XXX`` SKU whose Description names the model
+    it estimates (``"EBOSS 25-25 HYBRID ESTIMATION ASSEMBLY"``). We key on the
+    normalized description-minus-boilerplate so a schedule row whose only
+    identifier is MODEL TYPE can still be mapped to the right placeholder.
+
+    Returns an empty dict for a missing/empty catalog, so callers can pass the
+    result straight through and recovery simply no-ops.
+    """
+    out: dict[str, str] = {}
+    if machine_df is None or len(machine_df) == 0:
+        return out
+    cols = {str(c).strip().upper(): c for c in machine_df.columns}
+    sku_col = cols.get("SKU")
+    if sku_col is None:
+        return out
+    desc_col = cols.get("DESCRIPTION")
+    for _, row in machine_df.iterrows():
+        sku = str(row[sku_col]).strip()
+        if not sku or "XXX" not in sku.upper():
+            continue
+        desc = str(row[desc_col]).strip() if desc_col is not None else ""
+        # Prefer the description (it carries the EBOSS model name); fall back to
+        # the SKU itself. Strip the "XXX" token and estimation boilerplate.
+        model_text = _PLACEHOLDER_STOPWORDS.sub(" ", desc) if desc else sku
+        model_text = re.sub(r"XXX", " ", model_text, flags=re.IGNORECASE)
+        key = _norm_model_key(model_text)
+        if key:
+            out.setdefault(key, sku)
+    return out
+
+
+def _apply_placeholder_recovery(df: pd.DataFrame, placeholder_map: dict | None) -> dict:
+    """In place: backfill a blank ``FG SKU ID`` from ``MODEL TYPE`` using the
+    catalog placeholder map, so SKU-less but otherwise valid planned units are
+    counted on estimated labor instead of being dropped.
+
+    Must run *before* the BUILD-QTY / FG-SKU drop filter. Returns a summary the
+    UI surfaces as a warning::
+
+        {"count": int,
+         "by_model": {model_type: (placeholder_sku, n), ...},
+         "unmatched": {model_type: n, ...}}
+
+    No-op (zeros) when there's no map, or no MODEL TYPE / FG SKU ID / BUILD QTY
+    column to work with.
+    """
+    summary: dict = {"count": 0, "by_model": {}, "unmatched": {}}
+    if not placeholder_map:
+        return summary
+    model_col = _find_column(df.columns, "MODEL TYPE", "MODEL_TYPE", "MODELTYPE")
+    if model_col is None or "FG SKU ID" not in df.columns or "BUILD QTY" not in df.columns:
+        return summary
+
+    qty = pd.to_numeric(df["BUILD QTY"], errors="coerce")
+    fg = df["FG SKU ID"].astype("object")
+    fg_blank = fg.isna() | (fg.fillna("").astype(str).str.strip() == "")
+    candidates = df.index[qty.notna() & (qty > 0) & fg_blank]
+
+    for idx in candidates:
+        model_raw = df.at[idx, model_col]
+        model = str(model_raw).strip() if model_raw is not None else ""
+        if model.lower() in ("", "nan", "none"):
+            continue  # no model to match on — leave it to be dropped
+        sku = placeholder_map.get(_norm_model_key(model))
+        if sku:
+            df.at[idx, "FG SKU ID"] = sku
+            summary["count"] += 1
+            prev = summary["by_model"].get(model)
+            summary["by_model"][model] = (sku, (prev[1] + 1) if prev else 1)
+        else:
+            summary["unmatched"][model] = summary["unmatched"].get(model, 0) + 1
+    return summary
+
+
 def load_schedule(
     path: Union[Path, str, io.IOBase, None] = None,
     location: str = "HENDERSON",
     include_carryover: bool = True,
     machine_skus: set | None = None,
+    placeholder_map: dict | None = None,
 ) -> pd.DataFrame:
     """Load production schedule CSV → DataFrame.
 
@@ -605,6 +713,13 @@ def load_schedule(
     # 2) Resolve fuzzy column names to the canonical names downstream code
     # expects. Raises ScheduleColumnError on missing required columns.
     df = _resolve_schedule_columns(df)
+
+    # 2b) Placeholder recovery — rescue planned units that carry a BUILD QTY but
+    # no FG SKU ID by mapping their MODEL TYPE to the catalog's matching `XXX`
+    # estimation placeholder. Runs *before* the drop filter below so recovered
+    # rows survive. Records what it did so the UI can warn the planner that
+    # those units are running on ESTIMATED labor.
+    _recovered = _apply_placeholder_recovery(df, placeholder_map)
 
     # 3) Coerce BUILD QTY to integer before filtering, so non-numeric junk
     # (section divider rows, empty strings) becomes NaN → dropped, and 0-qty
@@ -676,6 +791,10 @@ def load_schedule(
 
     # Sort: carryover first
     df = df.sort_values(by=["CARRYOVER"], ascending=False).reset_index(drop=True)
+    # Expose the placeholder-recovery summary so the UI can warn the planner.
+    # (Set last because the boolean filters / reset_index above don't carry
+    # .attrs forward reliably.)
+    df.attrs["placeholder_recovered"] = _recovered
     return df
 
 

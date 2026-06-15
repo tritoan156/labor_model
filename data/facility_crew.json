@@ -103,8 +103,13 @@
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 11,
+      "HC": 12,
       "Conc": 16,
+      "Crew": 1
+    },
+    "Undercarriage Assembly": {
+      "HC": 0,
+      "Conc": 0,
       "Crew": 1
     },
     "Com Accessories": {

@@ -54,6 +54,7 @@ _stale = (
     or "overtime" not in _inspect.signature(
         core.labor_calculator.executive_summary).parameters
     or not hasattr(core.data_loader, "ScheduleColumnError")
+    or not hasattr(core.data_loader, "build_placeholder_map")
     or "efficiency" not in getattr(
         core.facility_settings_storage, "DEFAULT_SETTINGS", {})
     or "Undercarriage" not in getattr(core.constants, "STATION_KEYS", [])

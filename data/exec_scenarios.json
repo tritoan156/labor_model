@@ -349,6 +349,70 @@
         "coverage_pct": 111.6508865753807,
         "verdict": "Good"
       }
+    },
+    "Hen July 06/15": {
+      "saved_at": "2026-06-15T15:15:01-07:00",
+      "assumptions": {
+        "units": 216,
+        "total_earned_hours": 3598.133333333333,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.3,
+        "new_hire_productivity": 0.5,
+        "absenteeism": 0.05,
+        "overtime": 0.0,
+        "safety": 1.0,
+        "shift_minutes": 480,
+        "working_days": 23,
+        "available_hc": 56.0,
+        "support_hc": 5.0,
+        "crew_hc": {
+          "Warehouse (Pick)": 2,
+          "Wire Assembly": 3,
+          "Battery Assembly": 13,
+          "PM Acc (Headunit)": 2,
+          "Gen Accessories": 10,
+          "Undercarriage Assembly": 2,
+          "Com Accessories": 0,
+          "Trailer Assembly": 6,
+          "ETO": 5,
+          "Accessories KIT": 0,
+          "Final Assembly": 4,
+          "PDI": 3,
+          "QC": 4,
+          "Ship": 2,
+          "Lead": 3,
+          "Other": 2
+        },
+        "schedule_label": "July 2026"
+      },
+      "metrics": {
+        "total_earned_hours": 3598.133333333333,
+        "total_units": 216,
+        "units_per_day": 9.391304347826088,
+        "mh_per_unit": 16.658024691358023,
+        "mh_per_unit_loaded": 41.258265489431636,
+        "total_available_hours_per_unit": 51.96296296296296,
+        "available_headcount": 56.0,
+        "support_headcount": 5.0,
+        "total_headcount": 61.0,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.3,
+        "new_hire_productivity": 0.5,
+        "absenteeism": 0.05,
+        "overtime": 0.0,
+        "safety": 1.0,
+        "adjusted_efficiency": 0.425,
+        "effective_hours_per_person": 74.29,
+        "net_available_hours": 10304.0,
+        "total_available_hours": 11224.0,
+        "available_earned_hours": 4160.240000000001,
+        "headcount_needed_aggregate": 48.43361600933279,
+        "headcount_needed_station": 55.0,
+        "missed_units_aggregate": 0.0,
+        "missed_units_station": 31,
+        "coverage_pct": 115.62217446083156,
+        "verdict": "Good"
+      }
     }
   }
 }

@@ -80,8 +80,16 @@ def _fetch_existing_from_github(token: str) -> "tuple[dict, str | None]":
     scenario other users saved since our deploy.
     """
     content_bytes, sha = fetch_catalog_csv_from_github(GITHUB_FILE_PATH, token)
-    if not content_bytes:  # 404 → empty starting point
-        return {}, sha
+    if not content_bytes:
+        if sha is not None:
+            # File EXISTS but content came back empty (fetch problem, not an
+            # empty file). Returning {} and saving would WIPE every executive
+            # scenario — abort instead.
+            raise RuntimeError(
+                f"{GITHUB_FILE_PATH} exists on GitHub but its contents couldn't "
+                "be read just now — not overwriting it. Try again in a moment."
+            )
+        return {}, None  # genuine 404 → empty starting point for a first save
     parsed = json.loads(content_bytes.decode("utf-8"))
     if not isinstance(parsed, dict):
         raise ValueError(f"{GITHUB_FILE_PATH} on GitHub is not a JSON object.")

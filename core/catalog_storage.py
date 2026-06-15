@@ -68,11 +68,20 @@ def _headers(token: str) -> dict:
 def fetch_catalog_csv_from_github(
     file_path: str, token: str,
 ) -> Tuple[bytes, Optional[str]]:
-    """Fetch the current CSV from GitHub for `file_path`.
+    """Fetch the current file from GitHub for `file_path`.
 
-    Returns `(csv_bytes, sha)`. If the file doesn't exist yet (404),
-    returns `(b"", None)` so the caller can treat it as an empty starting point.
-    Other HTTP errors raise.
+    Returns `(content_bytes, sha)`. A real 404 (file doesn't exist) returns
+    `(b"", None)` so the caller can treat it as an empty starting point.
+
+    IMPORTANT — large files: the GitHub *Contents* API omits the ``content``
+    field for files larger than 1 MB (it returns ``encoding: "none"`` and an
+    empty ``content``). ``data/uploaded_schedules.json`` stores a full CSV per
+    saved schedule and crosses 1 MB quickly, so we MUST follow the *blob* API
+    (``git_url``) in that case — it returns base64 content for blobs up to
+    100 MB. Skipping this is what let a save/delete read "empty", then write an
+    empty dict back over every saved schedule (data loss). If the file exists
+    (sha present) but we still can't get its bytes, we return `(b"", sha)` so
+    callers can refuse to overwrite it rather than clobber it blind.
     """
     r = requests.get(
         _api_url(file_path),
@@ -85,12 +94,27 @@ def fetch_catalog_csv_from_github(
     r.raise_for_status()
     payload = r.json()
     sha = payload.get("sha")
-    content_b64 = payload.get("content", "")
-    try:
-        content_bytes = base64.b64decode(content_b64) if content_b64 else b""
-    except Exception:
-        content_bytes = b""
-    return content_bytes, sha
+    content_b64 = payload.get("content", "") or ""
+    if content_b64.strip():
+        try:
+            return base64.b64decode(content_b64), sha
+        except Exception:
+            pass  # fall through to the blob fetch
+    # Contents API returned no inline content → file is >1 MB (or content was
+    # unparseable). Follow the blob API, which carries content up to 100 MB.
+    git_url = payload.get("git_url")
+    if git_url:
+        try:
+            rb = requests.get(git_url, headers=_headers(token), timeout=30)
+            rb.raise_for_status()
+            blob_b64 = rb.json().get("content", "") or ""
+            if blob_b64.strip():
+                return base64.b64decode(blob_b64), sha
+        except Exception:
+            pass  # leave content empty; caller guards on (b"", sha)
+    # File exists (sha) but content unavailable → signal so callers don't
+    # overwrite it with empty. (sha is None only on a true 404, handled above.)
+    return b"", sha
 
 
 def latest_catalog_sha(file_path: str, token: str) -> Optional[str]:

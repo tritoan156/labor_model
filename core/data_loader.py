@@ -775,7 +775,17 @@ def load_schedule(
     # 3) Coerce BUILD QTY to integer before filtering, so non-numeric junk
     # (section divider rows, empty strings) becomes NaN → dropped, and 0-qty
     # rows don't sneak through as phantom units.
-    df["__qty_num"] = pd.to_numeric(df["BUILD QTY"], errors="coerce")
+    #
+    # pd.to_numeric maps junk to NaN (correctly dropped below), but a literal
+    # "inf"/"Infinity" cell — or a number so large it overflows float64 (e.g.
+    # "1e400") — coerces to ±inf. +inf is *not* NaN and satisfies ``> 0``, so it
+    # would sail through the filter and then blow up ``.astype(int)`` with
+    # ``IntCastingNaNError: Cannot convert non-finite values (NA or inf) to
+    # integer``, crashing the entire upload. Fold ±inf into NaN so those phantom
+    # rows are dropped like any other invalid quantity instead.
+    df["__qty_num"] = pd.to_numeric(df["BUILD QTY"], errors="coerce").replace(
+        [float("inf"), float("-inf")], float("nan")
+    )
     df = df[df["FG SKU ID"].notna() & df["__qty_num"].notna() & (df["__qty_num"] > 0)].copy()
     df["BUILD QTY"] = df["__qty_num"].astype(int)
     df.drop(columns=["__qty_num"], inplace=True)

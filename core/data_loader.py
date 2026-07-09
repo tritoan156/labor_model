@@ -483,6 +483,26 @@ def _detect_schedule_months(df: pd.DataFrame, include_carryover: bool) -> list[s
     return keep
 
 
+def _plan_month_anchor(df: pd.DataFrame, months: list[str]) -> str:
+    """Pick the current-plan month that *undated* rows should fold into.
+
+    Only current-format (``Mon-YY``) months are eligible — an undated unit is
+    never anchored to a *carryover* (``YY-Mon``) month. With a single current
+    month that's the answer; with several, use whichever carries the most rows
+    so the rescue biases toward the dominant plan. Returns ``""`` when there's
+    no current month to anchor to (e.g. a carryover-only slice), which disables
+    the rescue so nothing gets mis-dated.
+    """
+    current_re = re.compile(r"^[A-Za-z]{3}-\d{2}$")
+    current = [m for m in months if current_re.match(str(m))]
+    if not current:
+        return ""
+    if len(current) == 1:
+        return current[0]
+    counts = df["PRODUCTION MONTH"].value_counts()
+    return max(current, key=lambda m: int(counts.get(m, 0)))
+
+
 _REQUIRED_SCHEDULE_COLUMNS = [
     # (canonical_name, [acceptable patterns for fuzzy matching], friendly label)
     ("LOCATION",         ["LOCATION", "FACILITY", "SITE", "PLANT"],                              "Location"),
@@ -775,7 +795,17 @@ def load_schedule(
     # 3) Coerce BUILD QTY to integer before filtering, so non-numeric junk
     # (section divider rows, empty strings) becomes NaN → dropped, and 0-qty
     # rows don't sneak through as phantom units.
-    df["__qty_num"] = pd.to_numeric(df["BUILD QTY"], errors="coerce")
+    #
+    # pd.to_numeric maps junk to NaN (correctly dropped below), but a literal
+    # "inf"/"Infinity" cell — or a number so large it overflows float64 (e.g.
+    # "1e400") — coerces to ±inf. +inf is *not* NaN and satisfies ``> 0``, so it
+    # would sail through the filter and then blow up ``.astype(int)`` with
+    # ``IntCastingNaNError: Cannot convert non-finite values (NA or inf) to
+    # integer``, crashing the entire upload. Fold ±inf into NaN so those phantom
+    # rows are dropped like any other invalid quantity instead.
+    df["__qty_num"] = pd.to_numeric(df["BUILD QTY"], errors="coerce").replace(
+        [float("inf"), float("-inf")], float("nan")
+    )
     df = df[df["FG SKU ID"].notna() & df["__qty_num"].notna() & (df["__qty_num"] > 0)].copy()
     df["BUILD QTY"] = df["__qty_num"].astype(int)
     df.drop(columns=["__qty_num"], inplace=True)
@@ -810,9 +840,36 @@ def load_schedule(
         .astype(bool)
     )
 
-    # 8) Filter to detected months
+    # 8) Keep only rows whose PRODUCTION MONTH resolves to a month we're planning
+    # for. A row whose month is blank or an unrecognized data-entry note (e.g.
+    # "NEED SN/QA") is a real planned unit the scheduler simply hasn't dated yet
+    # — fold it into the current plan month so it's still counted, instead of the
+    # silent drop that made uploads look short. Carryover-format rows (YY-Mon)
+    # are NOT rescued: they carry a real past month and are governed by
+    # include_carryover. Record the rescue so the UI can warn which units moved.
     months = _detect_schedule_months(df, include_carryover)
+    unscheduled = {"count": 0, "rows": 0, "assigned_month": "", "by_reason": {}}
     if months:
+        _pm = (
+            df["PRODUCTION MONTH"].astype("object").fillna("").astype(str).str.strip()
+        )
+        dated = _pm.str.match(r"^[A-Za-z]{3}-\d{2}$", na=False) | _pm.str.match(
+            r"^\d{2}-[A-Za-z]{3}$", na=False
+        )
+        orphan = ~dated
+        anchor = _plan_month_anchor(df, months)
+        if anchor and orphan.any():
+            _reason = _pm[orphan].replace("", "(blank)")
+            unscheduled = {
+                "count": int(df.loc[orphan, "BUILD QTY"].sum()),
+                "rows": int(orphan.sum()),
+                "assigned_month": anchor,
+                "by_reason": {
+                    str(k): int(v) for k, v in _reason.value_counts().items()
+                },
+            }
+            df.loc[orphan, "PRODUCTION MONTH"] = anchor
+            df.loc[orphan, "CARRYOVER"] = False
         df = df[df["PRODUCTION MONTH"].isin(months)]
 
     # 9) Parse PRODUCTION DAY → real datetime + derive WEEK_OF_MONTH.
@@ -846,6 +903,7 @@ def load_schedule(
     # (Set last because the boolean filters / reset_index above don't carry
     # .attrs forward reliably.)
     df.attrs["placeholder_recovered"] = _recovered
+    df.attrs["unscheduled_recovered"] = unscheduled
     return df
 
 

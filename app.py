@@ -1136,6 +1136,10 @@ def _load_schedule_df(
             df.attrs.get("placeholder_recovered")
             if df is not None and hasattr(df, "attrs") else None
         )
+        _unscheduled = (
+            df.attrs.get("unscheduled_recovered")
+            if df is not None and hasattr(df, "attrs") else None
+        )
         if df is not None and not df.empty:
             # Auto-clean customer-decal suffixes (e.g. BOSS70-001HRC →
             # BOSS70-001) on every load so the suffixed text never leaks into
@@ -1150,7 +1154,8 @@ def _load_schedule_df(
                 target_month_hint=target_month_hint,
             )
         _stash_upload_summary(df, location, source=source,
-                              plan_month_label=_plan_label, recovered=_recovered)
+                              plan_month_label=_plan_label, recovered=_recovered,
+                              unscheduled=_unscheduled)
         return df
 
     # Resolution order. NOTE: the previously-loaded schedule must survive
@@ -1217,7 +1222,8 @@ def _load_schedule_df(
 
 
 def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
-                          plan_month_label: str = "", recovered: dict | None = None) -> None:
+                          plan_month_label: str = "", recovered: dict | None = None,
+                          unscheduled: dict | None = None) -> None:
     """Save a one-line description of the just-loaded schedule into session
     state so the sidebar can echo it back to the planner as a green
     confirmation pill. No-op when the DataFrame is empty (caller already
@@ -1247,6 +1253,7 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
             "auto_spread": (df.attrs.get("auto_spread")
                             if hasattr(df, "attrs") else None),
             "recovered": recovered,
+            "unscheduled": unscheduled,
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
@@ -3312,6 +3319,21 @@ def render_sidebar() -> dict:
                         f"Add an `XXX` placeholder for these models (Data & Setup → "
                         f"Machine catalog) or fill in real SKUs, then re-upload."
                     )
+            # Undated units — rows with a valid SKU/qty but a blank or
+            # unrecognized PRODUCTION MONTH (e.g. "NEED SN/QA") were folded into
+            # the current plan month so they're counted, not silently dropped.
+            _uns = _summary.get("unscheduled")
+            if isinstance(_uns, dict) and _uns.get("count"):
+                _rlist = "; ".join(
+                    f"{_n}× {_r}" for _r, _n in (_uns.get("by_reason") or {}).items()
+                )
+                _rnote = f" ({_rlist})" if _rlist else ""
+                _amonth = _uns.get("assigned_month") or "the plan month"
+                st.sidebar.warning(
+                    f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION MONTH** "
+                    f"and were counted in **{_amonth}**{_rnote}. Fill in their "
+                    f"PRODUCTION MONTH to date them precisely."
+                )
         elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
     else:

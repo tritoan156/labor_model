@@ -3990,25 +3990,33 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
     # not a flat 5. A partial leading/trailing calendar week (week 1 or the last
     # week of most months) has only 1–4 working days; dividing its demand by a
     # 5-day capacity understates utilization by up to ~5× and paints a genuinely
-    # overloaded short week green. We derive the plan month from the dated rows
-    # and count working days per WEEK_OF_MONTH bucket; a week whose true count is
-    # unknown falls back to 5. We deliberately don't pull the day count from
-    # inputs["days"] (that may be set for the whole-month window).
-    week_days_by_week: dict[int, int] = {}
-    try:
-        _dts = pd.to_datetime(
-            schedule_df_full["PRODUCTION DAY"], errors="coerce"
-        ).dropna()
-        if not _dts.empty:
-            # Dominant (year, month) among dated rows = the plan month.
-            _period = _dts.dt.to_period("M").mode()
-            if len(_period):
-                _p = _period.iloc[0]
-                for _d in _working_days_in_month(int(_p.year), int(_p.month)):
-                    _wk = week_of_month(_d)
-                    week_days_by_week[_wk] = week_days_by_week.get(_wk, 0) + 1
-    except Exception:
-        week_days_by_week = {}
+    # overloaded short week green. The working-day count is computed PER WEEK
+    # from the month that week's own rows fall in — so a multi-month schedule
+    # (dated rows in two months) never applies one month's calendar to another
+    # month's weeks. A week whose dates are absent falls back to 5. We
+    # deliberately don't pull the day count from inputs["days"] (that may be set
+    # for the whole-month window).
+    def _working_days_for_week(slice_df, w):
+        try:
+            _wd = pd.to_datetime(
+                slice_df["PRODUCTION DAY"], errors="coerce"
+            ).dropna()
+            if _wd.empty:
+                return 5
+            # The month this week's rows fall in (dominant, if a bucket somehow
+            # straddles two months). Count that month's M–F days in week w.
+            _p = _wd.dt.to_period("M").mode()
+            if not len(_p):
+                return 5
+            _pp = _p.iloc[0]
+            cnt = sum(
+                1 for _d in _working_days_in_month(int(_pp.year), int(_pp.month))
+                if week_of_month(_d) == int(w)
+            )
+            return cnt if cnt > 0 else 5
+        except Exception:
+            return 5
+
     out = {}
     for w in weeks:
         slice_df = schedule_df_full[schedule_df_full["WEEK_OF_MONTH"] == w]
@@ -4020,7 +4028,7 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
             continue
         if units_w.empty:
             continue
-        week_days = week_days_by_week.get(int(w)) or 5
+        week_days = _working_days_for_week(slice_df, w)
         try:
             cap_w = _build_capacity_table_cached(
                 units_w, inputs["crew_config"], inputs["shift"], week_days,

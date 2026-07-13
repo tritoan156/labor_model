@@ -1237,8 +1237,13 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
         if df is None or df.empty:
             st.session_state.pop("_last_upload_summary", None)
             return
+        # Only treat a canonical Mon-YY token as the current CSV month — undated
+        # rows the loader now keeps (carryover-only slice, no anchor) are
+        # CARRYOVER=False but carry a blank/note PRODUCTION MONTH that must not
+        # be surfaced as the month label.
         months = (
-            df.loc[~df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
+            [m for m in df.loc[~df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
+             if re.match(r"^[A-Za-z]{3}-\d{2}$", str(m))]
             if "CARRYOVER" in df.columns else []
         )
         csv_month = months[0] if months else (
@@ -3328,12 +3333,22 @@ def render_sidebar() -> dict:
                     f"{_n}× {_r}" for _r, _n in (_uns.get("by_reason") or {}).items()
                 )
                 _rnote = f" ({_rlist})" if _rlist else ""
-                _amonth = _uns.get("assigned_month") or "the plan month"
-                st.sidebar.warning(
-                    f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION MONTH** "
-                    f"and were counted in **{_amonth}**{_rnote}. Fill in their "
-                    f"PRODUCTION MONTH to date them precisely."
-                )
+                _amonth = _uns.get("assigned_month")
+                if _amonth:
+                    st.sidebar.warning(
+                        f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION "
+                        f"MONTH** and were counted in **{_amonth}**{_rnote}. Fill "
+                        f"in their PRODUCTION MONTH to date them precisely."
+                    )
+                else:
+                    # No current-format plan month to anchor them to — they're
+                    # kept and counted, but stay undated on the calendar.
+                    st.sidebar.warning(
+                        f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION "
+                        f"MONTH** and no current plan month to date them to"
+                        f"{_rnote}. They're still counted in the totals but remain "
+                        f"undated — fill in their PRODUCTION MONTH to place them."
+                    )
         elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
     else:
@@ -3971,11 +3986,29 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
     if not weeks:
         return None
 
-    # Capacity for one week ≈ 5 working days (the standard). We deliberately
-    # don't pull this from inputs["days"] because the planner may have set
-    # that for the *whole-month* window; we want the heatmap to always show
-    # weekly intensity at a fixed reference rate.
-    week_days = 5
+    # Capacity for each week uses that week's TRUE count of M–F working days,
+    # not a flat 5. A partial leading/trailing calendar week (week 1 or the last
+    # week of most months) has only 1–4 working days; dividing its demand by a
+    # 5-day capacity understates utilization by up to ~5× and paints a genuinely
+    # overloaded short week green. We derive the plan month from the dated rows
+    # and count working days per WEEK_OF_MONTH bucket; a week whose true count is
+    # unknown falls back to 5. We deliberately don't pull the day count from
+    # inputs["days"] (that may be set for the whole-month window).
+    week_days_by_week: dict[int, int] = {}
+    try:
+        _dts = pd.to_datetime(
+            schedule_df_full["PRODUCTION DAY"], errors="coerce"
+        ).dropna()
+        if not _dts.empty:
+            # Dominant (year, month) among dated rows = the plan month.
+            _period = _dts.dt.to_period("M").mode()
+            if len(_period):
+                _p = _period.iloc[0]
+                for _d in _working_days_in_month(int(_p.year), int(_p.month)):
+                    _wk = week_of_month(_d)
+                    week_days_by_week[_wk] = week_days_by_week.get(_wk, 0) + 1
+    except Exception:
+        week_days_by_week = {}
     out = {}
     for w in weeks:
         slice_df = schedule_df_full[schedule_df_full["WEEK_OF_MONTH"] == w]
@@ -3987,6 +4020,7 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
             continue
         if units_w.empty:
             continue
+        week_days = week_days_by_week.get(int(w)) or 5
         try:
             cap_w = _build_capacity_table_cached(
                 units_w, inputs["crew_config"], inputs["shift"], week_days,
@@ -4404,18 +4438,41 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
             # verdict doesn't hide a per-station shortfall (rounds up per station
             # and can't share labor across them, so it's always ≥ the aggregate).
             _hc_station = metrics.get("headcount_needed_station")
+            _missed_station = metrics.get("missed_units_station")
             if _hc_station is not None:
-                if _hc_station > avail_hc:
-                    st.caption(
+                # "Covered at the station level" must reflect the ACTUAL
+                # per-station result (missed_units_station, from the buildable
+                # allocation), not a pooled sum-of-required-HC vs total-HC
+                # comparison. The pooled sum lets surplus at loosely-loaded
+                # stations mask a shortfall at an unstaffed or overloaded one, so
+                # it could previously claim "covered" while the same tab reported
+                # 100+ units missed. Treat the plan as station-short if the
+                # station-aware HC exceeds availability OR any units can't be
+                # built at the binding station(s).
+                _station_short = (_hc_station > avail_hc) or bool(_missed_station)
+                if _station_short:
+                    _msg = (
                         f"⚠️ The verdict uses the **aggregate** need. The stricter "
-                        f"**station-aware** need is **{_hc_station:.0f}** — by that "
-                        f"view you're ~{_hc_station - avail_hc:.0f} short. See the "
-                        "📊 Capacity tab's *Gap* column for which stations."
+                        f"**station-aware** need is **{_hc_station:.0f}**"
                     )
+                    if _hc_station > avail_hc:
+                        _msg += (
+                            f" — by that view you're ~{_hc_station - avail_hc:.0f} short"
+                        )
+                    _msg += "."
+                    if _missed_station:
+                        _msg += (
+                            f" At current staffing, **{int(_missed_station)}** of "
+                            f"{metrics.get('total_units', 0)} units can't be built at the "
+                            f"binding station(s)."
+                        )
+                    _msg += " See the 📊 Capacity tab's *Gap* column for which stations."
+                    st.caption(_msg)
                 else:
                     st.caption(
                         f"Stricter **station-aware** need is **{_hc_station:.0f}** "
-                        f"(≤ {avail_hc:.0f} available) — covered at the station level too."
+                        f"(≤ {avail_hc:.0f} available) and every station can build its "
+                        "share — covered at the station level too."
                     )
 
         with col_save:
@@ -4775,11 +4832,15 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             )
         else:
             _ceiling = ""
+        _one = len(_mu["missing_stations"]) == 1
         st.error(
-            f"🏭 **Max units this month at current mix: 0** — {_ms} "
-            f"{'have' if len(_mu['missing_stations'])>1 else 'has'} no HC, "
-            "but this mix needs it. Add headcount in the 👥 **Station "
-            f"headcount** sidebar panel to unlock the plan.{_ceiling}"
+            f"🏭 **Whole-mix cap: 0 units** — holding the current SKU mix in "
+            f"fixed proportion, {_ms} {'has' if _one else 'have'} no HC but this "
+            f"mix needs it, so the mix can't scale as a single block. "
+            f"(Lines that don't route through {'that station' if _one else 'those stations'} "
+            f"can still build — see the per-line **Buildable** breakdown above.) "
+            f"Add headcount in the 👥 **Station headcount** sidebar panel to "
+            f"unlock the full plan.{_ceiling}"
         )
     elif _mu.get("bottleneck"):
         st.markdown(
@@ -8538,11 +8599,19 @@ def main():
         schedule_df_full, machine_df, acc_df, inputs,
     )
 
-    # Detect schedule month for display (Mon-YY format rows, not carryover)
+    # Detect schedule month for display (Mon-YY format rows, not carryover).
+    # Only accept a canonical Mon-YY token: undated units that the loader now
+    # keeps (a carryover-only slice with no current month to anchor them to)
+    # carry CARRYOVER=False but a blank or note PRODUCTION MONTH like
+    # "NEED SN/QA" — those must not surface as the plan-month label.
     if schedule_df.empty or "CARRYOVER" not in schedule_df.columns:
         schedule_month = ""
     else:
-        current_months = schedule_df.loc[~schedule_df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
+        _cur = schedule_df.loc[~schedule_df["CARRYOVER"], "PRODUCTION MONTH"]
+        current_months = [
+            m for m in _cur.unique().tolist()
+            if re.match(r"^[A-Za-z]{3}-\d{2}$", str(m))
+        ]
         schedule_month = current_months[0] if current_months else ""
 
     # Top-of-page banner when there's no schedule loaded

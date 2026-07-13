@@ -108,12 +108,12 @@
       "Crew": 1
     },
     "Undercarriage Assembly": {
-      "HC": 8,
+      "HC": 9,
       "Conc": 10,
       "Crew": 1
     },
     "Com Accessories": {
-      "HC": 6,
+      "HC": 5,
       "Conc": 16,
       "Crew": 1
     },

@@ -1140,6 +1140,10 @@ def _load_schedule_df(
             df.attrs.get("unscheduled_recovered")
             if df is not None and hasattr(df, "attrs") else None
         )
+        _location = (
+            df.attrs.get("location_recovered")
+            if df is not None and hasattr(df, "attrs") else None
+        )
         if df is not None and not df.empty:
             # Auto-clean customer-decal suffixes (e.g. BOSS70-001HRC →
             # BOSS70-001) on every load so the suffixed text never leaks into
@@ -1155,7 +1159,7 @@ def _load_schedule_df(
             )
         _stash_upload_summary(df, location, source=source,
                               plan_month_label=_plan_label, recovered=_recovered,
-                              unscheduled=_unscheduled)
+                              unscheduled=_unscheduled, location_recovered=_location)
         return df
 
     # Resolution order. NOTE: the previously-loaded schedule must survive
@@ -1223,7 +1227,8 @@ def _load_schedule_df(
 
 def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
                           plan_month_label: str = "", recovered: dict | None = None,
-                          unscheduled: dict | None = None) -> None:
+                          unscheduled: dict | None = None,
+                          location_recovered: dict | None = None) -> None:
     """Save a one-line description of the just-loaded schedule into session
     state so the sidebar can echo it back to the planner as a green
     confirmation pill. No-op when the DataFrame is empty (caller already
@@ -1259,6 +1264,7 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
                             if hasattr(df, "attrs") else None),
             "recovered": recovered,
             "unscheduled": unscheduled,
+            "location_recovered": location_recovered,
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
@@ -3349,6 +3355,20 @@ def render_sidebar() -> dict:
                         f"{_rnote}. They're still counted in the totals but remain "
                         f"undated — fill in their PRODUCTION MONTH to place them."
                     )
+            # Untagged location — rows with a valid SKU/qty but a blank LOCATION
+            # cell were folded into the active facility so they're counted, not
+            # silently dropped by the location filter.
+            _loc = _summary.get("location_recovered")
+            if isinstance(_loc, dict) and _loc.get("count"):
+                _flist = "; ".join(
+                    f"{_n}× {_fg}" for _fg, _n in (_loc.get("by_fg") or {}).items()
+                )
+                _fnote = f" ({_flist})" if _flist else ""
+                st.sidebar.warning(
+                    f"⚠️ {_loc['count']} unit(s) had a blank **LOCATION** and were "
+                    f"counted under **{_loc.get('assigned_location') or 'this facility'}**"
+                    f"{_fnote}. Set their LOCATION if any belong to a different plant."
+                )
         elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.sidebar.info("Using the bundled May 2026 sample schedule.")
     else:

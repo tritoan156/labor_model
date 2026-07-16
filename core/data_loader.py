@@ -828,9 +828,36 @@ def load_schedule(
     # source uses Mon-YY, 5/8/2026, 2026-05-08, etc.
     df["PRODUCTION MONTH"] = _coerce_production_month(df["PRODUCTION MONTH"])
 
-    # 6) Filter location first so month detection is scoped to the right rows
+    # 6) Filter to the requested location so month detection is scoped to the
+    # right rows. A row whose LOCATION cell is *blank* (empty / NaN) is a real
+    # planned unit the scheduler simply didn't tag with a facility — fold it
+    # into the active facility so it's counted, instead of dropping it silently
+    # (mirrors the undated-row and SKU-less-row rescues below). Rows tagged with
+    # a *different* explicit facility are still excluded. Record the rescue so
+    # the UI can warn which units moved.
+    location_recovered = {
+        "count": 0, "rows": 0, "assigned_location": "", "by_fg": {},
+    }
     if location:
-        df = df[df["LOC"] == location.upper()]
+        loc_target = location.upper()
+        blank_loc = df["LOC"].isin(["", "NAN", "NONE"])
+        keep_loc = (df["LOC"] == loc_target) | blank_loc
+        if blank_loc.any():
+            _fg = df.loc[blank_loc, "FG_RAW"].astype(str)
+            location_recovered = {
+                "count": int(df.loc[blank_loc, "BUILD QTY"].sum()),
+                "rows": int(blank_loc.sum()),
+                "assigned_location": location,
+                "by_fg": {
+                    str(k): int(v)
+                    for k, v in df.loc[blank_loc, "BUILD QTY"].groupby(_fg).sum().items()
+                },
+            }
+            # Tag the rescued rows with the active facility so downstream
+            # display / grouping shows them under this plant.
+            df.loc[blank_loc, "LOCATION"] = location
+            df.loc[blank_loc, "LOC"] = loc_target
+        df = df[keep_loc]
 
     # 7) Detect carryover rows (YY-Mon format) vs current rows (Mon-YY format).
     # Use vectorized .str.match() with na=False — robust against PyArrow-backed
@@ -927,6 +954,7 @@ def load_schedule(
     # .attrs forward reliably.)
     df.attrs["placeholder_recovered"] = _recovered
     df.attrs["unscheduled_recovered"] = unscheduled
+    df.attrs["location_recovered"] = location_recovered
     return df
 
 

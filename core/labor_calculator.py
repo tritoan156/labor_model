@@ -646,7 +646,8 @@ def _overall_status(row) -> str:
     return "🟢 OK"
 
 
-def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame) -> dict:
+def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame,
+                      excluded_stations=None) -> dict:
     """Line-aware buildable-unit cap.
 
     The plant runs parallel production lines (see :func:`classify_fg_category`)
@@ -671,6 +672,12 @@ def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame) -> dict:
     A station a line needs but with HC=0 makes that line infeasible (buildable 0),
     mirroring the missing-station handling elsewhere.
 
+    ``excluded_stations`` is an optional iterable of station DISPLAY names the
+    planner has chosen to ignore when sizing buildable units (e.g. a station the
+    model over-constrains, like Battery, that isn't really binding in reality).
+    An excluded station is skipped entirely — it neither caps a line nor renders
+    it infeasible — so the buildable count reflects the next real constraint.
+
     Returns ``{"lines": [ {line, planned, buildable, binding_station,
     binding_kind, max_util, infeasible} ... ], "total": int}`` (lines sorted by
     name). Empty inputs return ``{"lines": [], "total": 0}``.
@@ -679,6 +686,8 @@ def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame) -> dict:
             or capacity is None or capacity.empty
             or "fg_base" not in units_df.columns):
         return {"lines": [], "total": 0}
+
+    excluded = {str(s).strip() for s in (excluded_stations or [])}
 
     def _station_util(disp: str):
         """(util, kind) for a station display name; inf if the line can't clear it.
@@ -722,6 +731,8 @@ def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame) -> dict:
             if st_key not in sub.columns or float(sub[st_key].sum()) <= 0:
                 continue  # this line doesn't use this station
             disp = STATION_KEY_TO_DISPLAY[st_key]
+            if disp in excluded:
+                continue  # planner excluded this station from buildable sizing
             util, kind = _station_util(disp)
             if util == float("inf"):
                 infeasible, max_util, binding, binding_kind = True, util, disp, kind

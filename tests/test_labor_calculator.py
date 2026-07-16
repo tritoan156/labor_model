@@ -574,6 +574,29 @@ class TestBuildableByLine:
         assert r["lines"][0]["buildable"] == 0
         assert r["total"] == 0
 
+    def test_excluded_station_is_skipped(self):
+        # Battery throughput-binds an EBOSS line to 40; excluding it lets the
+        # next real constraint (GenAcc, 0.5) drive the count → 120.
+        units = make_units_df(
+            [{"fg_base": "BOSS125-001", "Battery": 10, "GenAcc": 10} for _ in range(60)]
+        )
+        cap = self._cap({"Battery Assembly": (8, 0.2, 1.5),
+                         "Gen Accessories": (4, 0.5, 0.0)})
+        assert buildable_by_line(units, cap)["total"] == 40          # 60 / 1.5
+        r = buildable_by_line(units, cap, excluded_stations=["Battery Assembly"])
+        assert r["total"] == 120                                     # 60 / 0.5
+        assert r["lines"][0]["binding_station"] == "Gen Accessories"
+
+    def test_excluded_station_ignores_infeasibility(self):
+        # An excluded station that is unstaffed (HC=0) must NOT render the line
+        # infeasible — it's set aside entirely.
+        units = make_units_df([{"fg_base": "PDS100-001", "ComAcc": 10} for _ in range(10)])
+        cap = self._cap({"Com Accessories": (0, 0.0, 0.0)})  # HC=0
+        r = buildable_by_line(units, cap, excluded_stations=["Com Accessories"])
+        assert r["lines"][0]["infeasible"] is False
+        assert r["lines"][0]["buildable"] == 10   # no binding station left
+        assert r["total"] == 10
+
     def test_conc_zero_station_makes_line_infeasible(self):
         # Audit fix: a STAFFED station carrying throughput demand but with zero
         # concurrent bays (Conc=0) is physically blocked — build_capacity_table

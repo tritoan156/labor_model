@@ -6,6 +6,8 @@ sessions for each facility — currently the workforce-availability assumptions:
     * ``new_hire_pct``           — share of crew that are new hires (0..1)
     * ``new_hire_productivity``  — new-hire pace vs a seasoned worker (0..1)
     * ``absenteeism``            — share of paid time not worked (0..1)
+    * ``excluded_stations``      — list of station display names to skip when
+                                   sizing buildable units (not a fraction)
 
 Persists to ``data/facility_settings.json`` on GitHub so every user / browser
 sees the same values. Same concurrency pattern as the catalog / scenario saves:
@@ -63,6 +65,27 @@ def _clamp01(x) -> float:
     return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
 
+# Non-numeric settings that live alongside the [0,1] float knobs above but
+# aren't clamped. ``excluded_stations`` is the list of station display names the
+# planner has chosen to skip when sizing buildable units (persisted so the
+# exclusion sticks across sessions until the underlying model is fixed).
+def _clean_excluded(value) -> list:
+    """Coerce a saved ``excluded_stations`` value to a clean list of unique,
+    non-empty station-name strings (first-seen order). Non-list / junk → []."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    out, seen = [], set()
+    for v in value:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s or s.lower() in ("nan", "none") or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 def load_all_facility_settings() -> dict:
     """Read facility_settings.json from local disk. Returns {} if missing/bad."""
     if not SETTINGS_PATH.exists():
@@ -88,6 +111,8 @@ def get_facility_settings(location: str) -> dict:
     for k in _KEYS:
         if k in block:
             out[k] = _clamp01(block[k])
+    # Non-clamped list field — station display names excluded from buildable sizing.
+    out["excluded_stations"] = _clean_excluded(block.get("excluded_stations", []))
     return out
 
 
@@ -141,6 +166,7 @@ def save_facility_settings_to_github(
     if not location:
         raise ValueError("Facility cannot be empty.")
     clean = {k: _clamp01((settings or {}).get(k, DEFAULT_SETTINGS[k])) for k in _KEYS}
+    clean["excluded_stations"] = _clean_excluded((settings or {}).get("excluded_stations", []))
 
     for attempt in (1, 2):
         existing, sha = _fetch_existing_from_github(token)

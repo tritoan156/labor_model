@@ -142,3 +142,53 @@ class TestDatedRowsUntouched:
         assert rec["assigned_month"] == "Aug-26"
         assert df["PRODUCTION MONTH"].tolist().count("Aug-26") == 4
         assert df["PRODUCTION MONTH"].tolist().count("Sep-26") == 1
+
+
+class TestCarryoverOnlySliceKeepsOrphans:
+    """Audit fix: when a slice has carryover months but NO current-format month
+    to anchor undated rows to, those undated rows must be KEPT (and surfaced),
+    not silently dropped. Previously the orphan-rescue block was skipped because
+    the anchor was "", and the `isin(months)` filter then removed every undated
+    row with count=0 — a silent undercount driven only by the absence of an
+    unrelated current-month row.
+    """
+
+    def test_undated_rows_kept_when_no_current_month(self, tmp_path):
+        p = _write_schedule(tmp_path, [
+            _row("SDG45-001", "26-Jul", qty="3"),   # carryover only
+            _row("SDG65-006", "NEED SN/QA", qty="5"),
+            _row("SDG65-006", "", qty="7"),          # blank
+        ])
+        df = load_schedule(p, location="CYPRESS", include_carryover=True)
+        # All 15 units survive (3 carryover + 12 undated), not just the 3 dated.
+        assert int(df["BUILD QTY"].sum()) == 15
+        assert len(df) == 3
+
+    def test_summary_flags_unplaceable_orphans(self, tmp_path):
+        p = _write_schedule(tmp_path, [
+            _row("SDG45-001", "26-Jul", qty="3"),
+            _row("SDG65-006", "NEED SN/QA", qty="5"),
+            _row("SDG65-006", "", qty="7"),
+        ])
+        df = load_schedule(p, location="CYPRESS", include_carryover=True)
+        rec = df.attrs["unscheduled_recovered"]
+        assert rec["count"] == 12          # 5 + 7 undated units
+        assert rec["rows"] == 2
+        assert rec["assigned_month"] == ""  # nothing to anchor to → kept undated
+        assert rec["by_reason"] == {"NEED SN/QA": 1, "(blank)": 1}
+
+    def test_adding_a_current_month_row_flips_to_rescue(self, tmp_path):
+        # Same undated rows, but now with one current-month row present: the
+        # orphans are rescued into that month instead of kept undated. Guards
+        # the boundary between the two code paths.
+        p = _write_schedule(tmp_path, [
+            _row("SDG45-001", "26-Jul", qty="3"),
+            _row("SDG65-006", "NEED SN/QA", qty="5"),
+            _row("SDG65-006", "", qty="7"),
+            _row("SDG45-002", "Aug-26", qty="2"),   # a current month appears
+        ])
+        df = load_schedule(p, location="CYPRESS", include_carryover=True)
+        assert int(df["BUILD QTY"].sum()) == 17
+        rec = df.attrs["unscheduled_recovered"]
+        assert rec["assigned_month"] == "Aug-26"
+        assert rec["count"] == 12

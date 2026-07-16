@@ -667,12 +667,27 @@ def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame) -> dict:
         return {"lines": [], "total": 0}
 
     def _station_util(disp: str):
-        """(util, kind) for a station display name; inf if needed-but-unstaffed."""
+        """(util, kind) for a station display name; inf if the line can't clear it.
+
+        A station is infeasible (util=inf) when it is needed but either
+        unstaffed (HC=0) OR physically blocked — no concurrent bays (Conc=0) or
+        an invalid cycle (avg_cycle<=0, e.g. a Crew=0 config) while it carries
+        throughput demand. The latter mirrors ``build_capacity_table``'s
+        ``thru_blocked`` 🔴 rule: there the divide-by-zero guard forces
+        ``thru_util_safe`` to 0, which would otherwise read here as "unconstrained"
+        and let buildable_by_line overstate the buildable count for a station
+        that can actually ship nothing.
+        """
         if disp not in capacity.index:
             return 0.0, "labor"
         row = capacity.loc[disp]
         if int(row.get("HC", 0) or 0) <= 0:
             return float("inf"), "labor"
+        need_per_day = float(row.get("need_per_day", 0) or 0)
+        conc = int(row.get("Conc", 0) or 0)
+        avg_cycle = float(row.get("avg_cycle", 0) or 0)
+        if need_per_day > 0 and (conc <= 0 or avg_cycle <= 0):
+            return float("inf"), "throughput"
         lu = float(row.get("labor_util_safe", 0) or 0)
         tu = float(row.get("thru_util_safe", 0) or 0)
         return (lu, "labor") if lu >= tu else (tu, "throughput")

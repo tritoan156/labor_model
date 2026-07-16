@@ -544,6 +544,58 @@ class TestBuildableByLine:
         assert r["lines"][0]["buildable"] == 0
         assert r["total"] == 0
 
+    def test_conc_zero_station_makes_line_infeasible(self):
+        # Audit fix: a STAFFED station carrying throughput demand but with zero
+        # concurrent bays (Conc=0) is physically blocked — build_capacity_table
+        # flags it thru_blocked 🔴 (thru_cap_safe=0). buildable_by_line must
+        # treat it as infeasible, not read the divide-by-zero-guarded
+        # thru_util_safe=0 as "unconstrained" and report a positive buildable
+        # count that contradicts the 🔴 capacity view. Built through the real
+        # build_capacity_table so the guard interaction is exercised.
+        units = make_units_df([{"fg_base": "BOSS125-001", "GenAcc": 10, "Ship": 5}
+                               for _ in range(20)])
+        crew = make_crew({
+            "Gen Accessories": (4, 4, 1),
+            "Ship": (2, 0, 1),          # staffed, but ZERO concurrent bays
+        })
+        cap = build_capacity_table(units, crew, 480, 20, 1.0, 1.0)
+        assert cap.loc["Ship", "thru_status_safe"] == "🔴"   # capacity flags block
+        r = buildable_by_line(units, cap)
+        assert r["lines"][0]["infeasible"] is True
+        assert r["lines"][0]["binding_station"] == "Ship"
+        assert r["lines"][0]["binding_kind"] == "throughput"
+        assert r["total"] == 0
+
+    def test_crew_zero_station_makes_line_infeasible(self):
+        # Same root cause via avg_cycle<=0: a Crew=0 config (hand-edited
+        # facility_crew.json) makes cycle time 0, which the capacity guard also
+        # zeroes to thru_cap=0 🔴. Must be infeasible here too.
+        units = make_units_df([{"fg_base": "BOSS125-001", "GenAcc": 10, "Ship": 5}
+                               for _ in range(20)])
+        crew = make_crew({
+            "Gen Accessories": (4, 4, 1),
+            "Ship": (2, 2, 0),          # staffed, bays present, but Crew=0
+        })
+        cap = build_capacity_table(units, crew, 480, 20, 1.0, 1.0)
+        assert cap.loc["Ship", "thru_status_safe"] == "🔴"
+        r = buildable_by_line(units, cap)
+        assert r["lines"][0]["infeasible"] is True
+        assert r["total"] == 0
+
+    def test_staffed_station_with_bays_still_feasible(self):
+        # Guard against over-eager infeasibility: the SAME mix with Ship
+        # properly staffed (Conc>0, Crew>0) must remain feasible and buildable.
+        units = make_units_df([{"fg_base": "BOSS125-001", "GenAcc": 10, "Ship": 5}
+                               for _ in range(20)])
+        crew = make_crew({
+            "Gen Accessories": (4, 4, 1),
+            "Ship": (2, 2, 1),
+        })
+        cap = build_capacity_table(units, crew, 480, 20, 1.0, 1.0)
+        r = buildable_by_line(units, cap)
+        assert r["lines"][0]["infeasible"] is False
+        assert r["total"] > 0
+
     def test_empty(self):
         assert buildable_by_line(pd.DataFrame(), self._cap({"X": (1, 0.5, 0)})) == {"lines": [], "total": 0}
 

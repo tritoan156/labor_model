@@ -806,7 +806,15 @@ def load_schedule(
     df["__qty_num"] = pd.to_numeric(df["BUILD QTY"], errors="coerce").replace(
         [float("inf"), float("-inf")], float("nan")
     )
-    df = df[df["FG SKU ID"].notna() & df["__qty_num"].notna() & (df["__qty_num"] > 0)].copy()
+    # A blank FG SKU must be dropped the same whether the cell is a true NaN or
+    # whitespace ("  "). `.notna()` alone keeps a whitespace-only cell, which
+    # then normalizes to "" downstream — a phantom unit that inflates the plan
+    # count but resolves to no catalog SKU (so it carries zero labor and never
+    # shows up as skipped). Require a non-blank stripped SKU alongside notna.
+    _fg_ok = df["FG SKU ID"].notna() & (
+        df["FG SKU ID"].fillna("").astype(str).str.strip() != ""
+    )
+    df = df[_fg_ok & df["__qty_num"].notna() & (df["__qty_num"] > 0)].copy()
     df["BUILD QTY"] = df["__qty_num"].astype(int)
     df.drop(columns=["__qty_num"], inplace=True)
 
@@ -858,19 +866,34 @@ def load_schedule(
         )
         orphan = ~dated
         anchor = _plan_month_anchor(df, months)
-        if anchor and orphan.any():
+        if orphan.any():
             _reason = _pm[orphan].replace("", "(blank)")
             unscheduled = {
                 "count": int(df.loc[orphan, "BUILD QTY"].sum()),
                 "rows": int(orphan.sum()),
+                # "" when there's no current-format month to anchor to — the
+                # rows are then KEPT undated rather than reassigned (below).
                 "assigned_month": anchor,
                 "by_reason": {
                     str(k): int(v) for k, v in _reason.value_counts().items()
                 },
             }
-            df.loc[orphan, "PRODUCTION MONTH"] = anchor
-            df.loc[orphan, "CARRYOVER"] = False
-        df = df[df["PRODUCTION MONTH"].isin(months)]
+            if anchor:
+                # Fold undated units into the dominant current plan month so
+                # they're counted (and dated) with the rest of the plan.
+                df.loc[orphan, "PRODUCTION MONTH"] = anchor
+                df.loc[orphan, "CARRYOVER"] = False
+        # Keep rows whose month is one we're planning for. When there is NO
+        # current-format month to anchor undated rows to (a carryover-only
+        # slice), KEEP those undated rows anyway instead of silently dropping
+        # real planned units — they stay undated and are surfaced via the
+        # unscheduled summary above so the UI can warn. (With an anchor, the
+        # orphans were just reassigned into `months`, so `isin` already keeps
+        # them.)
+        keep = df["PRODUCTION MONTH"].isin(months)
+        if not anchor:
+            keep = keep | orphan
+        df = df[keep]
 
     # 9) Parse PRODUCTION DAY → real datetime + derive WEEK_OF_MONTH.
     # The column is OPTIONAL; if it's not in the CSV (or every value is

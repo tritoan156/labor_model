@@ -129,3 +129,37 @@ class TestOrdinaryBuildQtyUnaffected:
         ])
         df = load_schedule(p, location="HENDERSON")
         assert df["BUILD QTY"].tolist() == [5]
+
+
+class TestBlankFgSku:
+    """Audit fix: a whitespace-only FG SKU cell must be dropped like a truly
+    empty (NaN) one. `.notna()` alone kept a `" "` row, which then normalized to
+    an empty FG SKU — a phantom unit counted in the plan total but resolving to
+    no catalog SKU (zero labor, not even reported as skipped)."""
+
+    def test_whitespace_sku_dropped_like_nan(self, tmp_path):
+        p = _write_schedule(tmp_path, [
+            _row("BOSS25-010", "2"),
+            _row("   ", "5"),        # whitespace-only SKU — must be dropped
+        ])
+        df = load_schedule(p, location="HENDERSON")
+        assert df["FG SKU ID"].tolist() == ["BOSS25-010"]
+        assert int(df["BUILD QTY"].sum()) == 2
+
+    def test_empty_string_sku_dropped(self, tmp_path):
+        p = _write_schedule(tmp_path, [
+            _row("", "5"),
+            _row("BOSS25-011", "3"),
+        ])
+        df = load_schedule(p, location="HENDERSON")
+        assert df["FG SKU ID"].tolist() == ["BOSS25-011"]
+
+    def test_real_skus_with_surrounding_space_survive_stripped(self, tmp_path):
+        # A real SKU that merely carries stray padding is still a valid unit —
+        # it must be kept (and downstream-stripped), not dropped.
+        p = _write_schedule(tmp_path, [
+            _row(" BOSS25-010 ", "4"),
+        ])
+        df = load_schedule(p, location="HENDERSON")
+        assert len(df) == 1
+        assert df["FG_RAW"].tolist() == ["BOSS25-010"]

@@ -5,7 +5,12 @@
 # the catalog editors so they stay visible during horizontal scroll. If we
 # ever fall below this floor those pins silently stop working.
 streamlit>=1.36
-pandas>=2.0
+# Cap below pandas 3: core/data_loader.py disables the Arrow-string default via
+# `pd.set_option("future.infer_string", False)`. That option is removed in
+# pandas 3 (Arrow strings become mandatory), where the try/except shim silently
+# no-ops and the Arrow <NA>/dtype bugs it guards against return in production.
+# Lift the cap only after a validated pandas-3 Arrow-compat pass (see MAINTAINING.md).
+pandas>=2.0,<3
 plotly>=5.20
 openpyxl>=3.1
 requests>=2.31

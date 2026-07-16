@@ -185,17 +185,22 @@
       "Crew": 1
     },
     "Gen Accessories": {
-      "HC": 8,
+      "HC": 7,
       "Conc": 4,
       "Crew": 2
     },
+    "Undercarriage Assembly": {
+      "HC": 0,
+      "Conc": 0,
+      "Crew": 1
+    },
     "Com Accessories": {
-      "HC": 7,
+      "HC": 8,
       "Conc": 6,
       "Crew": 1
     },
     "Trailer Assembly": {
-      "HC": 2,
+      "HC": 3,
       "Conc": 2,
       "Crew": 1
     },

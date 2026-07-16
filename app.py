@@ -201,7 +201,7 @@ def _csv_mtime(filename: str) -> float:
 # Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
 # renames, new columns, etc.) so the cache invalidates even if the underlying
 # CSV file's mtime hasn't changed.
-_LOADER_SCHEMA_VERSION = 8
+_LOADER_SCHEMA_VERSION = 9
 
 
 def _fmt_min_hr(value, *, with_thousands: bool = True, hr_decimals: int = 1) -> str:
@@ -259,11 +259,12 @@ def _load_machine_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
 def _project_facility_routing(machine_df, location: str):
     """Project the per-facility routing columns into legacy column names.
 
-    machine_clean.csv carries 9 routing columns (3 stations × 3 facilities):
+    machine_clean.csv carries 15 routing columns (5 stations × 3 facilities):
     e.g. ``Final Station HND`` / ``Final Station SPB`` / ``Final Station CYP``.
     The labor calculator and capacity table still read the legacy names
-    ``Final Station`` / ``AccKIT Station`` / ``PDI Station``, so we copy the
-    facility-matched column into those names here. Returns a NEW DataFrame
+    ``Final Station`` / ``AccKIT Station`` / ``PDI Station`` / ``Wire Station`` /
+    ``Undercarriage Station``, so we copy the facility-matched column into those
+    names here. Returns a NEW DataFrame
     (does not mutate the cached one) so the cache stays clean across
     location switches.
     """
@@ -273,7 +274,8 @@ def _project_facility_routing(machine_df, location: str):
     for base, default in (("Final Station", "Final"),
                           ("AccKIT Station", "AccKIT"),
                           ("PDI Station", "PDI"),
-                          ("Wire Station", "Wire")):
+                          ("Wire Station", "Wire"),
+                          ("Undercarriage Station", "Undercarriage")):
         sfx = f"{base} {code}"
         if sfx in out.columns:
             out[base] = out[sfx]
@@ -5918,6 +5920,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
     ak_col = f"AccKIT Station {fac_code}"
     pd_col = f"PDI Station {fac_code}"
     ws_col = f"Wire Station {fac_code}"
+    uc_col = f"Undercarriage Station {fac_code}"
 
     st.subheader("🏭 Machine catalog")
     _render_stale_data_banner("data/machine_clean.csv")
@@ -5945,16 +5948,20 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
         display_df[pd_col] = "PDI"
     if ws_col not in display_df.columns:
         display_df[ws_col] = "Wire"
+    if uc_col not in display_df.columns:
+        display_df[uc_col] = "Undercarriage"
     # Drop the projected legacy routing columns from the editor view —
     # they're compute helpers, not the source of truth. We also drop the
     # OTHER facilities' columns so the editor only shows ONE set of
     # routing dropdowns matching the sidebar location.
-    _drop_cols = ["Final Station", "AccKIT Station", "PDI Station", "Wire Station"]
+    _drop_cols = ["Final Station", "AccKIT Station", "PDI Station", "Wire Station",
+                  "Undercarriage Station"]
     for _code in ("HND", "SPB", "CYP"):
         if _code == fac_code:
             continue
         _drop_cols.extend([f"Final Station {_code}", f"AccKIT Station {_code}",
-                           f"PDI Station {_code}", f"Wire Station {_code}"])
+                           f"PDI Station {_code}", f"Wire Station {_code}",
+                           f"Undercarriage Station {_code}"])
     display_df = display_df.drop(columns=[c for c in _drop_cols if c in display_df.columns])
     if "Last Modified" not in display_df.columns:
         display_df["Last Modified"] = ""
@@ -6031,6 +6038,18 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
             ),
             required=False,
         ),
+        uc_col: st.column_config.SelectboxColumn(
+            "Undercarriage Station",
+            options=["Undercarriage", "ComAcc", "GenAcc", "PMAcc", "Final"],
+            help=(
+                f"Which station absorbs this SKU's Undercarriage-Assembly labor "
+                f"at **{location}** — i.e. the Final-Assembly labor that lands at "
+                f"Undercarriage (PDS units). Default Undercarriage Assembly; "
+                f"reroute when this plant has no dedicated undercarriage crew "
+                f"(e.g. Henderson: Undercarriage → Com Accessories)."
+            ),
+            required=False,
+        ),
         "Used (qty)": st.column_config.NumberColumn(
             "Used (qty)", disabled=True, pinned=True,
         ),
@@ -6058,7 +6077,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
                    + ", ".join(f"`{o}` → `{n}`" for o, n in renames))
     _render_pending_changes(
         edited_cells, machine_df, editable_cols,
-        text_cols=["Description", fs_col, ak_col, pd_col],
+        text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
     )
 
     if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
@@ -6066,7 +6085,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
             edited=edited_cells, source_df=machine_df,
             editable_cols=editable_cols,
             file_path="data/machine_clean.csv", label="machine",
-            text_cols=["Description", fs_col, ak_col, pd_col],
+            text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
             renames=renames,
         )
 

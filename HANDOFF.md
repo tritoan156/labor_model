@@ -45,12 +45,15 @@ against per-station headcount + throughput capacity.
 ## Key architecture you'll hit
 
 - **Per-facility station routing:** stored in `machine_clean.csv` as suffixed
-  columns `Final Station {CODE}` / `AccKIT Station {CODE}` / `PDI Station
-  {CODE}`, where `{CODE}` is `HND`/`SPB`/`CYP` from
+  columns for 5 stations × 3 facilities — `Final Station {CODE}` / `AccKIT
+  Station {CODE}` / `PDI Station {CODE}` / `Wire Station {CODE}` / `Undercarriage
+  Station {CODE}`, where `{CODE}` is `HND`/`SPB`/`CYP` from
   `core/constants.FACILITY_CODE`. `_project_facility_routing(...)` in `app.py`
   projects the active facility's columns onto legacy names at load so the
   compute path stays facility-agnostic. The catalog editor shows only the active
-  facility's 3 routing dropdowns.
+  facility's 5 routing dropdowns. `Undercarriage Station` is a second-hop
+  reroute (moves what Final-Station routing dropped at Undercarriage on to
+  another team, e.g. Henderson → Com Accessories).
 - **Catalog editors:** the live ones are `tab_floor_verification_machine` and
   `tab_floor_verification_accessory` (dispatched from the Data & Setup radio). An
   older monolithic `tab_floor_verification` was deleted as dead code — don't

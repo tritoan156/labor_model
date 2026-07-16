@@ -22,7 +22,8 @@ from core.constants import STATION_KEYS, DEFAULT_BATT_RAW, DEFAULT_NAMEPLATE_PRE
 # --------------------------------------------------------------------------
 MACHINE_COLS = ["Bat", "Warehouse", "Wire", "Trailer", "QC", "Ship",
                 "FN_Assy", "PDI", "ETO",
-                "Final Station", "AccKIT Station", "PDI Station", "Wire Station"]
+                "Final Station", "AccKIT Station", "PDI Station", "Wire Station",
+                "Undercarriage Station"]
 ACC_COLS = ["BattSubRaw", "Nameplate Prep", "Warehouse",
             "PMAcc", "GenAcc", "ComAcc", "AccKIT"]
 
@@ -39,6 +40,7 @@ def make_machine_df(rows, include_eto=True):
         r["AccKIT Station"] = "AccKIT"
         r["PDI Station"] = "PDI"
         r["Wire Station"] = "Wire"
+        r["Undercarriage Station"] = "Undercarriage"
         r.update(ov)
         data[fg] = r
     return pd.DataFrame.from_dict(data, orient="index")
@@ -162,6 +164,34 @@ class TestComputeUnitLabor:
         m2 = make_machine_df({"PDS-2": {"Wire": 20, "Wire Station": "ComAcc"}})
         r2 = compute_unit_labor("PDS-2", None, m2, make_acc_df({}))
         assert r2["Wire"] == 0 and r2["ComAcc"] == 20
+
+    def test_routing_undercarriage_default_noop(self):
+        # PDS Final labor routed to Undercarriage stays there when the
+        # Undercarriage Station reroute is left at its default.
+        m = make_machine_df({"PDS-3": {"FN_Assy": 118, "Final Station": "Undercarriage"}})
+        r = compute_unit_labor("PDS-3", None, m, make_acc_df({}))
+        assert r["Undercarriage"] == 118
+        assert r["ComAcc"] == 0
+
+    def test_routing_undercarriage_reroute_to_comacc(self):
+        # Second-hop reroute: FN_Assy → Undercarriage (Final Station), then
+        # Undercarriage → ComAcc (e.g. Henderson). Labor lands at ComAcc,
+        # Undercarriage is emptied, and the total is unchanged.
+        m = make_machine_df({"PDS-4": {
+            "FN_Assy": 118, "Final Station": "Undercarriage",
+            "Undercarriage Station": "ComAcc",
+        }})
+        r = compute_unit_labor("PDS-4", None, m, make_acc_df({}))
+        assert r["Undercarriage"] == 0
+        assert r["ComAcc"] == 118
+
+    def test_undercarriage_reroute_noop_when_no_source_labor(self):
+        # A unit with nothing at Undercarriage isn't affected by the reroute.
+        m = make_machine_df({"SDG-5": {"Trailer": 45, "Undercarriage Station": "ComAcc"}})
+        r = compute_unit_labor("SDG-5", None, m, make_acc_df({}))
+        assert r["Undercarriage"] == 0
+        assert r["ComAcc"] == 0
+        assert r["Trailer"] == 45
 
     def test_missing_fg_returns_none(self):
         assert compute_unit_labor("NOPE", None, make_machine_df({"X": {}}),

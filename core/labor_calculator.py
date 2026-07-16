@@ -264,6 +264,20 @@ def compute_unit_labor(fg_base: str, acc_sku: str | None,
     result[acckit_station] = float(result.get(acckit_station, 0) or 0) + acckit_labor
     result[pdi_station]    = float(result.get(pdi_station, 0) or 0) + pdi_labor
     result[wire_station]   = float(result.get(wire_station, 0) or 0) + wire_labor
+    # Undercarriage is a *second-hop* reroute. PDS units send their Final-
+    # Assembly labor to the Undercarriage station (via "Final Station" above);
+    # a plant with no dedicated undercarriage crew can then fold everything that
+    # landed there into another team (e.g. Henderson: Undercarriage → Com
+    # Accessories). Runs AFTER the routing above so it catches that just-routed
+    # labor. The default station "Undercarriage" is a no-op.
+    undercarriage_station = _station("Undercarriage Station", "Undercarriage")
+    if undercarriage_station != "Undercarriage":
+        _uc_moved = float(result.get("Undercarriage", 0) or 0)
+        if _uc_moved:
+            result["Undercarriage"] = 0.0
+            result[undercarriage_station] = (
+                float(result.get(undercarriage_station, 0) or 0) + _uc_moved
+            )
     return result
 
 

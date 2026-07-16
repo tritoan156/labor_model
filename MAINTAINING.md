@@ -76,15 +76,21 @@ Two pieces of behavior that aren't obvious from the UI:
 
 **Per-facility routing.** Some stations are staffed by different teams at
 different plants (e.g. PDI is done by the PDI team in Henderson but by the
-Accessories team in Cypress). Routing is therefore stored *per facility* in
-`data/machine_clean.csv` as suffixed columns:
-`Final Station {CODE}`, `AccKIT Station {CODE}`, `PDI Station {CODE}`, where
-`{CODE}` is the 3-letter `core/constants.FACILITY_CODE` for the plant
-(`HND` / `SPB` / `CYP`). The catalog editor shows only the *active* facility's
-3 routing dropdowns. At load, `_project_facility_routing(...)` in `app.py`
-copies the active facility's three columns onto the legacy
-`Final Station` / `AccKIT Station` / `PDI Station` names so the rest of the
-compute path stays facility-agnostic.
+Accessories team in Cypress; Henderson has no dedicated undercarriage crew, so
+PDS undercarriage work rolls into Com Accessories there). Routing is therefore
+stored *per facility* in `data/machine_clean.csv` as suffixed columns —
+**5 stations × 3 facilities = 15 columns**:
+`Final Station {CODE}`, `AccKIT Station {CODE}`, `PDI Station {CODE}`,
+`Wire Station {CODE}`, `Undercarriage Station {CODE}`, where `{CODE}` is the
+3-letter `core/constants.FACILITY_CODE` for the plant (`HND` / `SPB` / `CYP`).
+The catalog editor shows only the *active* facility's 5 routing dropdowns. At
+load, `_project_facility_routing(...)` in `app.py` copies the active facility's
+five columns onto the legacy `Final Station` / `AccKIT Station` / `PDI Station`
+/ `Wire Station` / `Undercarriage Station` names so the rest of the compute
+path stays facility-agnostic. (`Undercarriage Station` is a *second-hop*
+reroute: it moves whatever the Final-Station routing dropped at the
+Undercarriage station on to another team — see
+`core/labor_calculator.compute_unit_labor`.)
 
 **Frozen (pinned) catalog columns — the ~60% gotcha.** The catalog editors
 pin SKU / Description (and a couple of status columns) with
@@ -210,13 +216,14 @@ If the company spins up a fourth manufacturing facility:
 2. **`core/constants.FACILITY_CODE`** — add a matching entry mapping the new
    facility to a unique 3-letter code (e.g. `"Phoenix": "PHX"`). This code is
    the column suffix used for per-facility station routing.
-3. **`data/machine_clean.csv`** — run a migration to add the 3 routing columns
+3. **`data/machine_clean.csv`** — run a migration to add the 5 routing columns
    for the new code: `Final Station PHX`, `AccKIT Station PHX`,
-   `PDI Station PHX`. Copy an existing facility's column values as the starting
-   point. `core/data_loader.load_machine_labor` expects *all* per-facility
-   routing columns to be present — a missing one breaks the load. After the CSV
-   change, **bump `_LOADER_SCHEMA_VERSION`** (see "When you change a CSV column"
-   above). See also "Per-facility station routing" for how these columns work.
+   `PDI Station PHX`, `Wire Station PHX`, `Undercarriage Station PHX`. Copy an
+   existing facility's column values as the starting point.
+   `core/data_loader.load_machine_labor` expects *all* per-facility routing
+   columns to be present — a missing one breaks the load. After the CSV change,
+   **bump `_LOADER_SCHEMA_VERSION`** (see "When you change a CSV column" above).
+   See also "Per-facility station routing" for how these columns work.
 4. **`data/facility_crew.json`** — add a new top-level key with the new
    facility's per-station HC / Conc / Crew. Easiest is to copy an existing
    facility's block and tweak the numbers.

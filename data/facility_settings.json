@@ -2,8 +2,10 @@
   "Spartanburg": {
     "new_hire_pct": 0.2,
     "new_hire_productivity": 0.75,
-    "absenteeism": 0.05,
-    "overtime": 0.1
+    "absenteeism": 0.1,
+    "overtime": 0.0,
+    "efficiency": 0.5,
+    "safety": 1.0
   },
   "Cypress": {
     "new_hire_pct": 0.3,

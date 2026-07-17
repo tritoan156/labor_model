@@ -161,6 +161,13 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     wire_station_hnd_col = _find(df.columns, "Wire Station HND")
     wire_station_spb_col = _find(df.columns, "Wire Station SPB")
     wire_station_cyp_col = _find(df.columns, "Wire Station CYP")
+    # Undercarriage routing — PDS units land their Final-Assembly labor at the
+    # Undercarriage station (via "Final Station"); a plant with no dedicated
+    # undercarriage crew can reroute it from there (e.g. Henderson: Undercarriage
+    # -> ComAcc). Same per-facility pattern as the stations above.
+    undercarriage_station_hnd_col = _find(df.columns, "Undercarriage Station HND")
+    undercarriage_station_spb_col = _find(df.columns, "Undercarriage Station SPB")
+    undercarriage_station_cyp_col = _find(df.columns, "Undercarriage Station CYP")
 
     out = pd.DataFrame()
     out["SKU"] = df[sku_col]
@@ -207,6 +214,9 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     out["Wire Station HND"]   = _read_station_col(wire_station_hnd_col,   "Wire")
     out["Wire Station SPB"]   = _read_station_col(wire_station_spb_col,   "Wire")
     out["Wire Station CYP"]   = _read_station_col(wire_station_cyp_col,   "Wire")
+    out["Undercarriage Station HND"] = _read_station_col(undercarriage_station_hnd_col, "Undercarriage")
+    out["Undercarriage Station SPB"] = _read_station_col(undercarriage_station_spb_col, "Undercarriage")
+    out["Undercarriage Station CYP"] = _read_station_col(undercarriage_station_cyp_col, "Undercarriage")
     # Last-modified date — empty for rows never edited through the app.
     mod_col = _find(df.columns, "Last Modified", "Modified", "Updated")
     out["Last Modified"] = df[mod_col].fillna("").astype(str) if mod_col else pd.Series([""] * n, index=df.index, dtype=object)

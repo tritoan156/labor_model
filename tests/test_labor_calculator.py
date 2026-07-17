@@ -22,7 +22,8 @@ from core.constants import STATION_KEYS, DEFAULT_BATT_RAW, DEFAULT_NAMEPLATE_PRE
 # --------------------------------------------------------------------------
 MACHINE_COLS = ["Bat", "Warehouse", "Wire", "Trailer", "QC", "Ship",
                 "FN_Assy", "PDI", "ETO",
-                "Final Station", "AccKIT Station", "PDI Station", "Wire Station"]
+                "Final Station", "AccKIT Station", "PDI Station", "Wire Station",
+                "Undercarriage Station"]
 ACC_COLS = ["BattSubRaw", "Nameplate Prep", "Warehouse",
             "PMAcc", "GenAcc", "ComAcc", "AccKIT"]
 
@@ -39,6 +40,7 @@ def make_machine_df(rows, include_eto=True):
         r["AccKIT Station"] = "AccKIT"
         r["PDI Station"] = "PDI"
         r["Wire Station"] = "Wire"
+        r["Undercarriage Station"] = "Undercarriage"
         r.update(ov)
         data[fg] = r
     return pd.DataFrame.from_dict(data, orient="index")
@@ -162,6 +164,34 @@ class TestComputeUnitLabor:
         m2 = make_machine_df({"PDS-2": {"Wire": 20, "Wire Station": "ComAcc"}})
         r2 = compute_unit_labor("PDS-2", None, m2, make_acc_df({}))
         assert r2["Wire"] == 0 and r2["ComAcc"] == 20
+
+    def test_routing_undercarriage_default_noop(self):
+        # PDS Final labor routed to Undercarriage stays there when the
+        # Undercarriage Station reroute is left at its default.
+        m = make_machine_df({"PDS-3": {"FN_Assy": 118, "Final Station": "Undercarriage"}})
+        r = compute_unit_labor("PDS-3", None, m, make_acc_df({}))
+        assert r["Undercarriage"] == 118
+        assert r["ComAcc"] == 0
+
+    def test_routing_undercarriage_reroute_to_comacc(self):
+        # Second-hop reroute: FN_Assy → Undercarriage (Final Station), then
+        # Undercarriage → ComAcc (e.g. Henderson). Labor lands at ComAcc,
+        # Undercarriage is emptied, and the total is unchanged.
+        m = make_machine_df({"PDS-4": {
+            "FN_Assy": 118, "Final Station": "Undercarriage",
+            "Undercarriage Station": "ComAcc",
+        }})
+        r = compute_unit_labor("PDS-4", None, m, make_acc_df({}))
+        assert r["Undercarriage"] == 0
+        assert r["ComAcc"] == 118
+
+    def test_undercarriage_reroute_noop_when_no_source_labor(self):
+        # A unit with nothing at Undercarriage isn't affected by the reroute.
+        m = make_machine_df({"SDG-5": {"Trailer": 45, "Undercarriage Station": "ComAcc"}})
+        r = compute_unit_labor("SDG-5", None, m, make_acc_df({}))
+        assert r["Undercarriage"] == 0
+        assert r["ComAcc"] == 0
+        assert r["Trailer"] == 45
 
     def test_missing_fg_returns_none(self):
         assert compute_unit_labor("NOPE", None, make_machine_df({"X": {}}),
@@ -543,6 +573,29 @@ class TestBuildableByLine:
         assert r["lines"][0]["infeasible"] is True
         assert r["lines"][0]["buildable"] == 0
         assert r["total"] == 0
+
+    def test_excluded_station_is_skipped(self):
+        # Battery throughput-binds an EBOSS line to 40; excluding it lets the
+        # next real constraint (GenAcc, 0.5) drive the count → 120.
+        units = make_units_df(
+            [{"fg_base": "BOSS125-001", "Battery": 10, "GenAcc": 10} for _ in range(60)]
+        )
+        cap = self._cap({"Battery Assembly": (8, 0.2, 1.5),
+                         "Gen Accessories": (4, 0.5, 0.0)})
+        assert buildable_by_line(units, cap)["total"] == 40          # 60 / 1.5
+        r = buildable_by_line(units, cap, excluded_stations=["Battery Assembly"])
+        assert r["total"] == 120                                     # 60 / 0.5
+        assert r["lines"][0]["binding_station"] == "Gen Accessories"
+
+    def test_excluded_station_ignores_infeasibility(self):
+        # An excluded station that is unstaffed (HC=0) must NOT render the line
+        # infeasible — it's set aside entirely.
+        units = make_units_df([{"fg_base": "PDS100-001", "ComAcc": 10} for _ in range(10)])
+        cap = self._cap({"Com Accessories": (0, 0.0, 0.0)})  # HC=0
+        r = buildable_by_line(units, cap, excluded_stations=["Com Accessories"])
+        assert r["lines"][0]["infeasible"] is False
+        assert r["lines"][0]["buildable"] == 10   # no binding station left
+        assert r["total"] == 10
 
     def test_conc_zero_station_makes_line_infeasible(self):
         # Audit fix: a STAFFED station carrying throughput demand but with zero

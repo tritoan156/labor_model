@@ -201,7 +201,7 @@ def _csv_mtime(filename: str) -> float:
 # Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
 # renames, new columns, etc.) so the cache invalidates even if the underlying
 # CSV file's mtime hasn't changed.
-_LOADER_SCHEMA_VERSION = 8
+_LOADER_SCHEMA_VERSION = 9
 
 
 def _fmt_min_hr(value, *, with_thousands: bool = True, hr_decimals: int = 1) -> str:
@@ -259,11 +259,12 @@ def _load_machine_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
 def _project_facility_routing(machine_df, location: str):
     """Project the per-facility routing columns into legacy column names.
 
-    machine_clean.csv carries 9 routing columns (3 stations × 3 facilities):
+    machine_clean.csv carries 15 routing columns (5 stations × 3 facilities):
     e.g. ``Final Station HND`` / ``Final Station SPB`` / ``Final Station CYP``.
     The labor calculator and capacity table still read the legacy names
-    ``Final Station`` / ``AccKIT Station`` / ``PDI Station``, so we copy the
-    facility-matched column into those names here. Returns a NEW DataFrame
+    ``Final Station`` / ``AccKIT Station`` / ``PDI Station`` / ``Wire Station`` /
+    ``Undercarriage Station``, so we copy the facility-matched column into those
+    names here. Returns a NEW DataFrame
     (does not mutate the cached one) so the cache stays clean across
     location switches.
     """
@@ -273,7 +274,8 @@ def _project_facility_routing(machine_df, location: str):
     for base, default in (("Final Station", "Final"),
                           ("AccKIT Station", "AccKIT"),
                           ("PDI Station", "PDI"),
-                          ("Wire Station", "Wire")):
+                          ("Wire Station", "Wire"),
+                          ("Undercarriage Station", "Undercarriage")):
         sfx = f"{base} {code}"
         if sfx in out.columns:
             out[base] = out[sfx]
@@ -3615,6 +3617,40 @@ def render_sidebar() -> dict:
                 "throughput / Space-limits (cells run longer)."
             )
 
+        # ------------------------------------------------------------
+        # Exclude stations from buildable-unit sizing. A station the model
+        # over-constrains (e.g. Battery) can be set aside so it no longer
+        # caps "Buildable units" or shows up as the binding bottleneck —
+        # while STILL appearing (marked ⏸️) in the Capacity table so the
+        # planner remembers to come back and fix the underlying model.
+        # Persisted per facility alongside the other assumptions.
+        # ------------------------------------------------------------
+        from core.constants import STATION_KEY_TO_DISPLAY as _SKTD
+        st.markdown("**🚫 Exclude stations from buildable units**")
+        _station_options = [_SKTD[k] for k in STATION_KEYS]
+        _excl_key = f"excluded_stations_{location}"
+        if _excl_key not in st.session_state:
+            _saved_excl = _fs_saved.get("excluded_stations", []) or []
+            st.session_state[_excl_key] = [s for s in _saved_excl if s in _station_options]
+        excluded_stations = st.multiselect(
+            "Stations to ignore when sizing buildable units",
+            options=_station_options,
+            key=_excl_key,
+            help=(
+                "Skipped when computing **Buildable units** and the binding "
+                "bottleneck — use when the model over-constrains a station that "
+                "isn't really binding in reality (e.g. Battery). Excluded "
+                "stations still appear in the Capacity table, marked ⏸️, so the "
+                "issue stays visible until you fix it. Saved per facility with "
+                "the 💾 button below."
+            ),
+        )
+        if excluded_stations:
+            st.caption(
+                f"⏸️ Excluding **{', '.join(excluded_stations)}** from "
+                "buildable-unit sizing (still shown in the Capacity table)."
+            )
+
         if st.button(f"💾 Save planning assumptions for {location}",
                      use_container_width=True, key=f"save_assump_{location}"):
             token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
@@ -3633,6 +3669,7 @@ def render_sidebar() -> dict:
                             "overtime": overtime,
                             "efficiency": efficiency,
                             "safety": safety,
+                            "excluded_stations": excluded_stations,
                         }, token)
                     _track_and_flush("assumptions_save", facility=location)
                     st.success(f"✅ Saved planning assumptions for {location}.")
@@ -3979,6 +4016,7 @@ Every catalog / scenario / schedule / flow save triggers a Streamlit Cloud rebui
         "time_window": time_window,
         "plan_month": plan_month,
         "plan_month_label": plan_month_label,
+        "excluded_stations": excluded_stations,
     }
 
 
@@ -4067,7 +4105,8 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
     return pd.DataFrame(out).fillna(0)
 
 
-def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
+def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
+                              excluded_stations=None) -> dict:
     """How many units of the *current* SKU mix the facility can build this
     month, given the available stations + sidebar settings.
 
@@ -4077,9 +4116,15 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
     station that dictated the limit. If any station the mix needs has HC = 0,
     the build is infeasible (returns max_units = 0 and names the station).
 
+    ``excluded_stations`` is an optional iterable of station DISPLAY names to
+    ignore when sizing the cap — neither counted as a bottleneck nor as a
+    missing (HC=0) blocker — so a station the model over-constrains (e.g.
+    Battery) can be set aside until it's fixed.
+
     Reuses ``build_capacity_table`` columns: HC, labor_demand, labor_util_safe,
     thru_util_safe, station_display.
     """
+    excluded = {str(s).strip() for s in (excluded_stations or [])}
     if capacity is None or capacity.empty or total_units <= 0:
         # Return the full key set (matching the other branches) so any caller
         # that subscripts labor_/thru_/potential_ keys won't KeyError on the
@@ -4103,6 +4148,8 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
     thru_max_util = 0.0
     thru_bottleneck = ""
     for st_disp, row in capacity.iterrows():
+        if str(st_disp) in excluded:
+            continue  # planner excluded this station from buildable sizing
         labor_demand = float(row.get("labor_demand", 0) or 0)
         # "need_per_day" is only > 0 when units route through this station,
         # so it doubles as a "station is in the mix" signal alongside demand.
@@ -4175,7 +4222,8 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int) -> dict:
     }
 
 
-def _area_space_cap(sub: pd.DataFrame, total_units: int) -> dict | None:
+def _area_space_cap(sub: pd.DataFrame, total_units: int,
+                    excluded_stations=None) -> dict | None:
     """Throughput (space) cap for a group of stations — independent of HC.
 
     Unlike ``_max_units_at_current_mix`` (which is labor-aware and skips
@@ -4192,9 +4240,12 @@ def _area_space_cap(sub: pd.DataFrame, total_units: int) -> dict | None:
     """
     if sub is None or sub.empty or total_units <= 0:
         return None
+    excluded = {str(s).strip() for s in (excluded_stations or [])}
     best_util = 0.0
     limiting = ""
     for st_disp, row in sub.iterrows():
+        if str(st_disp) in excluded:
+            continue  # planner excluded this station from buildable sizing
         need = float(row.get("need_per_day", 0) or 0)
         cap = float(row.get("thru_cap_safe", 0) or 0)
         util = float(row.get("thru_util_safe", 0) or 0)
@@ -4418,7 +4469,10 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
             except Exception:
                 station_required_hc = None
             try:
-                station_buildable = int(buildable_by_line(units, capacity).get("total", 0))
+                station_buildable = int(buildable_by_line(
+                    units, capacity,
+                    excluded_stations=inputs.get("excluded_stations"),
+                ).get("total", 0))
             except Exception:
                 station_buildable = None
 
@@ -4782,10 +4836,11 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # isn't throttled by another line's bottleneck (e.g. PDS/compressor is not
     # limited by the Battery station, which only EBOSS/PM use). A line that
     # needs an unstaffed station contributes 0 (the others still count).
-    _bl = buildable_by_line(units, capacity)
+    _excluded = inputs.get("excluded_stations")
+    _bl = buildable_by_line(units, capacity, excluded_stations=_excluded)
     buildable_units = int(_bl.get("total", 0) or 0)
     # _max_units_at_current_mix still drives the single-bottleneck readout below.
-    _mu = _max_units_at_current_mix(capacity, total_units)
+    _mu = _max_units_at_current_mix(capacity, total_units, excluded_stations=_excluded)
     coverage_pct = (buildable_units / total_units * 100.0) if total_units > 0 else 0.0
     gap_units = buildable_units - total_units  # negative = short; positive = surplus
 
@@ -4829,6 +4884,14 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # Per-line breakdown — show how buildable decomposes across the parallel
     # production lines (only meaningful when the plan spans more than one line).
     _render_buildable_by_line(_bl, buildable_units)
+
+    if _excluded:
+        st.caption(
+            "⏸️ **Buildable** excludes "
+            + ", ".join(f"**{s}**" for s in _excluded)
+            + " (set in the sidebar → planning assumptions) — those stations "
+            "don't cap the count. They're still shown on the **Capacity** tab."
+        )
 
     # ----------------------------------------------------------------
     # Bottleneck line — single, definitive, sits right under the KPIs.
@@ -5207,6 +5270,17 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
         f"buffer: {inputs['safety']:.2f} · "
         f"productive time: {inputs['efficiency']:.3f}"
     )
+    # Stations the planner has excluded from buildable-unit sizing (still shown
+    # in the tables below, marked ⏸️). Read once so it's in scope for the whole
+    # tab, including the station summary that renders even when total_units==0.
+    _excluded = inputs.get("excluded_stations") or []
+    if _excluded:
+        st.caption(
+            "⏸️ Excluded from buildable-unit sizing: "
+            + ", ".join(f"**{s}**" for s in _excluded)
+            + " — still shown below, but they don't cap Buildable units. "
+            "Change this in the sidebar → planning assumptions."
+        )
 
     # =============================================================
     # Headline caps — how many units this mix can build, broken out by
@@ -5215,7 +5289,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
     # don't need to bounce back to Overview to see the upper bound.
     # =============================================================
     if total_units > 0:
-        _mu = _max_units_at_current_mix(capacity, total_units)
+        _mu = _max_units_at_current_mix(capacity, total_units, excluded_stations=_excluded)
         _lu = float(_mu.get("labor_max_util_safe", 0) or 0)
         _tu = float(_mu.get("thru_max_util_safe", 0) or 0)
         _lm = int(_mu.get("labor_max_units", 0) or 0)
@@ -5223,7 +5297,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
         _lb = _mu.get("labor_bottleneck", "") or "—"
         _tb = _mu.get("thru_bottleneck", "") or "—"
         # Line-aware buildable (parallel Compressor/Generator/EBOSS/PM lines).
-        _bl = buildable_by_line(units, capacity) if units is not None else {"lines": [], "total": 0}
+        _bl = buildable_by_line(units, capacity, excluded_stations=_excluded) if units is not None else {"lines": [], "total": 0}
         _bl_total = int(_bl.get("total", 0) or 0)
         _multi_line = len(_bl.get("lines", [])) > 1
         if _lu > 0 or _tu > 0:
@@ -5299,7 +5373,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                 sub = capacity[capacity.index.isin(stations)]
                 if sub.empty:
                     continue
-                _amu = _max_units_at_current_mix(sub, total_units)
+                _amu = _max_units_at_current_mix(sub, total_units, excluded_stations=_excluded)
                 _a_pm = int(_amu.get("potential_max_units", 0) or 0)
                 _a_pu = float(_amu.get("potential_util_safe", 0) or 0)
                 # Only meaningful when the area actually carries demand.
@@ -5383,7 +5457,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
             sp_area_rows = []
             for area, stations in area_groups.items():
                 sub = capacity[capacity.index.isin(stations)]
-                _cap = _area_space_cap(sub, total_units)
+                _cap = _area_space_cap(sub, total_units, excluded_stations=_excluded)
                 if _cap is None:
                     continue
                 sp_area_rows.append({
@@ -5512,6 +5586,13 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
     simple["Labor used %"] = (capacity["labor_util_safe"] * 100).round(0).astype(int)
     simple["Throughput used %"] = (capacity["thru_util_safe"] * 100).round(0).astype(int)
     simple["Avg cycle (min)"] = capacity["avg_cycle"].round(1)
+    # Tag excluded stations so they stay visible but are clearly not counted
+    # toward Buildable units. Display-only frame, so renaming the index is safe.
+    if _excluded:
+        _excl_set = set(_excluded)
+        simple = simple.rename(
+            index={s: f"{s} ⏸️" for s in list(simple.index) if s in _excl_set}
+        )
 
     st.dataframe(
         simple, use_container_width=True, height=480,
@@ -5532,6 +5613,12 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
             ),
         },
     )
+    if _excluded:
+        st.caption(
+            "⏸️ = excluded from **Buildable units** sizing (sidebar → planning "
+            "assumptions). Its utilization is still shown so the constraint stays "
+            "visible until the model is fixed."
+        )
 
     # =============================================================
     # Full detail — for engineers / planners who want all the numbers
@@ -5918,6 +6005,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
     ak_col = f"AccKIT Station {fac_code}"
     pd_col = f"PDI Station {fac_code}"
     ws_col = f"Wire Station {fac_code}"
+    uc_col = f"Undercarriage Station {fac_code}"
 
     st.subheader("🏭 Machine catalog")
     _render_stale_data_banner("data/machine_clean.csv")
@@ -5945,16 +6033,20 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
         display_df[pd_col] = "PDI"
     if ws_col not in display_df.columns:
         display_df[ws_col] = "Wire"
+    if uc_col not in display_df.columns:
+        display_df[uc_col] = "Undercarriage"
     # Drop the projected legacy routing columns from the editor view —
     # they're compute helpers, not the source of truth. We also drop the
     # OTHER facilities' columns so the editor only shows ONE set of
     # routing dropdowns matching the sidebar location.
-    _drop_cols = ["Final Station", "AccKIT Station", "PDI Station", "Wire Station"]
+    _drop_cols = ["Final Station", "AccKIT Station", "PDI Station", "Wire Station",
+                  "Undercarriage Station"]
     for _code in ("HND", "SPB", "CYP"):
         if _code == fac_code:
             continue
         _drop_cols.extend([f"Final Station {_code}", f"AccKIT Station {_code}",
-                           f"PDI Station {_code}", f"Wire Station {_code}"])
+                           f"PDI Station {_code}", f"Wire Station {_code}",
+                           f"Undercarriage Station {_code}"])
     display_df = display_df.drop(columns=[c for c in _drop_cols if c in display_df.columns])
     if "Last Modified" not in display_df.columns:
         display_df["Last Modified"] = ""
@@ -6031,6 +6123,18 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
             ),
             required=False,
         ),
+        uc_col: st.column_config.SelectboxColumn(
+            "Undercarriage Station",
+            options=["Undercarriage", "ComAcc", "GenAcc", "PMAcc", "Final"],
+            help=(
+                f"Which station absorbs this SKU's Undercarriage-Assembly labor "
+                f"at **{location}** — i.e. the Final-Assembly labor that lands at "
+                f"Undercarriage (PDS units). Default Undercarriage Assembly; "
+                f"reroute when this plant has no dedicated undercarriage crew "
+                f"(e.g. Henderson: Undercarriage → Com Accessories)."
+            ),
+            required=False,
+        ),
         "Used (qty)": st.column_config.NumberColumn(
             "Used (qty)", disabled=True, pinned=True,
         ),
@@ -6058,7 +6162,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
                    + ", ".join(f"`{o}` → `{n}`" for o, n in renames))
     _render_pending_changes(
         edited_cells, machine_df, editable_cols,
-        text_cols=["Description", fs_col, ak_col, pd_col],
+        text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
     )
 
     if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
@@ -6066,7 +6170,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
             edited=edited_cells, source_df=machine_df,
             editable_cols=editable_cols,
             file_path="data/machine_clean.csv", label="machine",
-            text_cols=["Description", fs_col, ak_col, pd_col],
+            text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
             renames=renames,
         )
 

@@ -70,6 +70,26 @@ class TestMaxUnitsAtCurrentMix:
         assert r["max_units"] == 0
         assert "thru_max_units" in r
 
+    def test_excluded_station_skipped(self):
+        # Battery is the tighter bottleneck (1.5); excluding it lets QC (0.5)
+        # drive the cap instead.
+        cap = self._cap({"Battery Assembly": (8, 100.0, 5.0, 1.5, 0.0),
+                         "QC": (4, 50.0, 5.0, 0.5, 0.0)})
+        base = app._max_units_at_current_mix(cap, 100)
+        assert base["bottleneck"] == "Battery Assembly"
+        r = app._max_units_at_current_mix(cap, 100, excluded_stations=["Battery Assembly"])
+        assert r["bottleneck"] == "QC"
+        assert r["potential_max_units"] == 200      # 100 / 0.5
+
+    def test_excluded_unstaffed_station_not_infeasible(self):
+        # An excluded HC=0 station must not block the build as infeasible.
+        cap = self._cap({"Battery Assembly": (0, 100.0, 5.0, 0.0, 0.0),
+                         "QC": (4, 50.0, 5.0, 0.5, 0.0)})
+        assert app._max_units_at_current_mix(cap, 100)["infeasible"] is True
+        r = app._max_units_at_current_mix(cap, 100, excluded_stations=["Battery Assembly"])
+        assert r["infeasible"] is False
+        assert r["bottleneck"] == "QC"
+
 
 class TestAreaSpaceCap:
     def _cap(self, rows):

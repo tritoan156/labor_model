@@ -14,8 +14,8 @@
     "overtime": 0.0
   },
   "Henderson": {
-    "new_hire_pct": 0.3,
-    "new_hire_productivity": 0.5,
+    "new_hire_pct": 0.2,
+    "new_hire_productivity": 0.7,
     "absenteeism": 0.05,
     "overtime": 0.0,
     "efficiency": 0.5,

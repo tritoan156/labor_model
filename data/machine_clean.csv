@@ -181,7 +181,7 @@ BOSS125-002,"EBOSS 125-65 HYBRID DUAL AXLE ELEC TRAILER 3"" RING HITCH ASSEMBLY"
 BOSS70HS-005,EBOSS 70PM SKID ASSEMBLY REV B,10.0,30.0,20.0,20.0,90.0,30.0,20.0,,1.0,2026-06-09,,,,,,,,,,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 PDS185L-5E1,,20.0,,,158.0,20.0,30.0,20.0,,,2026-06-15,Undercarriage,Undercarriage,Undercarriage,ComAcc,,,,,,Wire,Wire,ComAcc,ComAcc,Undercarriage,Undercarriage
 PDS400,,20.0,10.0,,388.0,20.0,30.0,20.0,,,2026-06-12,Undercarriage,Undercarriage,Undercarriage,,,,,,,Wire,Wire,ComAcc,ComAcc,Undercarriage,Undercarriage
-SDG45-015,,,,,,,,,,,2026-07-09,,,,,,,,,,,,,Undercarriage,Undercarriage,Undercarriage
+SDG45-015,"SDG45S-8E2 DUAL AXLE ELECTRIC TRAILER FOR EXT FUEL TANK 2-5/16"" BALL HITCH ASSEMBLY",20.0,10.0,150.0,60.0,30.0,30.0,30.0,,,2026-07-16,,,,,,GenAcc,,,GenAcc,,,,Undercarriage,Undercarriage,Undercarriage
 PDS185L XXX,PDS185L ESTIMATION ASSEMBLY,20.0,,,158.0,15.0,30.0,20.0,,,2026-07-16,Undercarriage,Undercarriage,Undercarriage,ComAcc,ComAcc,,,,,Wire,Wire,ComAcc,ComAcc,Undercarriage,Undercarriage
 SDG125S XXX,SDG125S ESTIMATION ASSEMBLY,5.0,,210.0,15.0,30.0,30.0,30.0,,,2026-07-16,,,,,GenAcc,GenAcc,,,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 SDG150S XXX,SDG150S ESTIMATION ASSEMBLY,5.0,0.0,210.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-07-16,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,PDI,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage

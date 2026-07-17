@@ -67,7 +67,7 @@
     },
     "Ship": {
       "HC": 2,
-      "Conc": 1,
+      "Conc": 2,
       "Crew": 1
     },
     "Lead": {

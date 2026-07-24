@@ -10,7 +10,7 @@ BOSS220-003,"ENERGY BOSS 220 TRIPLE AXLE ELEC TRAILER 3"" RING HITCH ASSEMBLY",1
 BOSS220HS-001,ENERGY BOSS 220 HEAD SKID ASSEMBLY,10.0,60.0,0.0,0.0,60.0,60.0,30.0,960.0,2.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS25PM XXX,EBOSS 25 PM ESTIMATION ASSEMBLY,10.0,60.0,0.0,30.0,60.0,60.0,30.0,0.0,1.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS220PM XXX,EBOSS 220 PM ESTIMATION ASSEMBLY,10.0,60.0,0.0,30.0,60.0,60.0,30.0,960.0,2.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
-BOSS220HS-002,EBOSS 220 PM SKID VENTED COVER ASSEMBLY,10.0,60.0,0.0,45.0,90.0,60.0,30.0,700.0,3.0,2026-07-24,Final,Final,Final,GenAcc,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
+BOSS220HS-002,EBOSS 220 PM SKID VENTED COVER ASSEMBLY,10.0,60.0,0.0,45.0,60.0,60.0,30.0,700.0,3.0,2026-07-24,Final,Final,Final,GenAcc,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS25-001,"ENERGY BOSS 25 DUAL AXLE SURGE TRAILER 2"" BALL HITCH ASSEMBLY",10.0,60.0,90.0,45.0,90.0,60.0,30.0,0.0,1.0,2026-05-30,Final,Final,Final,GenAcc,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS25-002,"ENERGY BOSS 25 DUAL AXLE ELEC TRAILER 2"" BALL HITCH ASSEMBLY",10.0,60.0,120.0,0.0,60.0,60.0,30.0,0.0,1.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS25-003,"ENERGY BOSS 25 DUAL AXLE SURGE TRAILER 2-5/16"" BALL HITCH ASSEMBLY",10.0,60.0,90.0,0.0,60.0,60.0,30.0,0.0,1.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
@@ -189,4 +189,4 @@ SDG150-A006,SDG150S-8E1 BC DCL SL ACCESSORY KIT,5.0,10.0,210.0,45.0,30.0,30.0,30
 SDG45-014,SDG45S-8E2 BASE NO FORK POCKET ASSEMBLY,5.0,20.0,150.0,15.0,30.0,30.0,20.0,,,2026-07-16,,,,,GenAcc,,,,,,,,Undercarriage,Undercarriage,Undercarriage
 BOSS125HS-003,EBOSS 125 PM SKID FOR EBOSS125-125,10.0,10.0,20.0,10.0,30.0,30.0,30.0,480.0,2.0,2026-07-16,,,,PMAcc,,,,,,,,,Undercarriage,Undercarriage,Undercarriage
 BOSS400HS-004,EBOSS 400 PM SKID VENTED COVER ASSEMBLY,20.0,10.0,,,30.0,30.0,20.0,960.0,5.0,2026-07-16,,,,PMAcc,,,,,,,,,Undercarriage,Undercarriage,Undercarriage
-TBA,,10.0,30.0,120.0,150.0,90.0,60.0,30.0,,1.0,2026-07-16,,,,GenAcc,,,,,,,,,Undercarriage,Undercarriage,Undercarriage
+TBA,,10.0,30.0,120.0,150.0,60.0,60.0,30.0,,1.0,2026-07-24,,,,GenAcc,,,,,,,,,Undercarriage,Undercarriage,Undercarriage

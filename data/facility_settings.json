@@ -19,6 +19,7 @@
     "absenteeism": 0.05,
     "overtime": 0.0,
     "efficiency": 0.5,
-    "safety": 1.0
+    "safety": 1.0,
+    "excluded_stations": []
   }
 }

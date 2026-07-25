@@ -2,7 +2,7 @@
   "Henderson": {
     "Warehouse (Pick)": {
       "HC": 2,
-      "Conc": 2,
+      "Conc": 3,
       "Crew": 1
     },
     "Wire Assembly": {
@@ -41,9 +41,9 @@
       "Crew": 2
     },
     "ETO": {
-      "HC": 4,
-      "Conc": 2,
-      "Crew": 2
+      "HC": 3,
+      "Conc": 5,
+      "Crew": 1
     },
     "Accessories KIT": {
       "HC": 0,
@@ -67,7 +67,7 @@
     },
     "Ship": {
       "HC": 2,
-      "Conc": 2,
+      "Conc": 3,
       "Crew": 1
     },
     "Lead": {

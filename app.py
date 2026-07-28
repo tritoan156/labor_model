@@ -2843,6 +2843,26 @@ _PASTE_MONTH_RE = re.compile(r"^[A-Z]{3,9}[ -]\d{2,4}$|^\d{2,4}[ -][A-Z]{3,9}$",
 
 _PASTE_COLUMNS = ["FG SKU", "Accessory SKU", "Qty"]
 
+# Display-only line number on the manual-entry table. It's regenerated from
+# row order every render — never read back out of the editor — so pasting,
+# adding, deleting, or reordering rows always leaves 1..N intact.
+_MANUAL_ROW_NO = "#"
+
+
+def _manual_add_row_numbers(df) -> pd.DataFrame:
+    """Return a display copy of the manual entries with a leading `#` column."""
+    out = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=_PASTE_COLUMNS)
+    out = out.drop(columns=[_MANUAL_ROW_NO], errors="ignore")
+    out.insert(0, _MANUAL_ROW_NO, range(1, len(out) + 1))
+    return out
+
+
+def _manual_drop_row_numbers(df):
+    """Strip the display-only `#` column before rows are stored or used."""
+    if isinstance(df, pd.DataFrame) and _MANUAL_ROW_NO in df.columns:
+        return df.drop(columns=[_MANUAL_ROW_NO])
+    return df
+
 
 def _paste_clean_cell(value) -> str:
     """Strip the debris Excel copies along with a cell (NBSP, stray quotes,
@@ -3977,11 +3997,20 @@ def render_sidebar() -> dict:
         # Render the data_editor with a rev-suffixed key so a fresh seed
         # is picked up after each programmatic add.
         manual_entries = st.sidebar.data_editor(
-            st.session_state[seed_key],
+            _manual_add_row_numbers(st.session_state[seed_key]),
             use_container_width=True,
             num_rows="dynamic",
             key=f"manual_entries_{location}_v{st.session_state[rev_key]}",
             column_config={
+                _MANUAL_ROW_NO: st.column_config.NumberColumn(
+                    _MANUAL_ROW_NO,
+                    width=44,
+                    disabled=True,
+                    help=(
+                        "Line number — filled in automatically as rows are "
+                        "pasted or added, and renumbered if you delete one."
+                    ),
+                ),
                 "FG SKU": st.column_config.TextColumn("FG SKU", help="e.g. BOSS25-006"),
                 "Accessory SKU": st.column_config.TextColumn(
                     "Accessory SKU", help="e.g. BOSS25-A016 (optional)"
@@ -3990,7 +4019,10 @@ def render_sidebar() -> dict:
             },
         )
 
-        # Persist the latest in-flight edits so the next Add appends on top
+        # Persist the latest in-flight edits so the next Add appends on top.
+        # The `#` column is display-only — dropped here so it never reaches
+        # the schedule builder, a saved scenario, or the next paste append.
+        manual_entries = _manual_drop_row_numbers(manual_entries)
         st.session_state[seed_key] = manual_entries
 
     # Plan month — the authoritative month for the whole tool. It drives:
@@ -4371,7 +4403,9 @@ Pick **✏️ Paste or type SKUs** in step 2, open **📋 Paste a list from Exce
 | `SKU` + `SKU` | FG SKU + accessory |
 | `SKU` + `SKU` + number | FG SKU + accessory + quantity |
 
-Column order doesn't matter — pasted SKUs are matched against the catalogs to work out which column is which, and a header row (`FG SKU ID`, `Qty`, …) is understood if you copied one. Extra columns like LOCATION or CUSTOMER are ignored. The preview shows what was read before anything is committed; then **➕ Add to table** appends to what's already there and **🔁 Replace table** starts over. Either way the rows land in the editable table below, so you can still fix a SKU or add a few more by hand.
+Column order doesn't matter — pasted SKUs are matched against the catalogs to work out which column is which, and a header row (`FG SKU ID`, `Qty`, …) is understood if you copied one. Extra columns like LOCATION or CUSTOMER are ignored. The preview shows what was read before anything is committed; then **➕ Add** appends to what's already there and **🔁 Replace** starts over. Either way the rows land in the editable table below, so you can still fix a SKU or add a few more by hand.
+
+The table's **`#`** column numbers the rows for you — pasted rows continue the count, and deleting a row closes the gap. It's display-only: it isn't part of the schedule and isn't saved with a scenario.
 
 **Where to find common features**
 

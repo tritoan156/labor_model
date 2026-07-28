@@ -118,6 +118,8 @@ The panel previews exactly what it read: row and unit counts, which column becam
 
 Then **➕ Add** appends to the table below and **🔁 Replace** starts fresh. Either way the rows land in the normal manual-entry table, so you can still fix a SKU, change a quantity, or add a few more by hand — and save the result as a named scenario.
 
+The table's **`#`** column is a line number, filled in automatically: pasted rows continue the count from whatever is already there, and deleting a row closes the gap. It's display-only — it isn't part of the schedule and isn't saved with a scenario.
+
 ---
 
 ## Data files (under `data/`)

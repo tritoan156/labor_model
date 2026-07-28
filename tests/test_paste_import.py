@@ -257,6 +257,68 @@ class TestEmptyAndJunk:
         assert len(df) <= 1
 
 
+class TestRowNumbers:
+    """The manual table's `#` column is display-only and rebuilt every render."""
+
+    def test_numbers_from_one_in_the_first_column(self):
+        df, _ = parse("BOSS25-010\t1\nBOSS70-002\t2\nSDG25\t3")
+        shown = app._manual_add_row_numbers(df)
+        assert list(shown.columns) == ["#", "FG SKU", "Accessory SKU", "Qty"]
+        assert shown["#"].tolist() == [1, 2, 3]
+
+    def test_renumbering_is_idempotent(self):
+        df, _ = parse("BOSS25-010\t1\nBOSS70-002\t1")
+        once = app._manual_add_row_numbers(df)
+        twice = app._manual_add_row_numbers(once)
+        assert twice["#"].tolist() == [1, 2]
+        assert list(twice.columns) == list(once.columns)
+
+    def test_appended_rows_continue_the_count(self):
+        # The paste-append case: existing rows + a new batch, renumbered whole.
+        first, _ = parse("BOSS25-010\t1\nBOSS70-002\t1")
+        second, _ = parse("SDG25\t1\nBOSS125-001\t1")
+        combined = pd.concat([first, second], ignore_index=True)
+        assert app._manual_add_row_numbers(combined)["#"].tolist() == [1, 2, 3, 4]
+
+    def test_deleting_a_row_closes_the_gap(self):
+        df, _ = parse("BOSS25-010\t1\nBOSS70-002\t1\nSDG25\t1")
+        remaining = df.drop(index=1).reset_index(drop=True)
+        assert app._manual_add_row_numbers(remaining)["#"].tolist() == [1, 2]
+
+    def test_blank_rows_are_numbered_too(self):
+        blanks = pd.DataFrame({"FG SKU": ["", ""], "Accessory SKU": ["", ""], "Qty": [0, 0]})
+        assert app._manual_add_row_numbers(blanks)["#"].tolist() == [1, 2]
+
+    def test_empty_frame_keeps_its_columns(self):
+        shown = app._manual_add_row_numbers(pd.DataFrame(columns=["FG SKU", "Accessory SKU", "Qty"]))
+        assert list(shown.columns) == ["#", "FG SKU", "Accessory SKU", "Qty"]
+        assert shown.empty
+
+    def test_non_dataframe_degrades_to_an_empty_table(self):
+        shown = app._manual_add_row_numbers(None)
+        assert list(shown.columns) == ["#", "FG SKU", "Accessory SKU", "Qty"]
+        assert shown.empty
+
+    def test_drop_is_a_clean_round_trip(self):
+        df, _ = parse("BOSS25-010\tBOSS25-A016\t4")
+        back = app._manual_drop_row_numbers(app._manual_add_row_numbers(df))
+        assert list(back.columns) == ["FG SKU", "Accessory SKU", "Qty"]
+        assert back.iloc[0].tolist() == ["BOSS25-010", "BOSS25-A016", 4]
+
+    def test_drop_is_a_no_op_without_the_column(self):
+        df, _ = parse("BOSS25-010\t1")
+        assert app._manual_drop_row_numbers(df) is df
+
+    def test_numbering_never_reaches_the_schedule_builder(self):
+        from core.data_loader import build_manual_schedule
+        df, _ = parse("BOSS25-010\t2")
+        numbered = app._manual_add_row_numbers(df)
+        sched = build_manual_schedule(app._manual_drop_row_numbers(numbered),
+                                      location="Henderson", machine_skus=set(MACHINE))
+        assert "#" not in sched.columns
+        assert sched.iloc[0]["BUILD QTY"] == 2
+
+
 class TestDownstreamContract:
     def test_output_feeds_build_manual_schedule(self):
         from core.data_loader import build_manual_schedule

@@ -12,7 +12,7 @@ Built so planners and execs can answer:
 ## Features
 
 - **Multi-location** — per-facility headcount, station setup, scenarios, and saved schedules.
-- **Two ways to enter a plan** — upload your normal Excel schedule (any column naming works), or type a handful of SKUs for a quick what-if.
+- **Three ways to enter a plan** — upload your normal Excel schedule (any column naming works), **paste a SKU list straight out of a spreadsheet**, or type a handful of SKUs for a quick what-if.
 - **Six interactive tabs:**
   - 🏠 **Overview** — executive dashboard with status banner, KPIs, recommended actions
   - 📊 **Capacity** — per-station utilization (labor + throughput), with 🔋 Battery throughput embedded
@@ -91,6 +91,38 @@ Click **📥 Download blank template** under the file uploader in the sidebar. Y
 ### Privacy
 
 Uploaded schedules stay **only in your browser** unless you explicitly click **💾 Save schedule** in the sidebar. Saving pushes the CSV to `data/uploaded_schedules.json` on GitHub, where teammates planning the same facility can reload it.
+
+---
+
+## Paste a SKU list from Excel
+
+For a quick plan there's no need to build a schedule file at all. Pick **✏️ Paste or type SKUs** in the sidebar, open **📋 Paste a list from Excel**, and paste the cells you copied (Ctrl+C out of Excel, Ctrl+V into the box).
+
+### What you can paste
+
+| What you paste | How it's read |
+|---|---|
+| One SKU per line | FG SKU, qty 1 each |
+| `SKU` + number | FG SKU + quantity |
+| `SKU` + `SKU` | FG SKU + accessory |
+| `SKU` + `SKU` + number | FG SKU + accessory + quantity |
+
+- **Column order doesn't matter.** Pasted values are matched against the machine and accessory catalogs to work out which column is which; the `-A###` accessory naming pattern is the fallback for SKUs the catalogs don't know yet.
+- **A header row is optional** — `FG SKU ID` / `FG ACCRY SKU ID` / `BUILD QTY` are understood, as are friendlier spellings like `Model`, `Accessory`, `Quantity`.
+- **Extra columns are ignored** — paste a whole ERP export row (LOCATION, CUSTOMER, dates…) and only the SKU / accessory / qty columns get picked up.
+- **Formats:** tab-separated (the Excel default), CSV, semicolon exports, space-aligned text, or a bare list of SKUs. Excel debris — non-breaking spaces, wrapping quotes, the leading `'` text marker, `1,200` thousands separators — is cleaned up.
+
+### Before anything is committed
+
+The panel previews exactly what it read: row and unit counts, which column became which, duplicates combined, blank quantities counted as 1, and any SKU missing from the catalogs (those still import — their labor just isn't counted until the SKU is added under **📁 Data & Setup**). Lines it can't use are listed with their line number and the reason.
+
+Then **➕ Add** appends to the table below and **🔁 Replace** starts fresh. Either way the rows land in the normal manual-entry table, so you can still fix a SKU, change a quantity, or add a few more by hand — and save the result as a named scenario.
+
+### The `#` column
+
+The table numbers its own rows. A row takes the next number as soon as it has an **FG SKU or an Accessory SKU** in it; a row with neither stays blank and doesn't consume a number, so the count always matches the rows that will actually build.
+
+That holds however the row arrived — pasted through the panel, pasted straight into the table from Excel, or typed in by hand — and deleting a row closes the gap rather than leaving a hole. The column is display-only: it isn't part of the schedule and isn't saved with a scenario.
 
 ---
 

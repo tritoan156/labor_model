@@ -8,6 +8,7 @@ in the sidebar, and shows the dashboards as top-level tabs.
 from __future__ import annotations
 
 import calendar
+import csv
 import io
 import re
 from datetime import date
@@ -2254,11 +2255,16 @@ def _render_calendar_view(
                     {"Station": st_disp, "Labor (p-min)": v}
                     for st_disp, v in station_totals.items()
                     if v > 0
-                ]
-            ).sort_values("Labor (p-min)", ascending=True)
+                ],
+                columns=["Station", "Labor (p-min)"],
+            )
             if mix_df.empty:
+                # Every station at zero — e.g. the week's SKUs aren't in the
+                # catalog yet. Sorting an empty frame by a column it doesn't
+                # have would raise, so the guard comes first.
                 st.info("ℹ️ No labor recorded for this week's units.")
             else:
+                mix_df = mix_df.sort_values("Labor (p-min)", ascending=True)
                 _bar = px.bar(
                     mix_df, x="Labor (p-min)", y="Station",
                     orientation="h", text_auto=",.0f",
@@ -2792,6 +2798,624 @@ def _uploaded_schedule_delete(location: str, name: str) -> None:
         _show_github_error(e, "Delete")
 
 
+# =============================================================
+# PASTE FROM EXCEL — bulk SKU import for manual entry mode
+# =============================================================
+# Planners normally already have the build list sitting in a spreadsheet: a
+# column of FG SKUs, sometimes an accessory column, sometimes a quantity.
+# Exporting that to a full schedule CSV (LOCATION / PRODUCTION MONTH headers
+# and all) just to run a what-if is heavy, and retyping row by row is worse.
+# These helpers let the planner copy the cells straight out of Excel and paste
+# them into the sidebar: the parser works out which column is which, then the
+# rows land in the manual-entry table where they can still be edited or
+# extended by hand.
+
+# Header aliases, checked per cell in this order: qty → accessory → FG.
+# Accessory before FG matters — "ACCESSORY SKU" would otherwise be claimed by
+# the FG list's bare "SKU".
+_PASTE_QTY_HEADERS = (
+    "BUILD QTY", "BUILD QUANTITY", "QUANTITY", "QTY", "UNITS", "UNIT COUNT",
+    "COUNT", "EACH", "EA",
+)
+_PASTE_ACC_HEADERS = (
+    "FG ACCRY SKU ID", "FG ACCRY SKU", "FG ACCRY", "ACCESSORY SKU ID",
+    "ACCESSORY SKU", "ACCRY SKU", "ACC SKU", "ACCESSORY KIT", "ACCESSORY",
+    "ACCRY", "ACC KIT", "KIT", "ACC",
+)
+_PASTE_FG_HEADERS = (
+    "FG SKU ID", "FG SKU", "FINISHED GOOD", "MACHINE SKU", "SKU ID",
+    "MACHINE", "MODEL", "ITEM", "PART", "SKU", "FG", "UNIT",
+)
+
+# Qty cells: a plain number, optionally with a unit suffix. Deliberately a
+# full match so a PRODUCTION DAY column like `5/4/2026` can never be mistaken
+# for a quantity when columns are being guessed positionally.
+_PASTE_QTY_RE = re.compile(
+    r"^(\d+(?:\.\d+)?)\s*(?:EA|EACH|PC|PCS|UNIT|UNITS|X)?$", re.IGNORECASE
+)
+# Accessory SKUs carry an -A### / -AXXX / " AXXX" tail (BOSS25-A016,
+# PDS100 AXXX). Only consulted when catalog membership can't answer.
+_PASTE_ACC_SKU_RE = re.compile(r"[-\s]A(?:\d|XXX)", re.IGNORECASE)
+# Shapes that pass the cheap "looks like a SKU" test but aren't one — dates
+# and month labels ride along in real Excel exports.
+_PASTE_DATE_RE = re.compile(r"^\d{1,4}[/.-]\d{1,2}[/.-]\d{1,4}$")
+_PASTE_MONTH_RE = re.compile(r"^[A-Z]{3,9}[ -]\d{2,4}$|^\d{2,4}[ -][A-Z]{3,9}$", re.IGNORECASE)
+
+_PASTE_COLUMNS = ["FG SKU", "Accessory SKU", "Qty"]
+
+# Display-only line number on the manual-entry table. It's regenerated from
+# row content every render — never read back out of the editor — so pasting,
+# adding, or deleting rows always leaves the count correct.
+_MANUAL_ROW_NO = "#"
+
+
+def _manual_row_has_content(df) -> pd.Series:
+    """True for rows carrying an FG SKU or an Accessory SKU.
+
+    Quantity deliberately doesn't count: a row someone has half-filled is
+    still a row, and a blank one shouldn't take a line number.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series([], dtype=bool)
+
+    def _filled(col: str) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(False, index=df.index)
+        return df[col].fillna("").astype(str).str.strip() != ""
+
+    return _filled("FG SKU") | _filled("Accessory SKU")
+
+
+def _manual_add_row_numbers(df) -> pd.DataFrame:
+    """Return a display copy of the manual entries with a leading `#` column.
+
+    Only rows with a SKU in them are numbered — blank rows (the trailing
+    spares, or a gap left mid-table) get an empty cell and don't consume a
+    number, so the sequence always matches the rows that will actually build.
+    Values are strings so an unnumbered row renders empty instead of as a
+    `None` the editor would flag.
+    """
+    out = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=_PASTE_COLUMNS)
+    out = out.drop(columns=[_MANUAL_ROW_NO], errors="ignore")
+    # Guarantee the editor is handed a RangeIndex whoever wrote the seed —
+    # anything else makes Streamlit un-hide the index column and mark it
+    # required, which stops rows added in the grid from ever reaching us.
+    out = out.reset_index(drop=True)
+
+    numbers: list[str] = []
+    seq = 0
+    for has_content in _manual_row_has_content(out):
+        if has_content:
+            seq += 1
+            numbers.append(str(seq))
+        else:
+            numbers.append("")
+    out.insert(0, _MANUAL_ROW_NO, numbers)
+    return out
+
+
+def _manual_drop_row_numbers(df):
+    """Strip the display-only `#` column before rows are stored or used."""
+    if isinstance(df, pd.DataFrame) and _MANUAL_ROW_NO in df.columns:
+        return df.drop(columns=[_MANUAL_ROW_NO])
+    return df
+
+
+def _paste_clean_cell(value) -> str:
+    """Strip the debris Excel copies along with a cell (NBSP, stray quotes,
+    the leading apostrophe Excel uses to force text)."""
+    s = str(value or "").replace("\xa0", " ").strip()
+    s = s.strip('"').strip("'").strip()
+    return re.sub(r"\s+", " ", s)
+
+
+def _paste_norm_header(cell) -> str:
+    """Uppercase a header cell and reduce punctuation to single spaces."""
+    return re.sub(r"[^A-Z0-9]+", " ", str(cell or "").upper()).strip()
+
+
+def _paste_header_role(cell) -> "str | None":
+    """Map one header cell to `Qty` / `Accessory SKU` / `FG SKU`, else None.
+
+    Matches whole words only, so a header like `SEAT` can't match `EA`.
+    """
+    norm = _paste_norm_header(cell)
+    if not norm:
+        return None
+    padded = f" {norm} "
+    for role, patterns in (
+        ("Qty", _PASTE_QTY_HEADERS),
+        ("Accessory SKU", _PASTE_ACC_HEADERS),
+        ("FG SKU", _PASTE_FG_HEADERS),
+    ):
+        for pattern in patterns:
+            if f" {_paste_norm_header(pattern)} " in padded:
+                return role
+    return None
+
+
+def _paste_parse_qty(cell) -> "float | None":
+    """Read a quantity cell. None when it isn't a plain number."""
+    s = str(cell or "").strip().replace(",", "")  # 1,200 → 1200
+    m = _PASTE_QTY_RE.match(s)
+    return float(m.group(1)) if m else None
+
+
+def _paste_is_sku_like(value) -> bool:
+    """Cheap shape test — SKUs are short, carry a digit, and have no prose."""
+    s = str(value or "").strip().upper()
+    if not (2 < len(s) <= 24) or len(s.split()) > 2:
+        return False
+    if not re.search(r"\d", s):
+        return False
+    # A bare quantity ("5", "2.0", "5 EA") is a number, not a SKU — every SKU
+    # in these catalogs carries an alpha family prefix.
+    if _paste_parse_qty(s) is not None:
+        return False
+    if _PASTE_DATE_RE.match(s) or _PASTE_MONTH_RE.match(s):
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9 ./_-]*", s))
+
+
+def _paste_split_grid(text) -> "tuple[list[tuple[int, list[str]]], str]":
+    """Split pasted spreadsheet text into `(line_no, cells)` rows.
+
+    Returns the rows plus the delimiter name we settled on, so the UI can tell
+    the planner how their paste was read.
+    """
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [(i + 1, ln) for i, ln in enumerate(raw.split("\n")) if ln.strip()]
+    if not lines:
+        return [], "none"
+
+    body = "\n".join(ln for _, ln in lines)
+    if "\t" in body:
+        delim = "tab"
+    elif "," in body:
+        delim = "comma"
+    elif ";" in body:
+        delim = "semicolon"
+    elif re.search(r"\S {2,}\S", body):
+        delim = "spaces"
+    else:
+        delim = "none"
+
+    char = {"tab": "\t", "comma": ",", "semicolon": ";"}.get(delim)
+    grid: list[tuple[int, list[str]]] = []
+    for no, ln in lines:
+        if char:
+            # csv.reader so a quoted cell ("BOSS25-010, spare") survives intact
+            try:
+                cells = next(csv.reader([ln], delimiter=char), [ln])
+            except csv.Error:
+                cells = ln.split(char)
+        elif delim == "spaces":
+            cells = re.split(r" {2,}", ln)
+        else:
+            cells = [ln]
+        grid.append((no, [_paste_clean_cell(c) for c in cells]))
+
+    width = max(len(cells) for _, cells in grid)
+    grid = [(no, cells + [""] * (width - len(cells))) for no, cells in grid]
+
+    # A single pasted line of 3+ SKU-shaped cells with no quantity anywhere is
+    # a horizontal list — someone copied a row instead of a column. Stand it up.
+    if len(grid) == 1 and width >= 3:
+        no, cells = grid[0]
+        filled = [c for c in cells if c]
+        if not any(_PASTE_QTY_RE.match(c) for c in filled):
+            grid = [(no, [c]) for c in filled]
+
+    return grid, delim
+
+
+def _paste_detect_header(cells, known_up: set) -> "dict[int, str] | None":
+    """Return `{col_index: role}` when the first pasted row is a header row."""
+    if any(c and c.upper() in known_up for c in cells):
+        return None  # a real catalog SKU sits in row 1 — that's data
+    if any(_PASTE_QTY_RE.match(c) for c in cells if c):
+        return None  # header rows don't carry quantities
+    roles = {i: _paste_header_role(c) for i, c in enumerate(cells) if c}
+    roles = {i: r for i, r in roles.items() if r}
+    return roles or None
+
+
+def _paste_assign_columns(rows, header_roles, machine_up: dict, acc_up: dict) -> dict:
+    """Decide which column holds FG SKU / Accessory SKU / Qty.
+
+    Header names win where they exist; everything left over is inferred from
+    the data itself — catalog membership first, then shape (numeric vs
+    SKU-like). Columns we can't place (LOCATION, CUSTOMER, dates…) are simply
+    left unclaimed and ignored.
+    """
+    width = max((len(cells) for _, cells in rows), default=0)
+    cols: dict[str, "int | None"] = {c: None for c in _PASTE_COLUMNS}
+    for idx, role in (header_roles or {}).items():
+        if idx < width and role in cols and cols[role] is None:
+            cols[role] = idx
+
+    free = [i for i in range(width) if i not in {v for v in cols.values() if v is not None}]
+
+    def _frac(idx, pred) -> float:
+        vals = [cells[idx] for _, cells in rows if idx < len(cells) and cells[idx]]
+        return (sum(1 for v in vals if pred(v)) / len(vals)) if vals else 0.0
+
+    numeric = {i: _frac(i, lambda v: _paste_parse_qty(v) is not None) for i in free}
+    in_fg = {i: _frac(i, lambda v: v.upper() in machine_up) for i in free}
+    in_acc = {i: _frac(i, lambda v: v.upper() in acc_up) for i in free}
+    acc_like = {i: _frac(i, lambda v: bool(_PASTE_ACC_SKU_RE.search(v))) for i in free}
+    sku_like = {i: _frac(i, _paste_is_sku_like) for i in free}
+
+    def _claim(role: str, idx: int) -> None:
+        cols[role] = idx
+        free.remove(idx)
+
+    # Qty — a column of plain numbers that doesn't read as a SKU.
+    if cols["Qty"] is None:
+        cands = [i for i in free if numeric[i] >= 0.6 and sku_like[i] < 0.5]
+        if cands:
+            # Excel puts qty last more often than not; break ties to the right.
+            _claim("Qty", max(cands, key=lambda i: (numeric[i], i)))
+
+    # FG SKU — a catalog hit first, then the leftmost SKU-shaped column.
+    if cols["FG SKU"] is None and free:
+        hits = [i for i in free if in_fg[i] > 0 and in_fg[i] >= in_acc[i]]
+        if hits:
+            _claim("FG SKU", max(hits, key=lambda i: (in_fg[i], -i)))
+        else:
+            shaped = [i for i in free if sku_like[i] >= 0.5 and acc_like[i] < 0.5]
+            _claim("FG SKU", shaped[0] if shaped else free[0])
+
+    # Accessory SKU — a catalog hit or the -A### shape, else the next
+    # SKU-shaped leftover. Prose columns (customer, description) never qualify.
+    if cols["Accessory SKU"] is None and free:
+        hits = [i for i in free if in_acc[i] > 0 or acc_like[i] >= 0.5]
+        if hits:
+            _claim("Accessory SKU",
+                   max(hits, key=lambda i: (max(in_acc[i], acc_like[i]), -i)))
+        else:
+            shaped = [i for i in free if sku_like[i] >= 0.5]
+            if shaped:
+                _claim("Accessory SKU", shaped[0])
+
+    return cols
+
+
+def _paste_canonical(sku, catalog_up: dict) -> str:
+    """Uppercase a pasted SKU, preferring the catalog's own spelling when known."""
+    s = str(sku or "").strip()
+    if not s:
+        return ""
+    return catalog_up.get(s.upper(), s.upper())
+
+
+def _parse_pasted_skus(
+    text,
+    machine_skus=None,
+    acc_skus=None,
+    combine_duplicates: bool = True,
+) -> "tuple[pd.DataFrame, dict]":
+    """Turn text copied out of a spreadsheet into manual-entry rows.
+
+    Handles what actually comes off a clipboard: tab-separated Excel cells,
+    CSV, semicolon exports, space-aligned text, or a bare one-SKU-per-line
+    list. A header row is optional; so are the accessory and quantity columns
+    (a missing quantity counts as 1).
+
+    Returns ``(DataFrame[FG SKU, Accessory SKU, Qty], report)`` where *report*
+    carries everything the UI needs to explain the import: the delimiter and
+    columns it settled on, per-line skip reasons, and any SKUs missing from
+    the catalogs.
+    """
+    machine_up = {str(s).strip().upper(): str(s).strip()
+                  for s in (machine_skus or []) if str(s).strip()}
+    acc_up = {str(s).strip().upper(): str(s).strip()
+              for s in (acc_skus or []) if str(s).strip()}
+    known_up = set(machine_up) | set(acc_up)
+
+    grid, delim = _paste_split_grid(text)
+    header_roles = _paste_detect_header(grid[0][1], known_up) if grid else None
+    rows = grid[1:] if header_roles else grid
+    cols = _paste_assign_columns(rows, header_roles, machine_up, acc_up) if rows else {
+        c: None for c in _PASTE_COLUMNS
+    }
+
+    entries: list[dict] = []
+    skipped: list[dict] = []
+    qty_defaulted = qty_rounded = dropped_acc = 0
+
+    for no, cells in rows:
+        def _cell(idx) -> str:
+            return cells[idx] if idx is not None and idx < len(cells) else ""
+
+        shown = " | ".join(c for c in cells if c)
+        fg_raw = _cell(cols["FG SKU"])
+        if not fg_raw:
+            skipped.append({"line": no, "text": shown, "reason": "no FG SKU in this row"})
+            continue
+        # Spreadsheet formula-injection guard — same rule as the catalog forms.
+        if fg_raw[:1] in ("=", "+", "-", "@"):
+            skipped.append({"line": no, "text": shown,
+                            "reason": "FG SKU starts with =, +, - or @"})
+            continue
+
+        qty_cell = _cell(cols["Qty"])
+        if not qty_cell:
+            qty = 1
+            qty_defaulted += 1
+        else:
+            parsed_qty = _paste_parse_qty(qty_cell)
+            if parsed_qty is None:
+                skipped.append({"line": no, "text": shown,
+                                "reason": f"quantity “{qty_cell}” isn't a number"})
+                continue
+            qty = int(round(parsed_qty))
+            if qty <= 0:
+                skipped.append({"line": no, "text": shown,
+                                "reason": f"quantity is {qty_cell}"})
+                continue
+            if float(qty) != parsed_qty:
+                qty_rounded += 1
+
+        acc_raw = _cell(cols["Accessory SKU"])
+        if acc_raw[:1] in ("=", "+", "-", "@"):
+            acc_raw = ""
+            dropped_acc += 1
+
+        entries.append({
+            "FG SKU": _paste_canonical(fg_raw, machine_up),
+            "Accessory SKU": _paste_canonical(acc_raw, acc_up),
+            "Qty": qty,
+        })
+
+    merged = 0
+    if combine_duplicates and entries:
+        combined: dict[tuple, dict] = {}
+        order: list[tuple] = []
+        for e in entries:
+            key = (e["FG SKU"], e["Accessory SKU"])
+            if key in combined:
+                combined[key]["Qty"] += e["Qty"]
+            else:
+                combined[key] = dict(e)
+                order.append(key)
+        merged = len(entries) - len(order)
+        entries = [combined[k] for k in order]
+
+    def _unknown(field: str, catalog_up: dict) -> list[str]:
+        """SKUs the catalog has never heard of — reported, never dropped."""
+        if not catalog_up:
+            return []
+        out, seen = [], set()
+        for e in entries:
+            sku = e[field]
+            if sku and sku.upper() not in catalog_up and sku not in seen:
+                seen.add(sku)
+                out.append(sku)
+        return out
+
+    df = pd.DataFrame(entries, columns=_PASTE_COLUMNS)
+    if not df.empty:
+        df["Qty"] = df["Qty"].astype(int)
+
+    report = {
+        "delimiter": delim,
+        "header": header_roles is not None,
+        "columns": dict(cols),
+        "rows": int(len(df)),
+        "units": int(df["Qty"].sum()) if not df.empty else 0,
+        "skipped": skipped,
+        "qty_defaulted": qty_defaulted,
+        "qty_rounded": qty_rounded,
+        "merged": merged,
+        "dropped_acc": dropped_acc,
+        "unknown_fg": _unknown("FG SKU", machine_up),
+        "unknown_acc": _unknown("Accessory SKU", acc_up),
+    }
+    return df, report
+
+
+_PASTE_DELIM_LABEL = {
+    "tab": "tab-separated (straight from Excel)",
+    "comma": "comma-separated",
+    "semicolon": "semicolon-separated",
+    "spaces": "space-aligned columns",
+    "none": "one SKU per line",
+}
+
+
+def _paste_commit(parsed: pd.DataFrame, location: str, seed_key: str,
+                  rev_key: str, nonce_key: str, *, replace: bool) -> None:
+    """Push the parsed rows into the manual entries table, then clear the box.
+
+    Same session-state contract as the catalog browser's ➕ Add: write the new
+    seed, bump the revision so the data_editor picks it up, rerun.
+    """
+    if replace:
+        current = pd.DataFrame(columns=_PASTE_COLUMNS)
+    else:
+        current = st.session_state.get(
+            seed_key, pd.DataFrame(columns=_PASTE_COLUMNS),
+        ).copy()
+        # Drop the untouched blank rows so pasted rows don't land under a gap.
+        # "Blank" has to mean the same thing here as it does to the row
+        # numberer, or an accessory-only row it numbered gets thrown away by
+        # the next ➕ Add.
+        if not current.empty:
+            qty = pd.to_numeric(current.get("Qty", 0), errors="coerce").fillna(0)
+            current = current[_manual_row_has_content(current) | (qty > 0)]
+
+    # A couple of empty rows on the end so "add a few more by hand" stays a
+    # one-click affair in the editor.
+    blanks = pd.DataFrame({"FG SKU": [""] * 2, "Accessory SKU": [""] * 2, "Qty": [0] * 2})
+    st.session_state[seed_key] = pd.concat(
+        [current, parsed[_PASTE_COLUMNS], blanks], ignore_index=True,
+    )
+    st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
+    st.session_state[nonce_key] = st.session_state.get(nonce_key, 0) + 1
+
+    _track_and_flush(
+        "paste_import", facility=location, rows=int(len(parsed)),
+        units=int(parsed["Qty"].sum()), mode="replace" if replace else "append",
+    )
+    verb = "Replaced the table with" if replace else "Added"
+    st.session_state[f"_paste_toast_{location}"] = (
+        "success",
+        f"✅ {verb} **{len(parsed)}** row(s) · "
+        f"**{int(parsed['Qty'].sum())}** unit(s).",
+    )
+    st.rerun()
+
+
+def _render_paste_import(machine_df, acc_df, location: str,
+                         seed_key: str, rev_key: str) -> None:
+    """Sidebar expander: paste rows copied from a spreadsheet straight into the
+    manual entries table (via session_state[seed_key])."""
+    machine_skus = (
+        machine_df["SKU"].astype(str).tolist()
+        if machine_df is not None and not machine_df.empty else []
+    )
+    acc_skus = (
+        acc_df["SKU"].astype(str).tolist()
+        if acc_df is not None and not acc_df.empty else []
+    )
+
+    nonce_key = f"paste_nonce_{location}"
+    st.session_state.setdefault(nonce_key, 0)
+
+    with st.sidebar.expander("📋 Paste a list from Excel", expanded=False):
+        # Replay the one-shot confirmation stashed before the rerun
+        toast = st.session_state.pop(f"_paste_toast_{location}", None)
+        if toast:
+            level, msg = toast
+            (st.success if level == "success" else st.info)(msg)
+
+        st.caption(
+            "Copy the cells out of your spreadsheet and paste them here — "
+            "one row per SKU. **Accessory** and **Qty** columns are optional "
+            "(no quantity ⇒ 1 each), and a header row is fine. The rows land "
+            "in the table below, where you can still edit them or add more."
+        )
+        text = st.text_area(
+            "Pasted rows",
+            key=f"paste_text_{location}_v{st.session_state[nonce_key]}",
+            height=140,
+            placeholder=(
+                "BOSS25-010\tBOSS25-A016\t5\n"
+                "BOSS70-002\t\t2\n"
+                "SDG25\t\t1"
+            ),
+            label_visibility="collapsed",
+            help=(
+                "Works with anything a spreadsheet puts on the clipboard: "
+                "tab-separated cells, CSV, or a plain list of SKUs one per "
+                "line. Column order doesn't matter — the SKUs are matched "
+                "against the catalogs to work out which column is which."
+            ),
+        )
+        combine = st.checkbox(
+            "Combine duplicate SKUs",
+            value=True,
+            key=f"paste_combine_{location}",
+            help=(
+                "Rows with the same FG + accessory pair are merged into one "
+                "row with the quantities added up. Uncheck to keep them "
+                "as separate lines."
+            ),
+        )
+
+        if not str(text or "").strip():
+            return
+
+        parsed, report = _parse_pasted_skus(
+            text, machine_skus=machine_skus, acc_skus=acc_skus,
+            combine_duplicates=combine,
+        )
+
+        def _render_skipped() -> None:
+            if not report["skipped"]:
+                return
+            with st.expander(f"⚠️ {len(report['skipped'])} line(s) skipped", expanded=False):
+                for s in report["skipped"][:25]:
+                    st.markdown(f"- **Line {s['line']}** — {s['reason']}  \n  `{s['text']}`")
+                if len(report["skipped"]) > 25:
+                    st.caption(f"…and {len(report['skipped']) - 25} more.")
+
+        if parsed.empty:
+            st.warning(
+                "Couldn't read any usable rows out of that. Each line needs an "
+                "**FG SKU**; quantity is optional and defaults to 1."
+            )
+            _render_skipped()
+            return
+
+        # How the paste was read — so a mis-detected column is obvious before
+        # the rows are committed, not after.
+        col_bits = []
+        for role in _PASTE_COLUMNS:
+            idx = report["columns"].get(role)
+            col_bits.append(f"{role} ← col {idx + 1}" if idx is not None else f"{role} ← —")
+        st.caption(
+            f"**{report['rows']}** row(s) · **{report['units']}** unit(s) · "
+            f"read as {_PASTE_DELIM_LABEL.get(report['delimiter'], report['delimiter'])}"
+            + (" · header row detected" if report["header"] else "")
+            + "  \n" + " · ".join(col_bits)
+        )
+
+        # Short headers so all three columns fit the sidebar's width
+        st.dataframe(
+            parsed.head(25).rename(columns={"FG SKU": "FG", "Accessory SKU": "Acc"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if len(parsed) > 25:
+            st.caption(f"…and {len(parsed) - 25} more row(s) not shown.")
+
+        notes = []
+        if report["qty_defaulted"]:
+            notes.append(f"{report['qty_defaulted']} row(s) had no quantity → counted as 1 each.")
+        if report["merged"]:
+            notes.append(f"{report['merged']} duplicate row(s) combined.")
+        if report["qty_rounded"]:
+            notes.append(f"{report['qty_rounded']} fractional quantity(ies) rounded to whole units.")
+        if report["dropped_acc"]:
+            notes.append(f"{report['dropped_acc']} accessory cell(s) dropped (formula-like value).")
+        if notes:
+            st.caption("ℹ️ " + "  \n".join(notes))
+
+        for label, missing, where in (
+            ("machine catalog", report["unknown_fg"], "🏭 Machine catalog"),
+            ("accessory catalog", report["unknown_acc"], "🔌 Accessory catalog"),
+        ):
+            if missing:
+                shown = ", ".join(f"`{s}`" for s in missing[:8])
+                more = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+                st.warning(
+                    f"⚠️ Not in the {label}: {shown}{more}. They'll still import, "
+                    f"but their labor won't be counted until you add them in "
+                    f"**📁 Data & Setup → {where} → ➕ Add a new SKU**."
+                )
+
+        _render_skipped()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            add_clicked = st.button(
+                "➕ Add", use_container_width=True,
+                key=f"paste_add_{location}",
+                help="Append these rows to whatever is already in the table below.",
+            )
+        with c2:
+            replace_clicked = st.button(
+                "🔁 Replace", use_container_width=True,
+                key=f"paste_replace_{location}",
+                help="Clear the table below and use only these rows.",
+            )
+        if add_clicked or replace_clicked:
+            _paste_commit(parsed, location, seed_key, rev_key, nonce_key,
+                          replace=replace_clicked)
+
+
 def _render_sku_browser(machine_df, acc_df, location: str, seed_key: str, rev_key: str) -> None:
     """Sidebar expander that lets the user filter the machine catalog by
     family + class and add a chosen FG SKU + accessory + qty into the
@@ -3210,11 +3834,12 @@ def render_sidebar() -> dict:
     st.sidebar.markdown("#### Step 2 · Tell us what to build")
     schedule_mode = st.sidebar.radio(
         "How would you like to enter the build plan?",
-        ["📤 Upload schedule file", "✏️ Type a few SKUs"],
+        ["📤 Upload schedule file", "✏️ Paste or type SKUs"],
         index=0,
         help=(
             "Upload a full production schedule (CSV) — best for monthly planning. "
-            "Or type a few SKU rows by hand — best for quick what-if scenarios."
+            "Or paste a SKU list straight out of Excel (and add a few rows by "
+            "hand) — best for quick what-if scenarios."
         ),
     )
 
@@ -3379,7 +4004,8 @@ def render_sidebar() -> dict:
         # for both modes.
         st.sidebar.caption(
             "Enter FG SKU, Accessory SKU (optional), and Quantity for each row. "
-            "Use **Browse catalog** below to pick from the known SKUs."
+            "Already have the list in Excel? Use **📋 Paste a list from Excel** "
+            "below — or **📚 Browse catalog** to pick from the known SKUs."
         )
 
         # Cached loaders — same path as main(), no extra I/O
@@ -3399,18 +4025,34 @@ def render_sidebar() -> dict:
         st.session_state.setdefault(seed_key, default_entries)
         st.session_state.setdefault(rev_key, 0)
 
+        # Bulk paste first (it may bump rev_key + rerun on commit), then the
+        # one-at-a-time browse panel for topping the list up.
+        _render_paste_import(machine_df, acc_df, location, seed_key, rev_key)
+
         # Render the Browse panel (it may bump rev_key + rerun on Add)
         _render_sku_browser(machine_df, acc_df, location, seed_key, rev_key)
         _render_scenarios_panel(location, seed_key, rev_key)
 
         # Render the data_editor with a rev-suffixed key so a fresh seed
         # is picked up after each programmatic add.
+        shown_entries = _manual_add_row_numbers(st.session_state[seed_key])
         manual_entries = st.sidebar.data_editor(
-            st.session_state[seed_key],
+            shown_entries,
             use_container_width=True,
             num_rows="dynamic",
             key=f"manual_entries_{location}_v{st.session_state[rev_key]}",
             column_config={
+                _MANUAL_ROW_NO: st.column_config.TextColumn(
+                    _MANUAL_ROW_NO,
+                    width=44,
+                    disabled=True,
+                    help=(
+                        "Line number — assigned automatically to every row "
+                        "that has a SKU in it, whether you paste it or type "
+                        "it. Blank rows aren't numbered, and deleting a row "
+                        "renumbers the rest."
+                    ),
+                ),
                 "FG SKU": st.column_config.TextColumn("FG SKU", help="e.g. BOSS25-006"),
                 "Accessory SKU": st.column_config.TextColumn(
                     "Accessory SKU", help="e.g. BOSS25-A016 (optional)"
@@ -3419,8 +4061,41 @@ def render_sidebar() -> dict:
             },
         )
 
-        # Persist the latest in-flight edits so the next Add appends on top
+        # Persist the latest in-flight edits so the next Add appends on top.
+        # The `#` column is display-only — dropped here so it never reaches
+        # the schedule builder, a saved scenario, or the next paste append.
+        #
+        # reset_index is load-bearing, not tidiness. st.data_editor materializes
+        # a row the user added in the browser with `.loc` enlargement, which
+        # turns the frame's RangeIndex into a plain Int64 index. Handed that
+        # back on the next render, Streamlit stops hiding the index column and
+        # marks it required — and the front end then silently drops every
+        # further added row from the widget payload, because a row created in
+        # the grid has no value for that required cell. The result was that the
+        # FIRST grid paste worked (it's the one that poisons the index) and
+        # every later one never reached the server at all: no renumbering, and
+        # the rows themselves lost on the next rerun.
+        manual_entries = _manual_drop_row_numbers(manual_entries)
+        if isinstance(manual_entries, pd.DataFrame):
+            manual_entries = manual_entries.reset_index(drop=True)
         st.session_state[seed_key] = manual_entries
+
+        # Rows pasted, added, deleted, or typed straight into the grid live in
+        # the editor's own widget state, which Streamlit replays over the frame
+        # we pass in — the `#` column we numbered above describes the frame as
+        # it was BEFORE those edits, so a new row would render unnumbered no
+        # matter what we do here. Once the edits have been folded into the seed
+        # above, retire that widget state by bumping the revision: the next
+        # render builds a fresh editor from the seed alone and every row that
+        # has a SKU in it gets its number.
+        #
+        # Keyed on which rows have content rather than on row count, so filling
+        # a blank row in place renumbers too — and so editing a SKU that's
+        # already there costs no extra rerun.
+        if (_manual_row_has_content(shown_entries).tolist()
+                != _manual_row_has_content(manual_entries).tolist()):
+            st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
+            st.rerun()
 
     # Plan month — the authoritative month for the whole tool. It drives:
     #   • where auto-spread drops undated rows (target month),
@@ -3787,14 +4462,29 @@ def render_sidebar() -> dict:
 
 **Sidebar in three steps**
 1. **Pick a facility** — Henderson, Spartanburg, or Cypress. Each has its own crew config.
-2. **Tell us what to build** — upload your monthly schedule CSV, or type a few SKUs for a quick what-if.
+2. **Tell us what to build** — upload your monthly schedule CSV, or paste / type a few SKUs for a quick what-if.
 3. **Tune** — working days, shift length, safety, efficiency, and per-station headcount under the expanders below.
+
+**Pasting a list from Excel**
+Pick **✏️ Paste or type SKUs** in step 2, open **📋 Paste a list from Excel**, and paste the cells you copied. You don't need the full schedule layout — just SKUs, with an accessory column and a quantity column if you have them:
+
+| What you paste | How it's read |
+|---|---|
+| One SKU per line | Qty 1 each |
+| `SKU` + number | FG SKU + quantity |
+| `SKU` + `SKU` | FG SKU + accessory |
+| `SKU` + `SKU` + number | FG SKU + accessory + quantity |
+
+Column order doesn't matter — pasted SKUs are matched against the catalogs to work out which column is which, and a header row (`FG SKU ID`, `Qty`, …) is understood if you copied one. Extra columns like LOCATION or CUSTOMER are ignored. The preview shows what was read before anything is committed; then **➕ Add** appends to what's already there and **🔁 Replace** starts over. Either way the rows land in the editable table below, so you can still fix a SKU or add a few more by hand.
+
+The table's **`#`** column numbers the rows for you. A row takes the next number as soon as it has an FG SKU or an Accessory SKU in it — however it got there (pasted through the panel, pasted straight into the table, or typed by hand). Blank rows stay unnumbered and don't consume a number, and deleting a row closes the gap. It's display-only: it isn't part of the schedule and isn't saved with a scenario.
 
 **Where to find common features**
 
 | Want to… | Go to |
 |---|---|
-| Save your manual build plan | Sidebar → **📂 Save / load scenarios** (when in "Type a few SKUs" mode) |
+| Paste a SKU list out of Excel | Sidebar → **✏️ Paste or type SKUs** → **📋 Paste a list from Excel** |
+| Save your manual build plan | Sidebar → **📂 Save / load scenarios** (when in "Paste or type SKUs" mode) |
 | Save your uploaded schedule | Sidebar → **📂 Save / load uploaded schedules** (when in "Upload schedule file" mode) |
 | Get a blank upload template | Sidebar → **📥 Download blank template** (under the file uploader) |
 | Edit labor times | **📁 Data & Setup** tab → Machine / Accessory catalog |
@@ -3896,7 +4586,7 @@ The Overview's **🎯 Recommended actions** splits these two cases so you don't 
 Answers the question planners ask once they care: *"will the team see what I just did?"*
 
 ### Save / load scenarios (manual mode)
-When you're in **✏️ Type a few SKUs** mode, the sidebar's **📂 Save / load scenarios** expander lets you name and save your manual SKU list. Saved per facility to `data/scenarios.json` on GitHub — anyone planning for the same facility can reload them.
+When you're in **✏️ Paste or type SKUs** mode, the sidebar's **📂 Save / load scenarios** expander lets you name and save your manual SKU list. Saved per facility to `data/scenarios.json` on GitHub — anyone planning for the same facility can reload them.
 
 ### Save / load uploaded schedules (upload mode)
 When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / load uploaded schedules** expander lets you save your uploaded CSV under a name. Saved per facility to `data/uploaded_schedules.json` on GitHub. The **raw CSV** is preserved, so any columns the app currently ignores still survive the round-trip for future use.
@@ -8537,7 +9227,7 @@ def main():
     schedule_df = pd.DataFrame()
     empty_banner_msg = None
 
-    if inputs.get("schedule_mode") == "✏️ Type a few SKUs":
+    if inputs.get("schedule_mode") == "✏️ Paste or type SKUs":
         manual_entries = inputs.get("manual_entries")
         if manual_entries is None or manual_entries.empty:
             empty_banner_msg = (
@@ -8954,7 +9644,7 @@ def main():
     def _empty_state(tab_name: str):
         st.info(
             f"📭 **{tab_name} needs a schedule to populate.**  \n"
-            "• In the sidebar, switch to **📤 Upload schedule file** or **✏️ Type a few SKUs**.  \n"
+            "• In the sidebar, switch to **📤 Upload schedule file** or **✏️ Paste or type SKUs**.  \n"
             "• You can still edit catalogs, items, packages, and the process flow from the "
             "**📁 Data & Setup** tab without a schedule."
         )

@@ -2877,6 +2877,10 @@ def _manual_add_row_numbers(df) -> pd.DataFrame:
     """
     out = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=_PASTE_COLUMNS)
     out = out.drop(columns=[_MANUAL_ROW_NO], errors="ignore")
+    # Guarantee the editor is handed a RangeIndex whoever wrote the seed —
+    # anything else makes Streamlit un-hide the index column and mark it
+    # required, which stops rows added in the grid from ever reaching us.
+    out = out.reset_index(drop=True)
 
     numbers: list[str] = []
     seq = 0
@@ -3233,11 +3237,13 @@ def _paste_commit(parsed: pd.DataFrame, location: str, seed_key: str,
         current = st.session_state.get(
             seed_key, pd.DataFrame(columns=_PASTE_COLUMNS),
         ).copy()
-        # Drop the untouched blank rows so pasted rows don't land under a gap
+        # Drop the untouched blank rows so pasted rows don't land under a gap.
+        # "Blank" has to mean the same thing here as it does to the row
+        # numberer, or an accessory-only row it numbered gets thrown away by
+        # the next ➕ Add.
         if not current.empty:
-            fg = current.get("FG SKU", pd.Series(dtype=object)).fillna("").astype(str).str.strip()
             qty = pd.to_numeric(current.get("Qty", 0), errors="coerce").fillna(0)
-            current = current[(fg != "") | (qty > 0)]
+            current = current[_manual_row_has_content(current) | (qty > 0)]
 
     # A couple of empty rows on the end so "add a few more by hand" stays a
     # one-click affair in the editor.
@@ -4058,7 +4064,20 @@ def render_sidebar() -> dict:
         # Persist the latest in-flight edits so the next Add appends on top.
         # The `#` column is display-only — dropped here so it never reaches
         # the schedule builder, a saved scenario, or the next paste append.
+        #
+        # reset_index is load-bearing, not tidiness. st.data_editor materializes
+        # a row the user added in the browser with `.loc` enlargement, which
+        # turns the frame's RangeIndex into a plain Int64 index. Handed that
+        # back on the next render, Streamlit stops hiding the index column and
+        # marks it required — and the front end then silently drops every
+        # further added row from the widget payload, because a row created in
+        # the grid has no value for that required cell. The result was that the
+        # FIRST grid paste worked (it's the one that poisons the index) and
+        # every later one never reached the server at all: no renumbering, and
+        # the rows themselves lost on the next rerun.
         manual_entries = _manual_drop_row_numbers(manual_entries)
+        if isinstance(manual_entries, pd.DataFrame):
+            manual_entries = manual_entries.reset_index(drop=True)
         st.session_state[seed_key] = manual_entries
 
         # Rows pasted, added, deleted, or typed straight into the grid live in

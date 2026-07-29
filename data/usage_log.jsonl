@@ -4,3 +4,4 @@
 {"ts":"2026-05-22T20:45:40","uid":"4775a0b7ec48","type":"schedule_load","mode":"📤 Upload schedule file","facility":"Henderson","rows":"156"}
 {"ts":"2026-05-22T20:46:44","uid":"5d39d674a97e","type":"session_start","facility":"Henderson","mode":"📤 Upload schedule file"}
 {"ts":"2026-05-22T20:46:45","uid":"5d39d674a97e","type":"schedule_load","mode":"📤 Upload schedule file","facility":"Henderson","rows":"156"}
+{"ts":"2026-07-28T19:01:00-07:00","uid":"6700ef69c7f0","type":"schedule_load","mode":"✏️ Paste or type SKUs","facility":"Henderson","rows":"17"}

@@ -100,6 +100,15 @@ def test_rows_pasted_into_the_grid_are_numbered(tmp_path, monkeypatch):
     assert len(at.session_state[seed_key]) == 8
     assert "#" not in at.session_state[seed_key].columns
 
+    # The seed must go back on a RangeIndex. Streamlit materializes rows added
+    # in the browser with `.loc` enlargement, which leaves a plain Int64 index;
+    # feeding that back makes Streamlit un-hide the index column and mark it
+    # required, and the front end then silently drops every subsequently added
+    # row from the widget payload — the second grid paste never reaches the
+    # server at all. AppTest writes widget state directly so it can't see that
+    # front-end filter, but it can catch the index regression that triggers it.
+    assert isinstance(at.session_state[seed_key].index, pd.RangeIndex)
+
     # A further run must be stable — no repeated rows, no renumbering churn.
     at.run()
     assert _editor_frame(at)["#"].tolist() == ["1", "2", "3", "", "", "4", "5", "6"]
@@ -123,3 +132,43 @@ def test_rows_pasted_into_the_grid_are_numbered(tmp_path, monkeypatch):
     _edit_grid(at, edited_rows={"0": {"FG SKU": "BOSS70-012"}})
     assert at.session_state[rev_key] == rev
     assert _editor_frame(at)["#"].tolist() == ["1", "2", "3", "", "4", "5", "6"]
+
+    # Deletions go through `df.drop`, which also leaves a non-range index.
+    assert isinstance(at.session_state[seed_key].index, pd.RangeIndex)
+
+
+def test_panel_add_keeps_an_accessory_only_row(tmp_path, monkeypatch):
+    """A row carrying only an accessory is numbered, so ➕ Add must not eat it.
+
+    The panel drops "blank" rows before appending; that notion of blank has to
+    match the row numberer's, or a row the table shows as line 2 disappears on
+    the next commit.
+    """
+    import core.usage_tracker as usage_tracker
+    monkeypatch.setattr(usage_tracker, "USAGE_LOG_PATH", tmp_path / "usage_log.jsonl")
+
+    at = AppTest.from_file(str(APP_PATH), default_timeout=300)
+    at.run()
+    _mode_radio(at).set_value(MANUAL_MODE).run()
+
+    seed_key = f"manual_seed_{LOCATION}"
+    at.session_state[seed_key] = pd.DataFrame({
+        "FG SKU": ["BOSS25-010", "", ""],
+        "Accessory SKU": ["", "BOSS25-A016", ""],
+        "Qty": [1, 1, 0],
+    })
+    at.run()
+    assert _editor_frame(at)["#"].tolist() == ["1", "2", ""]
+
+    # Commit another row through the panel.
+    at.sidebar.text_area[0].set_value("BOSS70-002\t\t3").run()
+    add = [b for b in at.sidebar.button if "Add" in (b.label or "")]
+    assert add, "the panel's ➕ Add button should be rendered once text is pasted"
+    add[0].click().run()
+    assert not at.exception
+
+    seed = at.session_state[seed_key]
+    assert "BOSS25-A016" in seed["Accessory SKU"].tolist(), (
+        "the accessory-only row was dropped by ➕ Add"
+    )
+    assert _editor_frame(at)["#"].tolist()[:3] == ["1", "2", "3"]

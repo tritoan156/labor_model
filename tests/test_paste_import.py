@@ -360,6 +360,21 @@ class TestRowNumbers:
         shown = app._manual_add_row_numbers(pd.DataFrame({"FG SKU": ["BOSS25-010", ""]}))
         assert shown["#"].tolist() == ["1", ""]
 
+    def test_output_always_carries_a_range_index(self):
+        # Load-bearing: st.data_editor grows a frame with `.loc` enlargement,
+        # leaving a plain Int64 index behind. Handed that back, Streamlit
+        # un-hides the index column and marks it required, and the front end
+        # then drops every row the user adds in the grid from the payload —
+        # which is what made the second paste vanish.
+        df, _ = parse("BOSS25-010\t1\nBOSS70-002\t1")
+        # How Streamlit actually materializes a row added in the grid.
+        poisoned = df.copy()
+        poisoned.loc[len(poisoned)] = ["SDG25", "", 1]
+        assert not isinstance(poisoned.index, pd.RangeIndex)
+        shown = app._manual_add_row_numbers(poisoned)
+        assert isinstance(shown.index, pd.RangeIndex)
+        assert shown["#"].tolist() == ["1", "2", "3"]
+
     def test_drop_is_a_clean_round_trip(self):
         df, _ = parse("BOSS25-010\tBOSS25-A016\t4")
         back = app._manual_drop_row_numbers(app._manual_add_row_numbers(df))

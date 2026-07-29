@@ -2844,16 +2844,49 @@ _PASTE_MONTH_RE = re.compile(r"^[A-Z]{3,9}[ -]\d{2,4}$|^\d{2,4}[ -][A-Z]{3,9}$",
 _PASTE_COLUMNS = ["FG SKU", "Accessory SKU", "Qty"]
 
 # Display-only line number on the manual-entry table. It's regenerated from
-# row order every render — never read back out of the editor — so pasting,
-# adding, deleting, or reordering rows always leaves 1..N intact.
+# row content every render — never read back out of the editor — so pasting,
+# adding, or deleting rows always leaves the count correct.
 _MANUAL_ROW_NO = "#"
 
 
+def _manual_row_has_content(df) -> pd.Series:
+    """True for rows carrying an FG SKU or an Accessory SKU.
+
+    Quantity deliberately doesn't count: a row someone has half-filled is
+    still a row, and a blank one shouldn't take a line number.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.Series([], dtype=bool)
+
+    def _filled(col: str) -> pd.Series:
+        if col not in df.columns:
+            return pd.Series(False, index=df.index)
+        return df[col].fillna("").astype(str).str.strip() != ""
+
+    return _filled("FG SKU") | _filled("Accessory SKU")
+
+
 def _manual_add_row_numbers(df) -> pd.DataFrame:
-    """Return a display copy of the manual entries with a leading `#` column."""
+    """Return a display copy of the manual entries with a leading `#` column.
+
+    Only rows with a SKU in them are numbered — blank rows (the trailing
+    spares, or a gap left mid-table) get an empty cell and don't consume a
+    number, so the sequence always matches the rows that will actually build.
+    Values are strings so an unnumbered row renders empty instead of as a
+    `None` the editor would flag.
+    """
     out = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=_PASTE_COLUMNS)
     out = out.drop(columns=[_MANUAL_ROW_NO], errors="ignore")
-    out.insert(0, _MANUAL_ROW_NO, range(1, len(out) + 1))
+
+    numbers: list[str] = []
+    seq = 0
+    for has_content in _manual_row_has_content(out):
+        if has_content:
+            seq += 1
+            numbers.append(str(seq))
+        else:
+            numbers.append("")
+    out.insert(0, _MANUAL_ROW_NO, numbers)
     return out
 
 
@@ -3996,19 +4029,22 @@ def render_sidebar() -> dict:
 
         # Render the data_editor with a rev-suffixed key so a fresh seed
         # is picked up after each programmatic add.
+        shown_entries = _manual_add_row_numbers(st.session_state[seed_key])
         manual_entries = st.sidebar.data_editor(
-            _manual_add_row_numbers(st.session_state[seed_key]),
+            shown_entries,
             use_container_width=True,
             num_rows="dynamic",
             key=f"manual_entries_{location}_v{st.session_state[rev_key]}",
             column_config={
-                _MANUAL_ROW_NO: st.column_config.NumberColumn(
+                _MANUAL_ROW_NO: st.column_config.TextColumn(
                     _MANUAL_ROW_NO,
                     width=44,
                     disabled=True,
                     help=(
-                        "Line number — filled in automatically as rows are "
-                        "pasted or added, and renumbered if you delete one."
+                        "Line number — assigned automatically to every row "
+                        "that has a SKU in it, whether you paste it or type "
+                        "it. Blank rows aren't numbered, and deleting a row "
+                        "renumbers the rest."
                     ),
                 ),
                 "FG SKU": st.column_config.TextColumn("FG SKU", help="e.g. BOSS25-006"),
@@ -4024,6 +4060,23 @@ def render_sidebar() -> dict:
         # the schedule builder, a saved scenario, or the next paste append.
         manual_entries = _manual_drop_row_numbers(manual_entries)
         st.session_state[seed_key] = manual_entries
+
+        # Rows pasted, added, deleted, or typed straight into the grid live in
+        # the editor's own widget state, which Streamlit replays over the frame
+        # we pass in — the `#` column we numbered above describes the frame as
+        # it was BEFORE those edits, so a new row would render unnumbered no
+        # matter what we do here. Once the edits have been folded into the seed
+        # above, retire that widget state by bumping the revision: the next
+        # render builds a fresh editor from the seed alone and every row that
+        # has a SKU in it gets its number.
+        #
+        # Keyed on which rows have content rather than on row count, so filling
+        # a blank row in place renumbers too — and so editing a SKU that's
+        # already there costs no extra rerun.
+        if (_manual_row_has_content(shown_entries).tolist()
+                != _manual_row_has_content(manual_entries).tolist()):
+            st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
+            st.rerun()
 
     # Plan month — the authoritative month for the whole tool. It drives:
     #   • where auto-spread drops undated rows (target month),
@@ -4405,7 +4458,7 @@ Pick **✏️ Paste or type SKUs** in step 2, open **📋 Paste a list from Exce
 
 Column order doesn't matter — pasted SKUs are matched against the catalogs to work out which column is which, and a header row (`FG SKU ID`, `Qty`, …) is understood if you copied one. Extra columns like LOCATION or CUSTOMER are ignored. The preview shows what was read before anything is committed; then **➕ Add** appends to what's already there and **🔁 Replace** starts over. Either way the rows land in the editable table below, so you can still fix a SKU or add a few more by hand.
 
-The table's **`#`** column numbers the rows for you — pasted rows continue the count, and deleting a row closes the gap. It's display-only: it isn't part of the schedule and isn't saved with a scenario.
+The table's **`#`** column numbers the rows for you. A row takes the next number as soon as it has an FG SKU or an Accessory SKU in it — however it got there (pasted through the panel, pasted straight into the table, or typed by hand). Blank rows stay unnumbered and don't consume a number, and deleting a row closes the gap. It's display-only: it isn't part of the schedule and isn't saved with a scenario.
 
 **Where to find common features**
 

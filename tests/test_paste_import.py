@@ -257,20 +257,69 @@ class TestEmptyAndJunk:
         assert len(df) <= 1
 
 
+def table(rows):
+    """Build a manual-entry table from (fg, acc, qty) tuples."""
+    return pd.DataFrame(
+        [{"FG SKU": fg, "Accessory SKU": acc, "Qty": qty} for fg, acc, qty in rows],
+        columns=["FG SKU", "Accessory SKU", "Qty"],
+    )
+
+
 class TestRowNumbers:
-    """The manual table's `#` column is display-only and rebuilt every render."""
+    """The manual table's `#` column is display-only and rebuilt every render.
+
+    Rule: a row counts (and takes the next number) when it has an FG SKU or an
+    Accessory SKU. Anything else is blank — no number, no placeholder.
+    """
 
     def test_numbers_from_one_in_the_first_column(self):
         df, _ = parse("BOSS25-010\t1\nBOSS70-002\t2\nSDG25\t3")
         shown = app._manual_add_row_numbers(df)
         assert list(shown.columns) == ["#", "FG SKU", "Accessory SKU", "Qty"]
-        assert shown["#"].tolist() == [1, 2, 3]
+        assert shown["#"].tolist() == ["1", "2", "3"]
+
+    def test_blank_rows_get_no_number(self):
+        shown = app._manual_add_row_numbers(table([
+            ("BOSS25-010", "", 1),
+            ("", "", 0),
+            ("", "", 0),
+        ]))
+        assert shown["#"].tolist() == ["1", "", ""]
+
+    def test_blank_rows_dont_consume_a_number(self):
+        # A gap mid-table must not push the following row's number up.
+        shown = app._manual_add_row_numbers(table([
+            ("BOSS25-010", "", 1),
+            ("", "", 0),
+            ("BOSS70-002", "", 1),
+        ]))
+        assert shown["#"].tolist() == ["1", "", "2"]
+
+    def test_accessory_only_row_still_counts(self):
+        shown = app._manual_add_row_numbers(table([
+            ("", "BOSS25-A016", 1),
+            ("BOSS70-002", "", 1),
+        ]))
+        assert shown["#"].tolist() == ["1", "2"]
+
+    def test_row_with_sku_but_no_qty_still_counts(self):
+        shown = app._manual_add_row_numbers(table([("BOSS25-010", "", 0)]))
+        assert shown["#"].tolist() == ["1"]
+
+    def test_whitespace_only_cells_count_as_blank(self):
+        shown = app._manual_add_row_numbers(table([("   ", "  ", 0), ("BOSS25-010", "", 1)]))
+        assert shown["#"].tolist() == ["", "1"]
+
+    def test_none_cells_count_as_blank(self):
+        # Rows the editor adds client-side arrive with None in every column.
+        shown = app._manual_add_row_numbers(table([(None, None, None), ("BOSS25-010", None, 1)]))
+        assert shown["#"].tolist() == ["", "1"]
 
     def test_renumbering_is_idempotent(self):
         df, _ = parse("BOSS25-010\t1\nBOSS70-002\t1")
         once = app._manual_add_row_numbers(df)
         twice = app._manual_add_row_numbers(once)
-        assert twice["#"].tolist() == [1, 2]
+        assert twice["#"].tolist() == ["1", "2"]
         assert list(twice.columns) == list(once.columns)
 
     def test_appended_rows_continue_the_count(self):
@@ -278,16 +327,24 @@ class TestRowNumbers:
         first, _ = parse("BOSS25-010\t1\nBOSS70-002\t1")
         second, _ = parse("SDG25\t1\nBOSS125-001\t1")
         combined = pd.concat([first, second], ignore_index=True)
-        assert app._manual_add_row_numbers(combined)["#"].tolist() == [1, 2, 3, 4]
+        assert app._manual_add_row_numbers(combined)["#"].tolist() == ["1", "2", "3", "4"]
+
+    def test_rows_pasted_under_trailing_blanks_are_numbered(self):
+        # What an in-grid paste leaves behind: content rows, the spare blanks
+        # the last commit added, then the newly pasted rows.
+        shown = app._manual_add_row_numbers(table([
+            ("BOSS25-010", "", 1),
+            ("", "", 0),
+            ("", "", 0),
+            ("PDS185EZ-002", "", 1),
+            ("PDS185EZ-002", "", 1),
+        ]))
+        assert shown["#"].tolist() == ["1", "", "", "2", "3"]
 
     def test_deleting_a_row_closes_the_gap(self):
         df, _ = parse("BOSS25-010\t1\nBOSS70-002\t1\nSDG25\t1")
         remaining = df.drop(index=1).reset_index(drop=True)
-        assert app._manual_add_row_numbers(remaining)["#"].tolist() == [1, 2]
-
-    def test_blank_rows_are_numbered_too(self):
-        blanks = pd.DataFrame({"FG SKU": ["", ""], "Accessory SKU": ["", ""], "Qty": [0, 0]})
-        assert app._manual_add_row_numbers(blanks)["#"].tolist() == [1, 2]
+        assert app._manual_add_row_numbers(remaining)["#"].tolist() == ["1", "2"]
 
     def test_empty_frame_keeps_its_columns(self):
         shown = app._manual_add_row_numbers(pd.DataFrame(columns=["FG SKU", "Accessory SKU", "Qty"]))
@@ -298,6 +355,10 @@ class TestRowNumbers:
         shown = app._manual_add_row_numbers(None)
         assert list(shown.columns) == ["#", "FG SKU", "Accessory SKU", "Qty"]
         assert shown.empty
+
+    def test_missing_columns_dont_raise(self):
+        shown = app._manual_add_row_numbers(pd.DataFrame({"FG SKU": ["BOSS25-010", ""]}))
+        assert shown["#"].tolist() == ["1", ""]
 
     def test_drop_is_a_clean_round_trip(self):
         df, _ = parse("BOSS25-010\tBOSS25-A016\t4")
@@ -317,6 +378,19 @@ class TestRowNumbers:
                                       location="Henderson", machine_skus=set(MACHINE))
         assert "#" not in sched.columns
         assert sched.iloc[0]["BUILD QTY"] == 2
+
+    def test_numbered_rows_match_what_actually_builds(self):
+        from core.data_loader import build_manual_schedule
+        entries = table([
+            ("BOSS25-010", "", 1),
+            ("", "", 0),
+            ("BOSS70-002", "", 2),
+            ("", "", 0),
+        ])
+        numbered = [n for n in app._manual_add_row_numbers(entries)["#"] if n]
+        sched = build_manual_schedule(entries, location="Henderson",
+                                      machine_skus=set(MACHINE))
+        assert len(numbered) == len(sched) == 2
 
 
 class TestDownstreamContract:

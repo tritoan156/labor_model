@@ -118,7 +118,11 @@ The panel previews exactly what it read: row and unit counts, which column becam
 
 Then **➕ Add** appends to the table below and **🔁 Replace** starts fresh. Either way the rows land in the normal manual-entry table, so you can still fix a SKU, change a quantity, or add a few more by hand — and save the result as a named scenario.
 
-The table's **`#`** column is a line number, filled in automatically: pasted rows continue the count from whatever is already there, and deleting a row closes the gap. It's display-only — it isn't part of the schedule and isn't saved with a scenario.
+### The `#` column
+
+The table numbers its own rows. A row takes the next number as soon as it has an **FG SKU or an Accessory SKU** in it; a row with neither stays blank and doesn't consume a number, so the count always matches the rows that will actually build.
+
+That holds however the row arrived — pasted through the panel, pasted straight into the table from Excel, or typed in by hand — and deleting a row closes the gap rather than leaving a hole. The column is display-only: it isn't part of the schedule and isn't saved with a scenario.
 
 ---
 

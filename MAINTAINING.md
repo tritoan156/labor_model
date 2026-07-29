@@ -299,7 +299,11 @@ thresholds, battery demand, and the `app.py` helpers `_fmt_min_hr` /
 `_max_units_at_current_mix`. `tests/test_paste_import.py` covers the
 paste-from-Excel parser (`_parse_pasted_skus`) — delimiter and header
 detection, column guessing, quantity handling, and the formula-injection
-guard. Several tests are explicit regression guards for
+guard — plus the manual table's `#` numbering helpers.
+`tests/test_manual_editor_rows.py` drives the whole app through Streamlit's
+`AppTest` harness to cover row numbering against the data_editor's own widget
+state (rows pasted or typed straight into the grid); it's the slowest file in
+the suite at a few seconds, because each step is a full app run. Several tests are explicit regression guards for
 audit fixes (e.g. `get_battery_type` case-normalization, `_fmt_min_hr` NaN/Inf,
 `Crew=0`/`Conc=0` capacity edge cases). If you change a formula on purpose,
 update the matching expected value in `tests/` in the same commit.

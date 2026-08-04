@@ -194,3 +194,6 @@ SDG45-A004,,,,,,,,,,,2026-08-04,,,,,,,,,,,,,,,
 BOSS25-008 HERC,"EBOSS 25-25 REV B HYBRID DUAL AXLE SURGE TRAILER 3"" RING HITCH ASSEMBLY FOR HERC",,,,,,,,,,2026-08-04,,,,GenAcc,,,,,,,,,,,
 BOSS25-018ES,"EBOSS 25-25 HYBRID DUAL AXLE SURGE TRAILER 3"" RING HITCH ASSEMBLY ES",10.0,20.0,120.0,120.0,90.0,30.0,30.0,,1.0,2026-08-04,,,,GenAcc,,,,,,,,,,,
 BOSS25-10,"EBOSS 25-25 HYBRID DUAL AXLE SURGE TRAILER MOD 3"" RING HITCH ASSEMBLY",10.0,10.0,120.0,120.0,90.0,60.0,30.0,,1.0,2026-08-04,,,,GenAcc,,,,,,,,,,,
+SDG40S XXX,SDG40S ESTIMATION ASSEMBLY,5.0,0.0,90.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-08-04,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
+SDG45S XXX,SDG45S ESTIMATION ASSEMBLY,5.0,0.0,90.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-08-04,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
+SDG220S XXX,SDG220S ESTIMATION ASSEMBLY,5.0,0.0,240.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-08-04,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage

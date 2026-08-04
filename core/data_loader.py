@@ -691,14 +691,21 @@ def _apply_placeholder_recovery(
         {"count": int,
          "by_model": {model_type: (placeholder_sku, n), ...},
          "unmatched": {model_type: n, ...},
+         "no_model": int,
          "acc_count": int,
          "acc_by_model": {model_type: (accessory_sku, n), ...}}
+
+    ``no_model`` counts SKU-less rows that carry no MODEL TYPE either. They
+    can't be matched to any placeholder and are dropped like the ``unmatched``
+    ones, but they're tallied separately because the fix differs: there's no
+    model to add an ``XXX`` placeholder for, so the planner has to fill in the
+    row itself. Counting them keeps every dropped unit visible in the UI.
 
     No-op (zeros) when there's no map, or no MODEL TYPE / FG SKU ID / BUILD QTY
     column to work with.
     """
     summary: dict = {
-        "count": 0, "by_model": {}, "unmatched": {},
+        "count": 0, "by_model": {}, "unmatched": {}, "no_model": 0,
         "acc_count": 0, "acc_by_model": {},
     }
     if not placeholder_map:
@@ -725,18 +732,29 @@ def _apply_placeholder_recovery(
         df["FG ACCRY SKU ID"] = df["FG ACCRY SKU ID"].astype(object)
 
     for idx in candidates:
+        # Every tally below is in *units* (BUILD QTY), not rows — a dropped row
+        # carrying qty 3 has to report 3, or the warning under-states the gap
+        # between the CSV's unit total and the plan's.
+        try:
+            n_units = int(qty.at[idx])
+        except (TypeError, ValueError):
+            n_units = 1
         model_raw = df.at[idx, model_col]
         model = str(model_raw).strip() if model_raw is not None else ""
         if model.lower() in ("", "nan", "none"):
-            continue  # no model to match on — leave it to be dropped
+            # No model to match on — dropped. Tallied separately from
+            # `unmatched` (no model name to add a placeholder for) so the UI can
+            # still account for the units instead of losing them silently.
+            summary["no_model"] += n_units
+            continue
         sku = placeholder_map.get(_norm_model_key(model))
         if not sku:
-            summary["unmatched"][model] = summary["unmatched"].get(model, 0) + 1
+            summary["unmatched"][model] = summary["unmatched"].get(model, 0) + n_units
             continue
         df.at[idx, "FG SKU ID"] = sku
-        summary["count"] += 1
+        summary["count"] += n_units
         prev = summary["by_model"].get(model)
-        summary["by_model"][model] = (sku, (prev[1] + 1) if prev else 1)
+        summary["by_model"][model] = (sku, (prev[1] + n_units) if prev else n_units)
 
         # Accessory side: pair with the `{stem} AXXX` accessory placeholder when
         # the unit's FG ACCRY SKU ID is blank and that placeholder is cataloged.
@@ -747,9 +765,11 @@ def _apply_placeholder_recovery(
                 cur_blank = (cur is None) or (str(cur).strip().lower() in ("", "nan", "none"))
                 if cur_blank:
                     df.at[idx, "FG ACCRY SKU ID"] = acc_sku
-                    summary["acc_count"] += 1
+                    summary["acc_count"] += n_units
                     aprev = summary["acc_by_model"].get(model)
-                    summary["acc_by_model"][model] = (acc_sku, (aprev[1] + 1) if aprev else 1)
+                    summary["acc_by_model"][model] = (
+                        acc_sku, (aprev[1] + n_units) if aprev else n_units,
+                    )
     return summary
 
 

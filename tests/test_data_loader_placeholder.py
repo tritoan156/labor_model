@@ -117,9 +117,12 @@ class TestPlaceholderRecovery:
         assert rec["count"] == 0
         assert rec["unmatched"] == {"SDG40S": 1}
 
-    def test_blank_model_type_is_skipped(self, tmp_path):
-        # A SKU-less row with no MODEL TYPE can't be matched and shouldn't be
-        # counted as "unmatched" noise — it's just dropped.
+    def test_blank_model_type_is_counted_as_no_model(self, tmp_path):
+        # A SKU-less row with no MODEL TYPE can't be matched, so it's dropped —
+        # but it must not vanish silently, or the plan total comes up short
+        # against the source CSV with nothing to explain the gap. It's tallied
+        # under `no_model` rather than polluting `unmatched` (which is keyed by
+        # model name so the UI can suggest adding an `XXX` placeholder).
         rows = [
             {"LOCATION": "HENDERSON", "FG SKU ID": "", "FG ACCRY SKU ID": "",
              "BUILD QTY": "1", "PRODUCTION MONTH": "Jul-26", "MODEL TYPE": ""},
@@ -127,10 +130,35 @@ class TestPlaceholderRecovery:
         p = _write_schedule(tmp_path, rows)
         pmap = build_placeholder_map(_catalog())
         df = load_schedule(p, location="HENDERSON", placeholder_map=pmap)
+        assert len(df) == 0
         rec = df.attrs["placeholder_recovered"]
         assert rec["count"] == 0
         assert rec["by_model"] == {}
         assert rec["unmatched"] == {}
+        assert rec["no_model"] == 1
+
+    def test_dropped_tallies_are_in_units_not_rows(self, tmp_path):
+        # A dropped row carrying BUILD QTY 3 accounts for 3 missing units, not
+        # 1 — otherwise the warning under-states the gap it exists to explain.
+        rows = [
+            {"LOCATION": "HENDERSON", "FG SKU ID": "", "FG ACCRY SKU ID": "",
+             "BUILD QTY": "3", "PRODUCTION MONTH": "Jul-26", "MODEL TYPE": "SDG40S"},
+            {"LOCATION": "HENDERSON", "FG SKU ID": "", "FG ACCRY SKU ID": "",
+             "BUILD QTY": "2", "PRODUCTION MONTH": "Jul-26", "MODEL TYPE": ""},
+            {"LOCATION": "HENDERSON", "FG SKU ID": "", "FG ACCRY SKU ID": "",
+             "BUILD QTY": "4", "PRODUCTION MONTH": "Jul-26", "MODEL TYPE": "EBOSS25-25 Hybrid"},
+        ]
+        p = _write_schedule(tmp_path, rows)
+        pmap = build_placeholder_map(_catalog())
+        df = load_schedule(p, location="HENDERSON", placeholder_map=pmap,
+                           acc_skus={"BOSS25-25 AXXX"})
+        rec = df.attrs["placeholder_recovered"]
+        assert rec["unmatched"] == {"SDG40S": 3}
+        assert rec["no_model"] == 2
+        assert rec["count"] == 4
+        assert rec["by_model"]["EBOSS25-25 Hybrid"] == ("BOSS25-25 XXX", 4)
+        assert rec["acc_count"] == 4
+        assert rec["acc_by_model"]["EBOSS25-25 Hybrid"] == ("BOSS25-25 AXXX", 4)
 
     def test_zero_qty_skuless_row_is_not_recovered(self, tmp_path):
         # A 0-qty phantom must never be resurrected by recovery.

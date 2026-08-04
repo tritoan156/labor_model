@@ -11,6 +11,7 @@ from core.data_loader import (
     build_placeholder_map,
     load_schedule,
     _norm_model_key,
+    _lookup_placeholder,
     _accessory_counterpart,
 )
 
@@ -53,6 +54,37 @@ class TestNormModelKey:
     def test_handles_blank_and_none(self):
         assert _norm_model_key("") == ""
         assert _norm_model_key(None) == "NONE"  # str(None) -> "NONE"; harmless
+
+
+class TestLookupPlaceholder:
+    """Facilities disagree on the generator suffix — Spartanburg writes
+    ``SDG45S``, Henderson writes ``SDG65`` — so the lookup retries with the
+    trailing ``S`` toggled rather than dropping the odd one out."""
+
+    MAP = {"SDG65S": "SDG65S XXX", "SDG40": "SDG40 XXX", "BOSS2525HYBRID": "BOSS25-25 XXX"}
+
+    def test_exact_key_wins(self):
+        assert _lookup_placeholder("SDG65S", self.MAP) == "SDG65S XXX"
+
+    def test_missing_trailing_s_still_matches(self):
+        # Catalog has SDG65S; the schedule says SDG65.
+        assert _lookup_placeholder("SDG65", self.MAP) == "SDG65S XXX"
+
+    def test_extra_trailing_s_still_matches(self):
+        # Catalog has SDG40; the schedule says SDG40S.
+        assert _lookup_placeholder("SDG40S", self.MAP) == "SDG40 XXX"
+
+    def test_unrelated_model_still_misses(self):
+        assert _lookup_placeholder("SDG99", self.MAP) is None
+
+    def test_eboss_prefix_is_not_mauled_by_the_s_retry(self):
+        # Load-bearing: _norm_model_key collapses EBOSS->BOSS, so a naive
+        # trailing-S strip inside normalization would turn BOSS into BOS.
+        assert _lookup_placeholder("EBOSS25-25 Hybrid", self.MAP) == "BOSS25-25 XXX"
+
+    def test_blank_and_empty_map(self):
+        assert _lookup_placeholder("", self.MAP) is None
+        assert _lookup_placeholder("SDG65S", {}) is None
 
 
 class TestBuildPlaceholderMap:

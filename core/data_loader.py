@@ -805,6 +805,7 @@ def load_schedule(
     machine_skus: set | None = None,
     placeholder_map: dict | None = None,
     acc_skus: set | None = None,
+    absorb_foreign_locations: bool = False,
 ) -> pd.DataFrame:
     """Load production schedule CSV → DataFrame.
 
@@ -814,6 +815,13 @@ def load_schedule(
     Filters to the given location. Month filtering is auto-detected from the
     data so any schedule month works without code changes.
     Strips customer suffixes (HRC/UR/ES/HERC) when machine_skus is provided.
+
+    ``absorb_foreign_locations`` folds rows tagged with a *different* facility
+    into ``location`` instead of excluding them. A per-plant export sometimes
+    uses LOCATION for where the unit is headed rather than where it's built, so
+    those rows are this plant's work. Off by default: applied to a genuinely
+    multi-plant file it would pull every other plant's schedule into this one's
+    numbers. What it moved is reported via ``.attrs["foreign_location_recovered"]``.
 
     Robust to real-world Excel exports:
     - Case-insensitive substring matching on the 5 required column names so
@@ -888,15 +896,44 @@ def load_schedule(
     # planned unit the scheduler simply didn't tag with a facility — fold it
     # into the active facility so it's counted, instead of dropping it silently
     # (mirrors the undated-row and SKU-less-row rescues below). Rows tagged with
-    # a *different* explicit facility are still excluded. Record the rescue so
-    # the UI can warn which units moved.
+    # a *different* explicit facility are excluded unless
+    # ``absorb_foreign_locations`` says otherwise. Record the rescue so the UI
+    # can warn which units moved.
     location_recovered = {
         "count": 0, "rows": 0, "assigned_location": "", "by_fg": {},
+    }
+    foreign_location_recovered = {
+        "count": 0, "rows": 0, "assigned_location": "", "by_location": {}, "by_fg": {},
     }
     if location:
         loc_target = location.upper()
         blank_loc = df["LOC"].isin(["", "NAN", "NONE"])
         keep_loc = (df["LOC"] == loc_target) | blank_loc
+        # A combined per-plant export can carry rows tagged with a *different*
+        # facility that are nonetheless built here — the LOCATION cell records
+        # where the unit is headed, not where it's assembled. Opt-in, because
+        # the same fold applied to a genuinely multi-plant file would silently
+        # pull another plant's whole schedule into this one's numbers.
+        foreign_loc = ~blank_loc & (df["LOC"] != loc_target)
+        if absorb_foreign_locations and foreign_loc.any():
+            _ffg = df.loc[foreign_loc, "FG_RAW"].astype(str)
+            _floc = df.loc[foreign_loc, "LOC"].astype(str)
+            foreign_location_recovered = {
+                "count": int(df.loc[foreign_loc, "BUILD QTY"].sum()),
+                "rows": int(foreign_loc.sum()),
+                "assigned_location": location,
+                "by_location": {
+                    str(k): int(v)
+                    for k, v in df.loc[foreign_loc, "BUILD QTY"].groupby(_floc).sum().items()
+                },
+                "by_fg": {
+                    str(k): int(v)
+                    for k, v in df.loc[foreign_loc, "BUILD QTY"].groupby(_ffg).sum().items()
+                },
+            }
+            df.loc[foreign_loc, "LOCATION"] = location
+            df.loc[foreign_loc, "LOC"] = loc_target
+            keep_loc = keep_loc | foreign_loc
         if blank_loc.any():
             _fg = df.loc[blank_loc, "FG_RAW"].astype(str)
             location_recovered = {
@@ -1010,6 +1047,7 @@ def load_schedule(
     df.attrs["placeholder_recovered"] = _recovered
     df.attrs["unscheduled_recovered"] = unscheduled
     df.attrs["location_recovered"] = location_recovered
+    df.attrs["foreign_location_recovered"] = foreign_location_recovered
     return df
 
 

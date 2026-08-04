@@ -1122,6 +1122,12 @@ def _load_schedule_df(
     # Accessory SKU set for auto-stripping customer-decal suffixes on load.
     acc_skus = set(acc_df_full["SKU"].astype(str))
 
+    # Rows tagged with a *different* facility: a per-plant export sometimes uses
+    # LOCATION for where the unit is headed rather than where it's assembled, so
+    # they're this plant's work. Sidebar checkbox (default on); what it actually
+    # moved is reported back so the planner sees it.
+    _absorb_foreign = bool(st.session_state.get("absorb_foreign_loc", True))
+
     # The Plan-month picker is authoritative — show it on the confirmation pill
     # (and use it for auto-spread) rather than the CSV's own PRODUCTION MONTH.
     _plan_label = ""
@@ -1147,6 +1153,10 @@ def _load_schedule_df(
             df.attrs.get("location_recovered")
             if df is not None and hasattr(df, "attrs") else None
         )
+        _foreign = (
+            df.attrs.get("foreign_location_recovered")
+            if df is not None and hasattr(df, "attrs") else None
+        )
         if df is not None and not df.empty:
             # Auto-clean customer-decal suffixes (e.g. BOSS70-001HRC →
             # BOSS70-001) on every load so the suffixed text never leaks into
@@ -1162,7 +1172,8 @@ def _load_schedule_df(
             )
         _stash_upload_summary(df, location, source=source,
                               plan_month_label=_plan_label, recovered=_recovered,
-                              unscheduled=_unscheduled, location_recovered=_location)
+                              unscheduled=_unscheduled, location_recovered=_location,
+                              foreign_location=_foreign)
         return df
 
     # Resolution order. NOTE: the previously-loaded schedule must survive
@@ -1190,6 +1201,7 @@ def _load_schedule_df(
         df = load_schedule(
             io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
             placeholder_map=placeholder_map, acc_skus=acc_skus,
+            absorb_foreign_locations=_absorb_foreign,
         )
         return _finalize(df, st.session_state["_active_schedule_source"])
 
@@ -1207,6 +1219,7 @@ def _load_schedule_df(
             df = load_schedule(
                 io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
                 placeholder_map=placeholder_map, acc_skus=acc_skus,
+                absorb_foreign_locations=_absorb_foreign,
             )
             return _finalize(df, "upload")
         # Same file as before → fall through to the persisted active schedule.
@@ -1217,6 +1230,7 @@ def _load_schedule_df(
         df = load_schedule(
             io.BytesIO(active), location=location, machine_skus=machine_skus,
             placeholder_map=placeholder_map, acc_skus=acc_skus,
+            absorb_foreign_locations=_absorb_foreign,
         )
         return _finalize(df, st.session_state.get("_active_schedule_source", "saved"))
 
@@ -1224,6 +1238,7 @@ def _load_schedule_df(
     df = load_schedule(
         location=location, machine_skus=machine_skus,
         placeholder_map=placeholder_map, acc_skus=acc_skus,
+        absorb_foreign_locations=_absorb_foreign,
     )
     return _finalize(df, "bundled")
 
@@ -1231,7 +1246,8 @@ def _load_schedule_df(
 def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
                           plan_month_label: str = "", recovered: dict | None = None,
                           unscheduled: dict | None = None,
-                          location_recovered: dict | None = None) -> None:
+                          location_recovered: dict | None = None,
+                          foreign_location: dict | None = None) -> None:
     """Save a one-line description of the just-loaded schedule into session
     state so the sidebar can echo it back to the planner as a green
     confirmation pill. No-op when the DataFrame is empty (caller already
@@ -1268,6 +1284,7 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
             "recovered": recovered,
             "unscheduled": unscheduled,
             "location_recovered": location_recovered,
+            "foreign_location": foreign_location,
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
@@ -3885,6 +3902,22 @@ def render_sidebar() -> dict:
             "🔒 Uploaded schedules stay in your browser by default. "
             "Use the 📂 panel below to save one to GitHub for the team."
         )
+        # A per-plant export can tag a row with the facility the unit is headed
+        # to rather than the one building it (the Henderson sheet carries rows
+        # marked Spartanburg that Henderson actually builds). Default on so
+        # those units are counted; the warning below always names what moved,
+        # and unticking restores strict LOCATION filtering for a genuinely
+        # multi-plant file.
+        st.sidebar.checkbox(
+            f"Count rows tagged for another plant as **{location}**",
+            value=True, key="absorb_foreign_loc",
+            help=(
+                "On: a row whose LOCATION names a different facility is still "
+                f"built at {location} and counted here — use this when LOCATION "
+                "records where the unit is going, not where it's assembled. "
+                "Off: only rows tagged for this facility (or untagged) count."
+            ),
+        )
 
         # Save / load / delete uploaded schedules (per-facility, shared)
         _render_uploaded_schedules_panel(location, uploaded)
@@ -3998,6 +4031,23 @@ def render_sidebar() -> dict:
             # Untagged location — rows with a valid SKU/qty but a blank LOCATION
             # cell were folded into the active facility so they're counted, not
             # silently dropped by the location filter.
+            # Rows tagged for a different plant that were folded into this one
+            # (the "Count rows tagged for another plant" checkbox). Always
+            # reported — this one moves units the LOCATION column explicitly
+            # assigned elsewhere, so it must never happen quietly.
+            _fgn = _summary.get("foreign_location")
+            if isinstance(_fgn, dict) and _fgn.get("count"):
+                _plist = "; ".join(
+                    f"{_n} tagged **{_p.title()}**"
+                    for _p, _n in (_fgn.get("by_location") or {}).items()
+                )
+                st.sidebar.warning(
+                    f"🏭 {_fgn['count']} unit(s) tagged for another plant were "
+                    f"counted as **{_fgn.get('assigned_location') or location}** "
+                    f"({_plist}). Untick **Count rows tagged for another plant** "
+                    f"above if they should be excluded instead."
+                )
+
             _loc = _summary.get("location_recovered")
             if isinstance(_loc, dict) and _loc.get("count"):
                 _flist = "; ".join(

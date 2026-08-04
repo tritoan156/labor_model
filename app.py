@@ -49,6 +49,14 @@ import core.data_loader
 import core.labor_calculator
 
 # Step 2: detect staleness via sentinels for names/params added in recent pushes.
+#
+# MAINTENANCE: whenever you add a new name to a `core.*` module — or a new
+# parameter that app.py passes by keyword — add it here, and prefer replacing
+# the previous sentinel for that module over piling another one on (the newest
+# addition implies every older one). Miss this and a warm Streamlit Cloud
+# process pairs the NEW app.py with the OLD module: the reload is skipped
+# because the stale sentinel still passes, and the first call using the new
+# parameter dies with a bare `TypeError: unexpected keyword argument`.
 _stale = (
     not hasattr(core.constants, "SUPPORT_ROLES")
     or not hasattr(core.labor_calculator, "executive_summary")
@@ -56,7 +64,8 @@ _stale = (
         core.labor_calculator.executive_summary).parameters
     or not hasattr(core.data_loader, "ScheduleColumnError")
     or not hasattr(core.data_loader, "build_placeholder_map")
-    or "acc_skus" not in _inspect.signature(
+    or not hasattr(core.data_loader, "_lookup_placeholder")
+    or "absorb_foreign_locations" not in _inspect.signature(
         core.data_loader.load_schedule).parameters
     or "efficiency" not in getattr(
         core.facility_settings_storage, "DEFAULT_SETTINGS", {})

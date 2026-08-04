@@ -3957,6 +3957,19 @@ def render_sidebar() -> dict:
                         f"Add an `XXX` placeholder for these models (Data & Setup → "
                         f"Machine catalog) or fill in real SKUs, then re-upload."
                     )
+                # Rows with neither an FG SKU ID nor a MODEL TYPE can't be
+                # matched to anything, so they're dropped too. Warn separately —
+                # there's no model to add a placeholder for, so the only fix is
+                # to fill the row in — but never silently, or the plan total
+                # comes up short against the source file with no explanation.
+                _nomodel = int(_rec.get("no_model") or 0)
+                if _nomodel:
+                    st.sidebar.warning(
+                        f"⚠️ {_nomodel} unit(s) had no **FG SKU ID** and no "
+                        f"**MODEL TYPE**, so there was nothing to identify them by "
+                        f"and they were dropped. Fill in either column and "
+                        f"re-upload to include them."
+                    )
             # Undated units — rows with a valid SKU/qty but a blank or
             # unrecognized PRODUCTION MONTH (e.g. "NEED SN/QA") were folded into
             # the current plan month so they're counted, not silently dropped.
@@ -6850,6 +6863,9 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
     if renames:
         st.caption("🔁 Pending SKU rename(s): "
                    + ", ".join(f"`{o}` → `{n}`" for o, n in renames))
+    merge_approved = _render_rename_collisions(
+        renames, machine_df, key_prefix="fv_m", used_map=used_fg,
+    )
     _render_pending_changes(
         edited_cells, machine_df, editable_cols,
         text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
@@ -6861,7 +6877,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
             editable_cols=editable_cols,
             file_path="data/machine_clean.csv", label="machine",
             text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
-            renames=renames,
+            renames=renames, merge_approved=merge_approved,
         )
 
     _render_add_new_sku(
@@ -6980,6 +6996,9 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     if renames:
         st.caption("🔁 Pending SKU rename(s): "
                    + ", ".join(f"`{o}` → `{n}`" for o, n in renames))
+    merge_approved = _render_rename_collisions(
+        renames, acc_df, key_prefix="fv_a", used_map=used_acc,
+    )
     _render_pending_changes(edited_cells, acc_df, editable_cols, text_cols=["Description"])
 
     if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
@@ -6988,6 +7007,7 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
             editable_cols=editable_cols,
             file_path="data/acc_clean.csv", label="accessory",
             text_cols=["Description"], renames=renames,
+            merge_approved=merge_approved,
         )
 
     _render_add_new_sku(
@@ -7489,7 +7509,8 @@ def _compute_cell_diffs(edited, source_df, editable_cols, text_cols=None):
     return diffs
 
 
-def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols, renames=None):
+def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols, renames=None,
+                               merges=None):
     """Apply the cell-level diffs (and optional SKU renames) on top of
     `fresh_df` (from GitHub) and return CSV text.
 
@@ -7499,9 +7520,15 @@ def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols, renames=None):
     the old SKU first, then the SKU is changed). Stamps Last Modified for any
     row that changed.
 
-    Returns ``(csv_text, n_cell_rows_changed, n_renamed)``.
+    `merges` is a list of ``(old_sku, existing_sku)`` the planner confirmed are
+    typo-duplicates: the ``old_sku`` row is **deleted** and the ``existing_sku``
+    row already on file is kept untouched. Applied last, so a merged-away row
+    can't be resurrected by a later rename.
+
+    Returns ``(csv_text, n_cell_rows_changed, n_renamed, n_merged)``.
     """
     renames = renames or []
+    merges = merges or []
     today = today_local_str()
     if "Last Modified" not in fresh_df.columns:
         fresh_df["Last Modified"] = ""
@@ -7543,8 +7570,21 @@ def _apply_diffs_and_serialize(fresh_df, diffs, editable_cols, renames=None):
         fresh_df.at[idx, "__sku_norm"] = str(new_sku).strip()
         n_renamed += 1
 
+    # Confirmed typo-duplicates: drop the duplicate row, keep the SKU already
+    # on file exactly as it is. Deliberately NOT a value merge — the planner
+    # said the surviving row is the right one, so copying the typo row's labor
+    # over it would silently overwrite good data with the values they were
+    # trying to get rid of.
+    n_merged = 0
+    for old_sku, _existing_sku in merges:
+        mask = fresh_df["__sku_norm"] == str(old_sku).strip()
+        if not mask.any():
+            continue
+        fresh_df = fresh_df[~mask]
+        n_merged += 1
+
     fresh_df = fresh_df.drop(columns=["__sku_norm"])
-    return fresh_df.to_csv(index=False), len(changed_skus), n_renamed
+    return fresh_df.to_csv(index=False), len(changed_skus), n_renamed, n_merged
 
 
 def _read_fresh_csv(file_path: str, token: str) -> "tuple[pd.DataFrame, str | None]":
@@ -7635,17 +7675,100 @@ def _import_missing_skus_to_catalog(
     return added, skipped
 
 
-def _validate_renames(renames, fresh_df):
+def _rename_collisions(renames, source_df):
+    """Return the ``(old, new)`` renames whose target SKU already exists.
+
+    Used at *render* time (against the in-memory catalog) so the planner can
+    resolve a collision before saving, rather than discovering it as a failed
+    save. The save path re-checks against the freshly-fetched file — this is a
+    UX pre-check, not the authority.
+    """
+    if source_df is None or "SKU" not in getattr(source_df, "columns", []):
+        return []
+    existing = set(source_df["SKU"].astype(str).str.strip().str.upper())
+    out = []
+    for old, new in renames:
+        old, new = str(old).strip(), str(new).strip()
+        if not old or not new or old == new:
+            continue
+        if new.upper() in (existing - {old.upper()}):
+            out.append((old, new))
+    return out
+
+
+def _render_rename_collisions(renames, source_df, key_prefix, used_map=None):
+    """Surface rename-onto-an-existing-SKU collisions *before* the save, and
+    let the planner resolve each one as a typo-duplicate merge.
+
+    Renaming `BOSS25-10` → `BOSS25-010` when `BOSS25-010` is already in the
+    catalog used to be a flat rejection at save time, which is a dead end when
+    the real story is "these are the same product, one of them is a typo". The
+    checkbox here says exactly what merging does — keep the row already on
+    file, delete the duplicate — and warns when the SKU about to disappear is
+    referenced by the current schedule.
+
+    Returns the set of upper-cased *old* SKUs approved for merging.
+    """
+    collisions = _rename_collisions(renames, source_df)
+    if not collisions:
+        return set()
+
+    approved = set()
+    used_map = used_map or {}
+    for old, new in collisions:
+        st.warning(
+            f"⚠️ **`{new}` is already in the catalog.** You renamed `{old}` → "
+            f"`{new}`, so two rows would share one SKU."
+        )
+        n_used = int(used_map.get(old, 0) or 0)
+        used_note = (
+            f" ⚠️ `{old}` is used by **{n_used} unit(s)** in the current "
+            f"schedule — those rows will show as *missing SKU* until you "
+            f"re-point them at `{new}`."
+            if n_used else ""
+        )
+        if st.checkbox(
+            f"It's a typo — merge `{old}` into the existing `{new}`",
+            key=f"{key_prefix}_merge_{old}",
+            help=(
+                f"Keeps the `{new}` row already in the catalog exactly as it is "
+                f"and deletes the duplicate `{old}` row. The existing row's "
+                f"labor times win — nothing is copied over from `{old}`."
+            ),
+        ):
+            approved.add(old.upper())
+            st.caption(
+                f"↪️ On save: `{new}` is kept unchanged, `{old}` is removed."
+                + used_note
+            )
+        else:
+            st.caption(
+                f"↪️ Leave unticked to have the save rejected — then fix `{old}` "
+                f"by hand, or edit the `{new}` row directly."
+            )
+    return approved
+
+
+def _validate_renames(renames, fresh_df, merge_approved=None):
     """Validate ``(old, new)`` SKU renames against the freshly-fetched catalog.
 
-    Returns ``(clean_renames, error_message)``. ``error_message`` is None when
-    everything is valid. Rules: new SKU non-empty, not a spreadsheet-formula
-    prefix, unique within the batch, and not colliding with a *different*
-    existing SKU.
+    Returns ``(clean_renames, merges, error_message)``. ``error_message`` is
+    None when everything is valid. Rules: new SKU non-empty, not a
+    spreadsheet-formula prefix, unique within the batch, and not colliding with
+    a *different* existing SKU.
+
+    ``merge_approved`` is a set of upper-cased *old* SKUs the planner has
+    explicitly confirmed are typo-duplicates. For those, a collision is not an
+    error: the rename is reclassified as a **merge** — the edited (typo) row is
+    dropped and the SKU already in the catalog is kept as-is. Merges come back
+    in the second return value so the caller can apply and report them
+    separately from ordinary renames.
     """
     fresh_upper = set(fresh_df["SKU"].astype(str).str.strip().str.upper()) \
         if "SKU" in fresh_df.columns else set()
+    approved = {str(s).strip().upper() for s in (merge_approved or set())}
     clean = []
+    merges = []
     seen_new = set()
     for old, new in renames:
         old = str(old).strip()
@@ -7653,28 +7776,33 @@ def _validate_renames(renames, fresh_df):
         if not old or old == new:
             continue
         if not new:
-            return None, f"`{old}` → (blank): a SKU can't be renamed to an empty value."
+            return None, None, f"`{old}` → (blank): a SKU can't be renamed to an empty value."
         if new[:1] in ("=", "+", "-", "@"):
-            return None, (
+            return None, None, (
                 f"`{new}` can't start with `=`, `+`, `-`, or `@` "
                 "(those trigger formula execution in Excel)."
             )
         if new.upper() in seen_new:
-            return None, f"Two rows are being renamed to the same SKU `{new}`."
+            return None, None, f"Two rows are being renamed to the same SKU `{new}`."
         # Collision with a different existing SKU (one not being renamed away).
         others = fresh_upper - {old.upper()}
         if new.upper() in others:
-            return None, (
-                f"`{new}` already exists in the catalog — pick a unique SKU "
-                "or edit that row instead."
+            if old.upper() in approved:
+                # Confirmed typo — fold this row into the SKU already on file.
+                merges.append((old, new))
+                continue
+            return None, None, (
+                f"`{new}` already exists in the catalog — pick a unique SKU, "
+                "edit that row instead, or tick **“it's a typo — merge”** above "
+                "to keep the existing row and drop this duplicate."
             )
         seen_new.add(new.upper())
         clean.append((old, new))
-    return clean, None
+    return clean, merges, None
 
 
 def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
-                      text_cols=None, renames=None):
+                      text_cols=None, renames=None, merge_approved=None):
     """Cell-level merge: compute the user's diff, fetch the latest file from
     GitHub, apply only those cells (and any SKU renames) on top, and push back.
     Retries once on a 409 SHA conflict (the narrow race window where someone
@@ -7682,7 +7810,9 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
 
     `text_cols` (e.g. ``["Description"]``) lets free-text columns be edited and
     saved alongside the numeric labor columns. `renames` is a list of
-    ``(old_sku, new_sku)`` for inline SKU renames.
+    ``(old_sku, new_sku)`` for inline SKU renames. `merge_approved` is the set
+    of old SKUs the planner confirmed are typo-duplicates — a rename onto an
+    existing SKU then deletes the duplicate instead of failing the save.
     """
     renames = [r for r in (renames or []) if str(r[0]).strip() != str(r[1]).strip()]
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
@@ -7696,13 +7826,14 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         return
 
     n_diffs = len(diffs)
+    # `renames` still mixes true renames with confirmed typo-merges; the split
+    # isn't known until _validate_renames runs against the fetched file, so the
+    # commit message and the counts below are finalized inside the loop.
     n_ren = len(renames)
-    _parts = []
-    if n_diffs:
-        _parts.append(f"{n_diffs} cells")
-    if n_ren:
-        _parts.append(f"{n_ren} SKU rename(s)")
-    commit_message = f"Update {label} catalog via app ({', '.join(_parts)})"
+    n_merged = 0
+    applied_renames = list(renames)
+    applied_merges = []
+    commit_message = f"Update {label} catalog via app"
 
     response = None
     for attempt in (1, 2):
@@ -7715,12 +7846,29 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
                 if fresh_df.empty:
                     st.error("Could not fetch the current catalog from GitHub.")
                     return
-                clean_renames, rename_err = _validate_renames(renames, fresh_df)
+                clean_renames, merges, rename_err = _validate_renames(
+                    renames, fresh_df, merge_approved=merge_approved,
+                )
                 if rename_err:
                     st.error(f"❌ SKU rename rejected: {rename_err}")
                     return
-                csv_text, changed_skus_count, n_renamed = _apply_diffs_and_serialize(
+                csv_text, changed_skus_count, n_renamed, n_merged = _apply_diffs_and_serialize(
                     fresh_df, diffs, editable_cols, renames=clean_renames,
+                    merges=merges,
+                )
+                n_ren = len(clean_renames)
+                applied_renames = list(clean_renames)
+                applied_merges = list(merges)
+                _parts = []
+                if n_diffs:
+                    _parts.append(f"{n_diffs} cells")
+                if n_ren:
+                    _parts.append(f"{n_ren} SKU rename(s)")
+                if n_merged:
+                    _parts.append(f"{n_merged} duplicate SKU(s) merged")
+                commit_message = (
+                    f"Update {label} catalog via app ({', '.join(_parts)})"
+                    if _parts else f"Update {label} catalog via app"
                 )
                 response = save_catalog_to_github(
                     csv_text, file_path, token,
@@ -7754,6 +7902,7 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
 
     _track_and_flush(
         "catalog_save", file=file_path, label=label, cells=n_diffs, renames=n_ren,
+        merges=n_merged,
     )
 
     _saved_bits = []
@@ -7761,17 +7910,39 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         _saved_bits.append(f"{n_diffs} cell change(s)")
     if n_ren:
         _saved_bits.append(f"{n_ren} SKU rename(s)")
+    if n_merged:
+        _saved_bits.append(f"{n_merged} duplicate SKU(s) merged")
     st.success(
         f"✅ Saved {' + '.join(_saved_bits)} to `{file_path}` "
         + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
     )
     if n_ren:
-        _ren_list = ", ".join(f"`{o}` → `{n}`" for o, n in renames[:8])
+        _ren_list = ", ".join(f"`{o}` → `{n}`" for o, n in applied_renames[:8])
         st.warning(
             f"🔁 **Renamed: {_ren_list}.** Heads up — schedule rows and saved "
             "schedules that still reference the **old** SKU won't auto-update; "
             "they'll show as *missing SKU* until you re-point or re-upload them. "
             "(Catalog-only change.)"
+        )
+    if n_merged:
+        _mrg_list = ", ".join(f"`{o}` → `{n}`" for o, n in applied_merges[:8])
+        # A merge deletes a row, so call out anything that pointed at it: cell
+        # edits made on the duplicate in this same save are gone (the surviving
+        # row was kept as-is, by design), and schedules referencing the old SKU
+        # now have nothing to match.
+        _merged_olds = {str(o).strip() for o, _ in applied_merges}
+        _lost = sorted({str(s).strip() for s, _c, _v in diffs} & _merged_olds)
+        _lost_note = (
+            f" Edits you made on {', '.join(f'`{s}`' for s in _lost)} in this save "
+            "were discarded along with the row — re-enter them on the surviving "
+            "SKU if you still want them."
+            if _lost else ""
+        )
+        st.warning(
+            f"🧹 **Merged duplicate(s): {_mrg_list}.** The row already in the "
+            f"catalog was kept unchanged and the duplicate was removed."
+            f"{_lost_note} Schedule rows still referencing the removed SKU will "
+            "show as *missing SKU* until you re-point or re-upload them."
         )
     st.info(
         "⏳ **Streamlit Cloud is now redeploying** with the new values "
@@ -9439,6 +9610,43 @@ def main():
     # Top-of-page banner when there's no schedule loaded
     if empty_banner_msg:
         st.info(empty_banner_msg)
+
+    # Top-of-page reconciliation banner — units the loader had to DROP, i.e.
+    # exactly the gap between the unit total in the planner's source file and
+    # the total the model reports. The per-reason detail lives in the sidebar,
+    # but the sidebar is easy to scroll past, and "why doesn't this match my
+    # Excel?" is the first thing a planner asks. Mirror the headline number
+    # onto the main panel so the discrepancy is never a silent surprise.
+    _upl = st.session_state.get("_last_upload_summary") or {}
+    _upl_rec = _upl.get("recovered") if isinstance(_upl, dict) else None
+    if isinstance(_upl_rec, dict):
+        _unm_map = _upl_rec.get("unmatched") or {}
+        _n_unmatched = int(sum(_unm_map.values()))
+        _n_nomodel = int(_upl_rec.get("no_model") or 0)
+        _n_dropped = _n_unmatched + _n_nomodel
+        if _n_dropped:
+            _why = []
+            if _n_unmatched:
+                _models = ", ".join(
+                    f"`{_m}`×{_n}" for _m, _n in list(_unm_map.items())[:6]
+                )
+                _why.append(
+                    f"**{_n_unmatched}** had no FG SKU and no matching `XXX` "
+                    f"placeholder ({_models})"
+                )
+            if _n_nomodel:
+                _why.append(
+                    f"**{_n_nomodel}** had neither an FG SKU nor a MODEL TYPE"
+                )
+            st.warning(
+                f"➖ **{_n_dropped} unit(s) in your file are NOT in these "
+                f"numbers.** "
+                + "; ".join(_why)
+                + ". Every total on every tab is short by that much. Fix: add an "
+                "`XXX` placeholder for those models in **📁 Data & Setup → "
+                "Machine catalog**, or fill in the SKUs and re-upload. "
+                "(Full breakdown in the sidebar.)"
+            )
 
     # Top-of-page warning when the schedule references SKUs the catalogs don't
     # know about. `expand_schedule` quietly drops unknown FG rows and lets

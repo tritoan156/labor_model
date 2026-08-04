@@ -625,6 +625,31 @@ def _norm_model_key(text) -> str:
     return k
 
 
+def _lookup_placeholder(model, placeholder_map: dict) -> str | None:
+    """Find the placeholder SKU for a schedule ``MODEL TYPE``.
+
+    Exact key first, then a trailing-``S`` tolerant retry. Facilities are not
+    consistent about the generator suffix — Spartanburg writes ``SDG45S`` while
+    Henderson writes ``SDG65`` for the same style of unit — and an exact-only
+    lookup silently drops the odd one out. Trying the key both with and without
+    a trailing ``S`` costs nothing and can't collide across families, since two
+    real models never differ by that letter alone.
+
+    Deliberately applied here rather than inside ``_norm_model_key``: stripping
+    a trailing S during normalization would maul ``EBOSS`` (already collapsed to
+    ``BOSS``, which would become ``BOS``).
+    """
+    if not placeholder_map:
+        return None
+    key = _norm_model_key(model)
+    if not key:
+        return None
+    if key in placeholder_map:
+        return placeholder_map[key]
+    alt = key[:-1] if key.endswith("S") else key + "S"
+    return placeholder_map.get(alt)
+
+
 def build_placeholder_map(machine_df: pd.DataFrame | None) -> dict:
     """Build ``{normalized model key → placeholder SKU}`` from the machine
     catalog's ``XXX`` estimation placeholders.
@@ -747,7 +772,7 @@ def _apply_placeholder_recovery(
             # still account for the units instead of losing them silently.
             summary["no_model"] += n_units
             continue
-        sku = placeholder_map.get(_norm_model_key(model))
+        sku = _lookup_placeholder(model, placeholder_map)
         if not sku:
             summary["unmatched"][model] = summary["unmatched"].get(model, 0) + n_units
             continue

@@ -199,3 +199,5 @@ SDG45S XXX,SDG45S ESTIMATION ASSEMBLY,5.0,0.0,90.0,45.0,30.0,30.0,30.0,0.0,0.0,2
 SDG220S XXX,SDG220S ESTIMATION ASSEMBLY,5.0,0.0,240.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-08-04,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 SDG65S XXX,SDG65S ESTIMATION ASSEMBLY,5.0,0.0,150.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-08-04,Final,Final,Final,GenAcc,GenAcc,GenAcc,PDI,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 PDSF375DP XXX,PDSF375DP ESTIMATION ASSEMBLY,5.0,0.0,0.0,315.0,15.0,30.0,30.0,0.0,0.0,2026-08-04,Undercarriage,Undercarriage,Undercarriage,ComAcc,ComAcc,ComAcc,ComAcc,ComAcc,ComAcc,Wire,Wire,ComAcc,ComAcc,Undercarriage,Undercarriage
+SDG45-016,,,,,,,,,,,2026-09-03,,,,,,,,,,,,,,,
+SDG65-008,,,,,,,,,,,2026-09-03,,,,,,,,,,,,,,,

@@ -160,7 +160,7 @@ SDG65-002,"SDG65S-8E1 ELECTRIC TRAILER 2"" BALL HITCH ASSEMBLY",5.0,0.0,150.0,45
 SDG65-003,"SDG65S-8E1 SURGE TRAILER 2-5/16"" BALL HITCH ASSEMBLY",5.0,0.0,120.0,45.0,30.0,30.0,30.0,0.0,0.0,,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 SDG65-004,"SDG65S-8E1 ELECTRIC TRAILER 2-5/16"" BALL HITCH ASSEMBLY",5.0,0.0,150.0,45.0,30.0,30.0,30.0,0.0,0.0,,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 SDG65-005,"SDG65S-8E1 SURGE TRAILER 3"" RING HITCH ASSEMBLY",10.0,30.0,180.0,15.0,30.0,30.0,20.0,0.0,0.0,2026-06-09,Final,Final,Final,GenAcc,AccKIT,GenAcc,PDI,PDI,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
-SDG65-006,"SDG65S-8E1 ELECTRIC TRAILER 3"" RING  HITCH ASSEMBLY",25.0,30.0,210.0,15.0,30.0,30.0,20.0,0.0,0.0,2026-07-16,Final,Final,Final,GenAcc,GenAcc,GenAcc,PDI,PDI,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
+SDG65-006,"SDG65S-8E1 ELECTRIC TRAILER 3"" RING  HITCH ASSEMBLY",25.0,30.0,210.0,25.0,30.0,30.0,20.0,0.0,0.0,2026-09-03,Final,Final,Final,GenAcc,GenAcc,GenAcc,PDI,PDI,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 SDG65-007,"SDG65S-8E1 ELECTRIC TRAILER 2""  BULLDOG BALL HITCH ASSEMBLY",5.0,0.0,150.0,45.0,30.0,30.0,30.0,0.0,0.0,,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 BOSS25-014,BOSS25-010 variant (seeded from BOSS25-010),10.0,35.0,120.0,180.0,90.0,60.0,30.0,0.0,1.0,2026-05-30,Final,Final,Final,GenAcc,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS25-015,EBOSS 25-25 HYBRID 65 TRAILER HYD ASSEMBLY,10.0,35.0,90.0,300.0,60.0,60.0,30.0,0.0,1.0,,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
@@ -186,7 +186,7 @@ PDS185L XXX,PDS185L ESTIMATION ASSEMBLY,20.0,,,158.0,15.0,30.0,20.0,,,2026-07-16
 SDG125S XXX,SDG125S ESTIMATION ASSEMBLY,5.0,,210.0,15.0,30.0,30.0,30.0,,,2026-07-16,,,,,GenAcc,GenAcc,,,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 SDG150S XXX,SDG150S ESTIMATION ASSEMBLY,5.0,0.0,210.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-07-16,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,PDI,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 SDG150-A006,SDG150S-8E1 BC DCL SL ACCESSORY KIT,5.0,10.0,210.0,45.0,30.0,30.0,30.0,,,2026-07-16,,,,,GenAcc,,,,,,,,Undercarriage,Undercarriage,Undercarriage
-SDG45-014,SDG45S-8E2 BASE NO FORK POCKET ASSEMBLY,5.0,20.0,150.0,15.0,30.0,30.0,20.0,,,2026-07-16,,,,,GenAcc,,,,,,,,Undercarriage,Undercarriage,Undercarriage
+SDG45-014,SDG45S-8E2 BASE NO FORK POCKET ASSEMBLY,5.0,20.0,150.0,15.0,30.0,30.0,20.0,,,2026-09-03,,,,GenAcc,GenAcc,,,,,,,,Undercarriage,Undercarriage,Undercarriage
 BOSS125HS-003,EBOSS 125 PM SKID FOR EBOSS125-125,10.0,10.0,20.0,10.0,30.0,30.0,30.0,480.0,2.0,2026-07-16,,,,PMAcc,,,,,,,,,Undercarriage,Undercarriage,Undercarriage
 BOSS400HS-004,EBOSS 400 PM SKID VENTED COVER ASSEMBLY,20.0,10.0,,20.0,30.0,30.0,20.0,960.0,5.0,2026-07-25,,,,PMAcc,,,,,,,,,,Undercarriage,Undercarriage
 TBA,,10.0,30.0,120.0,150.0,60.0,60.0,30.0,,1.0,2026-07-24,,,,GenAcc,,,,,,,,,,Undercarriage,Undercarriage
@@ -199,6 +199,6 @@ SDG45S XXX,SDG45S ESTIMATION ASSEMBLY,5.0,0.0,90.0,45.0,30.0,30.0,30.0,0.0,0.0,2
 SDG220S XXX,SDG220S ESTIMATION ASSEMBLY,5.0,0.0,240.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-08-04,Final,Final,Final,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 SDG65S XXX,SDG65S ESTIMATION ASSEMBLY,5.0,0.0,150.0,45.0,30.0,30.0,30.0,0.0,0.0,2026-08-04,Final,Final,Final,GenAcc,GenAcc,GenAcc,PDI,GenAcc,GenAcc,Wire,Wire,GenAcc,Undercarriage,Undercarriage,Undercarriage
 PDSF375DP XXX,PDSF375DP ESTIMATION ASSEMBLY,5.0,0.0,0.0,315.0,15.0,30.0,30.0,0.0,0.0,2026-08-04,Undercarriage,Undercarriage,Undercarriage,ComAcc,ComAcc,ComAcc,ComAcc,ComAcc,ComAcc,Wire,Wire,ComAcc,ComAcc,Undercarriage,Undercarriage
-SDG45-016,,,,,,,,,,,2026-09-03,,,,,,,,,,,,,,,
-SDG65-008,,,,,,,,,,,2026-09-03,,,,,,,,,,,,,,,
-PDS400S XXX,PDS400S ESTIMATION ASSEMBLY,5.0,0.0,0.0,335.0,15.0,30.0,30.0,0.0,0.0,2026-09-03,,,,,,,,,,,,,,,
+SDG45-016,SDG45-8E2 SKID BASE SIDE FORKLIFT POCKET ASSEMBLY,5.0,,105.0,25.0,30.0,30.0,30.0,,,2026-09-03,,,,GenAcc,,,,,,,,,,,
+SDG65-008,SDG65S-8E1 SKID BASE SIDE FORKLIFT POCKET ASSEMBLY,5.0,,210.0,25.0,30.0,30.0,30.0,,,2026-09-03,,,,GenAcc,,,,,,,,,,,
+PDS400S XXX,PDS400S ESTIMATION ASSEMBLY,5.0,0.0,0.0,335.0,15.0,30.0,30.0,0.0,0.0,2026-09-03,,,,GenAcc,,,,,,,,,,,

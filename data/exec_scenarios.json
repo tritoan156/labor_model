@@ -861,6 +861,70 @@
         "coverage_pct": 89.56340294677383,
         "verdict": "No Good"
       }
+    },
+    "Henderson October 09/23": {
+      "saved_at": "2026-09-23T11:34:34-07:00",
+      "assumptions": {
+        "units": 274,
+        "total_earned_hours": 4494.683333333333,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.2,
+        "new_hire_productivity": 0.7,
+        "absenteeism": 0.05,
+        "overtime": 0.0,
+        "safety": 1.0,
+        "shift_minutes": 480,
+        "working_days": 22,
+        "available_hc": 55.0,
+        "support_hc": 4.0,
+        "crew_hc": {
+          "Warehouse (Pick)": 2,
+          "Wire Assembly": 4,
+          "Battery Assembly": 6,
+          "PM Acc (Headunit)": 3,
+          "Gen Accessories": 12,
+          "Undercarriage Assembly": 0,
+          "Com Accessories": 2,
+          "Trailer Assembly": 10,
+          "ETO": 3,
+          "Accessories KIT": 0,
+          "Final Assembly": 4,
+          "PDI": 3,
+          "QC": 4,
+          "Ship": 2,
+          "Lead": 2,
+          "Other": 2
+        },
+        "schedule_label": "October 2026"
+      },
+      "metrics": {
+        "total_earned_hours": 4494.683333333333,
+        "total_units": 274,
+        "units_per_day": 12.454545454545455,
+        "mh_per_unit": 16.403953771289537,
+        "mh_per_unit_loaded": 36.738978211174775,
+        "total_available_hours_per_unit": 37.8978102189781,
+        "available_headcount": 55.0,
+        "support_headcount": 4.0,
+        "total_headcount": 59.0,
+        "base_efficiency": 0.5,
+        "new_hire_pct": 0.2,
+        "new_hire_productivity": 0.7,
+        "absenteeism": 0.05,
+        "overtime": 0.0,
+        "safety": 1.0,
+        "adjusted_efficiency": 0.47,
+        "effective_hours_per_person": 78.58399999999999,
+        "net_available_hours": 9680.0,
+        "total_available_hours": 10384.0,
+        "available_earned_hours": 4322.119999999999,
+        "headcount_needed_aggregate": 57.19590926057892,
+        "headcount_needed_station": 64.0,
+        "missed_units_aggregate": 10.519618363918916,
+        "missed_units_station": 212,
+        "coverage_pct": 96.16072322484712,
+        "verdict": "No Good"
+      }
     }
   }
 }

@@ -34,7 +34,12 @@ against per-station headcount + throughput capacity.
    right now.
 2. **`_LOADER_SCHEMA_VERSION` in `app.py` is a cache-buster.** Bump it after ANY
    CSV column add/remove/rename/type change, or users get stale cached data.
-   Currently `8`. A bump may require a Cloud reboot (Manage app → Reboot).
+   Currently `9`. The bump takes effect on the first script run after the
+   deploy — no Cloud reboot needed. The CSV loaders are cached on file mtime +
+   this constant, passed as plain (non-underscore) `st.cache_data` arguments;
+   `tests/test_cache_keys.py` fails if anyone re-prefixes them (Streamlit skips
+   `_`-prefixed params when building the cache key, which is how this used to
+   be broken).
 3. **Commit ritual:** stash `data/usage_log.jsonl` (local telemetry, never
    commit) → `git add` specific files → commit with a
    `Co-Authored-By: Claude` trailer → `git pull --rebase origin main` →

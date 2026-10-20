@@ -210,7 +210,8 @@ def _csv_mtime(filename: str) -> float:
 
 # Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
 # renames, new columns, etc.) so the cache invalidates even if the underlying
-# CSV file's mtime hasn't changed.
+# CSV file's mtime hasn't changed. The bump takes effect on the next script run
+# (no Cloud reboot): every CSV loader below passes it as a hashed cache arg.
 _LOADER_SCHEMA_VERSION = 9
 
 
@@ -261,9 +262,29 @@ def _split_crew_hc(crew_config) -> tuple[int, int, int]:
     return production, support, production + support
 
 
+# How the loader caches are keyed — read before touching these signatures.
+#
+# st.cache_data builds its key from the arguments ACTUALLY PASSED to the call,
+# and it skips any parameter whose name starts with "_". A parameter's default
+# value is never part of the key either. So the earlier shape,
+# ``def _load_x(_mtime, _schema_ver=_LOADER_SCHEMA_VERSION)``, was cached on
+# nothing at all: a changed file on disk or a bumped schema version never
+# invalidated a warm process, and only ``st.cache_data.clear()`` (after an
+# in-app save) or a container restart refreshed the data.
+#
+# Hence the two-layer shape for the CSV loaders: the ``*_cached`` function
+# hashes on the plain ``mtime`` + ``schema_ver`` it receives (no underscore, no
+# default), and the public wrapper always passes the current constant so no
+# call site can forget it. The JSON/JSONL loaders are keyed on ``mtime`` alone.
+# ``tests/test_cache_keys.py`` guards both halves.
 @st.cache_data(show_spinner=False)
-def _load_machine_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
+def _load_machine_df_cached(mtime: float, schema_ver: int):
     return load_machine_labor()
+
+
+def _load_machine_df(mtime: float):
+    """Load machine_clean.csv, cached on (file mtime, _LOADER_SCHEMA_VERSION)."""
+    return _load_machine_df_cached(mtime, _LOADER_SCHEMA_VERSION)
 
 
 def _project_facility_routing(machine_df, location: str):
@@ -297,44 +318,60 @@ def _project_facility_routing(machine_df, location: str):
 
 
 @st.cache_data(show_spinner=False)
-def _load_acc_df(_mtime: float, _schema_ver: int = _LOADER_SCHEMA_VERSION):
-    """Load acc_clean.csv. `_schema_ver` forces a cache refresh after schema
-    changes even when the file mtime is unchanged."""
+def _load_acc_df_cached(mtime: float, schema_ver: int):
     return load_acc_labor()
 
 
+def _load_acc_df(mtime: float):
+    """Load acc_clean.csv, cached on (file mtime, _LOADER_SCHEMA_VERSION) so a
+    schema bump refreshes the frame even when the file mtime is unchanged."""
+    return _load_acc_df_cached(mtime, _LOADER_SCHEMA_VERSION)
+
+
 @st.cache_data(show_spinner=False)
-def _load_item_master_df(_mtime: float):
+def _load_item_master_df_cached(mtime: float, schema_ver: int):
     return load_item_master()
 
 
+def _load_item_master_df(mtime: float):
+    """Load item_master.csv, cached on (file mtime, _LOADER_SCHEMA_VERSION)."""
+    return _load_item_master_df_cached(mtime, _LOADER_SCHEMA_VERSION)
+
+
 @st.cache_data(show_spinner=False)
-def _load_item_packages_df(_mtime: float):
+def _load_item_packages_df_cached(mtime: float, schema_ver: int):
     return load_item_packages()
 
 
+def _load_item_packages_df(mtime: float):
+    """Load item_packages.csv, cached on (file mtime, _LOADER_SCHEMA_VERSION)."""
+    return _load_item_packages_df_cached(mtime, _LOADER_SCHEMA_VERSION)
+
+
 @st.cache_data(show_spinner=False)
-def _load_scenarios_dict(_mtime: float):
-    """Load data/scenarios.json. Cached per file mtime."""
+def _load_scenarios_dict(mtime: float):
+    """Load data/scenarios.json. Cached per file mtime (hashed — keep the
+    parameter un-prefixed, see the cache-key note above)."""
     return load_all_scenarios()
 
 
 @st.cache_data(show_spinner=False)
-def _load_uploaded_schedules_dict(_mtime: float):
-    """Load data/uploaded_schedules.json. Cached per file mtime."""
+def _load_uploaded_schedules_dict(mtime: float):
+    """Load data/uploaded_schedules.json. Cached per file mtime (hashed)."""
     return load_all_uploaded_schedules()
 
 
 @st.cache_data(show_spinner=False)
-def _load_process_flow_edges(_mtime: float):
-    """Load data/process_flow.json. Cached per file mtime."""
+def _load_process_flow_edges(mtime: float):
+    """Load data/process_flow.json. Cached per file mtime (hashed)."""
     return load_process_flow()
 
 
 @st.cache_data(show_spinner=False, ttl=60)
-def _load_usage_log_cached(_mtime: float):
-    """Load data/usage_log.jsonl. TTL=60s so the admin view auto-refreshes
-    within a minute of new events without polling too aggressively."""
+def _load_usage_log_cached(mtime: float):
+    """Load data/usage_log.jsonl. Cached per file mtime (hashed); TTL=60s so
+    the admin view auto-refreshes within a minute of new events without
+    polling too aggressively."""
     return load_usage_log()
 
 
@@ -351,6 +388,9 @@ def _load_usage_log_cached(_mtime: float):
 #   • only the inputs that actually changed force a recompute.
 # Cache keys cover every input, so there is no staleness risk: edit the
 # schedule / catalog / crew / a setting and the matching key changes.
+# None of these parameters may be underscore-prefixed: the DataFrames are
+# hashed by content on purpose (an "_df" param would be skipped and the cache
+# would serve the first schedule it ever saw to every later one).
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, max_entries=32)
 def _expand_schedule_cached(schedule_df, machine_df, acc_df):

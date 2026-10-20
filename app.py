@@ -47,6 +47,7 @@ import core.usage_tracker
 import core.data_validator
 import core.data_loader
 import core.labor_calculator
+import core.excel_io
 
 # Step 2: detect staleness via sentinels for names/params added in recent pushes.
 #
@@ -89,6 +90,7 @@ if _stale:
         "core.data_validator",
         "core.data_loader",
         "core.labor_calculator",
+        "core.excel_io",
     ):
         _mod = _sys.modules.get(_modname)
         if _mod is not None:
@@ -104,6 +106,17 @@ from core.data_loader import (
     load_item_master, load_item_packages,
     resolve_item_time, unique_abbrs,
     ScheduleColumnError,
+)
+from core.excel_io import (
+    upload_to_schedule_csv,
+    build_workbook as build_excel_workbook,
+    database_tables as database_excel_tables,
+    database_readme as database_excel_readme,
+    raw_github_url,
+    power_query_m_for_csv,
+    DATABASE_TABLES as EXCEL_DATABASE_TABLES,
+    CSV_LINKABLE_FILES as EXCEL_CSV_LINKABLE_FILES,
+    SAVED_SCHEDULE_ROWS_SHEET as EXCEL_SAVED_ROWS_SHEET,
 )
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
@@ -1182,7 +1195,8 @@ def _load_schedule_df(
         _stash_upload_summary(df, location, source=source,
                               plan_month_label=_plan_label, recovered=_recovered,
                               unscheduled=_unscheduled, location_recovered=_location,
-                              foreign_location=_foreign)
+                              foreign_location=_foreign,
+                              sheet=st.session_state.get("_active_schedule_sheet"))
         return df
 
     # Resolution order. NOTE: the previously-loaded schedule must survive
@@ -1202,6 +1216,10 @@ def _load_schedule_df(
         st.session_state["_active_schedule_source"] = st.session_state.pop(
             "_loaded_schedule_source", "saved"
         )
+        # A programmatic load is always CSV — no workbook sheet to report,
+        # and any earlier failed-workbook banner is superseded.
+        st.session_state["_active_schedule_sheet"] = None
+        st.session_state.pop("_active_schedule_error", None)
         # A programmatic load supersedes whatever file is still sitting in the
         # uploader widget — mark it "seen" so the next rerun doesn't treat it
         # as a fresh upload and clobber what we just loaded.
@@ -1222,9 +1240,27 @@ def _load_schedule_df(
         sig = _upload_sig(uploaded_file)
         if sig != st.session_state.get("_seen_upload_sig"):
             st.session_state["_seen_upload_sig"] = sig
-            csv_bytes = uploaded_file.getvalue()
+            # An Excel workbook is converted to CSV bytes here, once, so every
+            # downstream consumer (the persisted active schedule, 💾 Save
+            # schedule, Sequence / Calendar) keeps seeing plain CSV. A CSV
+            # passes through untouched.
+            try:
+                csv_bytes, sheet = upload_to_schedule_csv(
+                    getattr(uploaded_file, "name", ""), uploaded_file.getvalue(),
+                )
+            except ScheduleColumnError as exc:
+                # No sheet had a usable header. Remember the failure so later
+                # reruns (any widget nudge) keep showing the banner instead of
+                # silently reviving the previous schedule — the persistence a
+                # malformed CSV already gets by living in _active_schedule_csv.
+                st.session_state.pop("_active_schedule_csv", None)
+                st.session_state["_active_schedule_sheet"] = None
+                st.session_state["_active_schedule_error"] = str(exc)
+                raise
+            st.session_state.pop("_active_schedule_error", None)
             st.session_state["_active_schedule_csv"] = csv_bytes
             st.session_state["_active_schedule_source"] = "upload"
+            st.session_state["_active_schedule_sheet"] = sheet
             df = load_schedule(
                 io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
                 placeholder_map=placeholder_map, acc_skus=acc_skus,
@@ -1243,6 +1279,13 @@ def _load_schedule_df(
         )
         return _finalize(df, st.session_state.get("_active_schedule_source", "saved"))
 
+    # 3b) The last upload was a workbook with no usable sheet — keep saying so
+    #     (the banner is the planner's only cue to fix the file) rather than
+    #     quietly falling back to the bundled sample.
+    _pending_error = st.session_state.get("_active_schedule_error")
+    if _pending_error:
+        raise ScheduleColumnError(_pending_error)
+
     # 4) Bundled sample
     df = load_schedule(
         location=location, machine_skus=machine_skus,
@@ -1256,7 +1299,8 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
                           plan_month_label: str = "", recovered: dict | None = None,
                           unscheduled: dict | None = None,
                           location_recovered: dict | None = None,
-                          foreign_location: dict | None = None) -> None:
+                          foreign_location: dict | None = None,
+                          sheet: str | None = None) -> None:
     """Save a one-line description of the just-loaded schedule into session
     state so the sidebar can echo it back to the planner as a green
     confirmation pill. No-op when the DataFrame is empty (caller already
@@ -1294,6 +1338,9 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
             "unscheduled": unscheduled,
             "location_recovered": location_recovered,
             "foreign_location": foreign_location,
+            # Workbook sheet the upload was read from (None for a CSV) — shown
+            # on the confirmation pill so the planner can spot a wrong tab.
+            "sheet": sheet,
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
@@ -2719,7 +2766,7 @@ def _uploaded_schedule_save(
         st.warning("Please enter a schedule name before saving.")
         return
     if uploaded_file is None:
-        st.warning("Upload a CSV first, then save it.")
+        st.warning("Upload a schedule file first, then save it.")
         return
 
     confirm_key = f"_uploaded_schedule_overwrite_pending_{location}"
@@ -2740,11 +2787,15 @@ def _uploaded_schedule_save(
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
 
-    # Decode the upload bytes to text. The loader handles latin-1 / UTF-8 /
+    # Decode the upload to CSV text. An Excel workbook is converted to CSV
+    # first (same sheet detection as the loader), so what's saved is always a
+    # CSV the loader can re-read. The loader handles latin-1 / UTF-8 /
     # UTF-8-with-BOM transparently; here we just need *some* text encoding
     # we can re-parse. Try utf-8 first, fall back to latin-1.
     try:
-        raw = uploaded_file.getvalue()
+        raw, _sheet = upload_to_schedule_csv(
+            getattr(uploaded_file, "name", ""), uploaded_file.getvalue(),
+        )
         try:
             csv_text = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
@@ -3863,9 +3914,9 @@ def render_sidebar() -> dict:
         ["📤 Upload schedule file", "✏️ Paste or type SKUs"],
         index=0,
         help=(
-            "Upload a full production schedule (CSV) — best for monthly planning. "
-            "Or paste a SKU list straight out of Excel (and add a few rows by "
-            "hand) — best for quick what-if scenarios."
+            "Upload a full production schedule (CSV or Excel workbook) — best "
+            "for monthly planning. Or paste a SKU list straight out of Excel "
+            "(and add a few rows by hand) — best for quick what-if scenarios."
         ),
     )
 
@@ -3874,13 +3925,17 @@ def render_sidebar() -> dict:
 
     if schedule_mode == "📤 Upload schedule file":
         uploaded = st.sidebar.file_uploader(
-            "Choose a CSV",
-            type=["csv"],
+            "Choose a CSV or Excel file",
+            type=["csv", "xlsx", "xlsm"],
             help=(
-                "Required columns (any of these names will match): LOCATION / "
-                "Facility, FG SKU ID / FG SKU, FG ACCRY SKU ID / Accessory SKU, "
-                "BUILD QTY / Qty, PRODUCTION MONTH / Month. Extra columns are "
-                "ignored. Optional: CUSTOMER NAME."
+                "CSV or Excel (.xlsx / .xlsm). For a workbook, the first sheet "
+                "whose header row carries the required columns is used — a "
+                "title row above the header, or the plan living on a later "
+                "tab, is fine. Required columns (any of these names will "
+                "match): LOCATION / Facility, FG SKU ID / FG SKU, FG ACCRY SKU "
+                "ID / Accessory SKU, BUILD QTY / Qty, PRODUCTION MONTH / "
+                "Month. Extra columns are ignored. Optional: CUSTOMER NAME, "
+                "PRODUCTION DAY."
             ),
             label_visibility="collapsed",
         )
@@ -3940,6 +3995,8 @@ def render_sidebar() -> dict:
                 "saved":   "saved schedule",
                 "bundled": "bundled sample",
             }.get(_summary.get("source", ""), "schedule")
+            if _summary.get("source") == "upload" and _summary.get("sheet"):
+                _src_label = f"uploaded Excel · sheet `{_summary['sheet']}`"
             _auto = _summary.get("auto_spread")
             _auto_suffix = ""
             if isinstance(_auto, dict) and _auto.get("count"):
@@ -4534,7 +4591,7 @@ def render_sidebar() -> dict:
 
 **Sidebar in three steps**
 1. **Pick a facility** — Henderson, Spartanburg, or Cypress. Each has its own crew config.
-2. **Tell us what to build** — upload your monthly schedule CSV, or paste / type a few SKUs for a quick what-if.
+2. **Tell us what to build** — upload your monthly schedule (CSV or Excel workbook), or paste / type a few SKUs for a quick what-if.
 3. **Tune** — working days, shift length, safety, efficiency, and per-station headcount under the expanders below.
 
 **Pasting a list from Excel**
@@ -4564,6 +4621,8 @@ The table's **`#`** column numbers the rows for you. A row takes the next number
 | See what gets built each week / day | **📆 Calendar** tab |
 | Reshape the schedule (move SKUs between dates) | **📁 Data & Setup** → **🗓 Sequence** |
 | See bottlenecks + suggested fixes | **🏠 Overview** → 🎯 Recommended actions, or **🔧 Recommendations** tab |
+| Get the whole database (or this analysis) into Excel | **📁 Data & Setup** → **📤 Export & Excel link** |
+| Link an Excel sheet to the live catalogs | **📁 Data & Setup** → **📤 Export & Excel link** → step 3 |
 
 **Tip:** hover any column header in a table to see its specific tooltip.
                 """
@@ -4661,7 +4720,10 @@ Answers the question planners ask once they care: *"will the team see what I jus
 When you're in **✏️ Paste or type SKUs** mode, the sidebar's **📂 Save / load scenarios** expander lets you name and save your manual SKU list. Saved per facility to `data/scenarios.json` on GitHub — anyone planning for the same facility can reload them.
 
 ### Save / load uploaded schedules (upload mode)
-When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / load uploaded schedules** expander lets you save your uploaded CSV under a name. Saved per facility to `data/uploaded_schedules.json` on GitHub. The **raw CSV** is preserved, so any columns the app currently ignores still survive the round-trip for future use.
+When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / load uploaded schedules** expander lets you save your uploaded schedule under a name. Saved per facility to `data/uploaded_schedules.json` on GitHub. The **raw CSV** is preserved (an Excel upload is saved as the CSV it was converted to), so any columns the app currently ignores still survive the round-trip for future use.
+
+### Export & Excel link
+**📁 Data & Setup → 📤 Export & Excel link** downloads the whole database (catalogs, crew, settings, scenarios, executive scenarios, saved schedules, process flow) as one `.xlsx`, or this session's schedule / per-unit labor / capacity tables. Step 3 there lists the raw GitHub URL of each CSV catalog plus a Power Query script, so an Excel sheet can read the live data and **Refresh All** whenever the team saves.
 
 ### Catalog edits
 Every **💾 Save** button in **📁 Data & Setup** (Machine catalog, Accessory catalog, Items, Item packages, Reconciliation, Process flow) pushes to GitHub. Other users see the new values after the next ~1 minute Streamlit Cloud redeploy.
@@ -6662,9 +6724,201 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     )
 
 
+# =============================================================
+# 📤 Export & Excel link — whole database / current analysis as .xlsx
+# =============================================================
+_XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+_DATABASE_EXPORT_FILES = tuple(sorted({f for _s, f, _d in EXCEL_DATABASE_TABLES}))
+
+
+def _database_export_signature(include_rows: bool) -> tuple:
+    """Cache key for the database workbook: every data file's mtime plus the
+    loader schema version. A catalog / scenario save rewrites the local file,
+    so the next visit rebuilds instead of serving a stale workbook."""
+    return (
+        tuple(_csv_mtime(f) for f in _DATABASE_EXPORT_FILES),
+        bool(include_rows),
+        _LOADER_SCHEMA_VERSION,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _build_database_workbook_cached(sig: tuple, include_rows: bool) -> bytes:
+    # ``sig`` is only here to key the cache (no leading underscore on purpose —
+    # Streamlit skips hashing underscore-prefixed params).
+    return build_excel_workbook(
+        database_excel_tables(include_saved_schedule_rows=include_rows),
+        readme=database_excel_readme(include_saved_schedule_rows=include_rows),
+    )
+
+
+def _session_settings_rows(inputs: dict | None) -> list[dict]:
+    """The sidebar's scalar inputs as Setting / Value rows for the analysis
+    export. Frames (crew table) and widgets (the upload) are skipped; the
+    plan-month tuple is already mirrored by ``plan_month_label``."""
+    rows = []
+    for key, val in (inputs or {}).items():
+        if isinstance(val, (list, tuple, set)):
+            if key == "plan_month":
+                continue
+            val = "; ".join(str(v) for v in val)
+        elif not isinstance(val, (str, int, float, bool)) or val is None:
+            continue
+        rows.append({"Setting": key, "Value": val})
+    return rows
+
+
+def _render_export_view(schedule_df, units, capacity, inputs, location: str) -> None:
+    """📤 Export & Excel link sub-view of 📁 Data & Setup.
+
+    Three ways out: the whole database as one workbook, this session's
+    analysis as a workbook, and read-only live links (raw GitHub URLs plus a
+    Power Query script) so Excel can refresh the catalogs itself.
+    """
+    st.subheader("📤 Export & Excel link")
+    st.caption(
+        "Everything the tool knows, in Excel. Download the whole database as one "
+        "workbook, download this session's analysis, or point a sheet at the live "
+        "data files so it refreshes on its own."
+    )
+
+    # ---- 1) Whole database ---------------------------------------------------
+    st.markdown("#### 1 · Whole database as one workbook")
+    st.markdown(
+        "One sheet per data file — the catalogs exactly as stored, plus the crew, "
+        "settings, scenarios, executive scenarios, saved schedules and process-flow "
+        "JSON flattened into plain tables. A **README** sheet says what each sheet "
+        "is and which file it came from."
+    )
+    include_rows = st.checkbox(
+        "Include every row of every saved schedule",
+        value=False,
+        key="export_include_saved_rows",
+        help=(
+            "Adds the big one: thousands of rows × every column the planners' "
+            "CSVs carried. Slower to build and a much larger file. The *index* "
+            "of saved schedules is always included."
+        ),
+    )
+    sheet_rows = [
+        {"Sheet": s, "Source file": f"data/{f}", "What it holds": d}
+        for s, f, d in EXCEL_DATABASE_TABLES
+        if include_rows or s != EXCEL_SAVED_ROWS_SHEET
+    ]
+    st.dataframe(pd.DataFrame(sheet_rows), use_container_width=True, hide_index=True)
+    try:
+        with st.spinner("Building workbook…"):
+            db_bytes = _build_database_workbook_cached(
+                _database_export_signature(include_rows), include_rows,
+            )
+    except Exception as e:  # noqa: BLE001 — never take the whole tab down
+        st.error(f"❌ Couldn't build the database workbook: {e}")
+        db_bytes = b""
+    st.download_button(
+        "📥 Download database workbook (.xlsx)",
+        db_bytes,
+        file_name=f"labor_model_database_{today_local_str()}.xlsx",
+        mime=_XLSX_MIME,
+        use_container_width=True,
+        disabled=not db_bytes,
+    )
+    if db_bytes:
+        st.caption(
+            f"{len(db_bytes) / 1024:,.0f} KB · reflects the data files as of this "
+            "app's last redeploy (saves land after the ~1 minute rebuild)."
+        )
+
+    # ---- 2) This session's analysis -----------------------------------------
+    st.markdown("#### 2 · This session's analysis")
+    if units is None or units.empty:
+        st.info(
+            "Load a schedule in the sidebar to export the per-unit labor and "
+            "capacity-by-station tables for it."
+        )
+    else:
+        crew_cfg = (inputs or {}).get("crew_config")
+        tables = {
+            "Schedule": schedule_df if schedule_df is not None else pd.DataFrame(),
+            "Units (labor per unit)": units,
+            "Capacity by station": capacity if capacity is not None else pd.DataFrame(),
+            "Crew (this session)": crew_cfg if isinstance(crew_cfg, pd.DataFrame) else pd.DataFrame(),
+            "Settings": pd.DataFrame(_session_settings_rows(inputs), columns=["Setting", "Value"]),
+        }
+        try:
+            analysis_bytes = build_excel_workbook(tables)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"❌ Couldn't build the analysis workbook: {e}")
+            analysis_bytes = b""
+        st.download_button(
+            "📥 Download analysis workbook (.xlsx)",
+            analysis_bytes,
+            file_name=(
+                f"labor_model_analysis_{location.lower()}_{today_local_str()}.xlsx"
+            ),
+            mime=_XLSX_MIME,
+            use_container_width=True,
+            disabled=not analysis_bytes,
+            help=(
+                "Schedule as loaded (after suffix cleanup / auto-spread), one row "
+                "per unit with its per-station labor, the capacity table behind the "
+                "Capacity tab, and the crew + sidebar settings that produced them."
+            ),
+        )
+
+    # ---- 3) Live link ---------------------------------------------------------
+    st.markdown("#### 3 · Link Excel to the live data")
+    st.markdown(
+        "The catalogs are plain CSV files on GitHub, so Excel can read them "
+        "directly: **Data → Get Data → From Web**, paste the URL, **Load**. From "
+        "then on **Data → Refresh All** pulls whatever the team has saved since. "
+        "Read-only — edits still go through the catalog editors here."
+    )
+    link_rows = [
+        {"Table": s, "File": f"data/{f}", "URL": raw_github_url(f)}
+        for s, f, _d in EXCEL_DATABASE_TABLES
+        if f in EXCEL_CSV_LINKABLE_FILES
+    ]
+    st.dataframe(
+        pd.DataFrame(link_rows),
+        use_container_width=True, hide_index=True,
+        column_config={"URL": st.column_config.LinkColumn("URL")},
+    )
+    pick = st.selectbox(
+        "Power Query script for…", [r["Table"] for r in link_rows],
+        key="export_pq_pick",
+    )
+    pick_url = next((r["URL"] for r in link_rows if r["Table"] == pick), "")
+    st.code(power_query_m_for_csv(pick_url), language="text")
+    with st.expander("Step by step", expanded=False):
+        st.markdown(
+            """
+**Quick way (one table):** Excel → **Data** → **Get Data** → **From Other
+Sources** → **From Web** → paste the URL above → **OK** → **Load**.
+
+**Script way (exact types, repeatable):** **Data** → **Get Data** → **Launch
+Power Query Editor** → **Home** → **New Source → Blank Query** → **Advanced
+Editor** → replace everything with the script above → **Done** → rename the
+query → **Close & Load**.
+
+**Refresh:** **Data** → **Refresh All** (or right-click the table →
+**Refresh**). Each refresh re-reads the file as it is on GitHub right then.
+
+**Notes**
+- The JSON files (crew, settings, scenarios, executive scenarios, saved
+  schedules, process flow) need a few transform steps in Power Query, so they
+  aren't one-click links — the database workbook above already has them
+  flattened.
+- If the repo is ever made private, these URLs stop working anonymously; the
+  query then needs a token (`Web.Contents` with an `Authorization` header).
+  Ask the maintainer.
+            """
+        )
+
+
 def tab_data_setup(
     machine_df, acc_df, schedule_df, item_master_df, item_packages_df,
     units=None, schedule_df_full=None, location: str = "Henderson",
+    capacity=None, inputs=None,
 ):
     """Consolidated data + admin tab.
 
@@ -6678,6 +6932,7 @@ def tab_data_setup(
       📦 Item packages         — package definitions editor
       🔬 Reconciliation & Apply — items-vs-aggregate diff + write-back
       🔍 Data Quality          — validation report
+      📤 Export & Excel link   — whole database / this session as .xlsx + live links
     """
     st.header("📁 Data & Setup")
     st.caption(
@@ -6697,6 +6952,7 @@ def tab_data_setup(
             "📦 Item packages",
             "🔬 Reconciliation & Apply",
             "🔍 Data Quality",
+            "📤 Export & Excel link",
         ],
         horizontal=True,
         label_visibility="collapsed",
@@ -6748,6 +7004,12 @@ def tab_data_setup(
 
     elif sub == "🔍 Data Quality":
         tab_data_validation(machine_df, acc_df, units=units)
+
+    elif sub == "📤 Export & Excel link":
+        _render_export_view(
+            schedule_df_full if schedule_df_full is not None else schedule_df,
+            units, capacity, inputs, location,
+        )
 
 
 def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: str = "Henderson"):
@@ -9960,6 +10222,7 @@ def main():
             item_master_df=item_master_df, item_packages_df=item_packages_df,
             units=units, schedule_df_full=schedule_df_full,
             location=inputs.get("location", "Henderson"),
+            capacity=capacity, inputs=inputs,
         )
 
     # --- Footer ---------------------------------------------------------

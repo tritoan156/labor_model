@@ -49,6 +49,7 @@ import core.data_validator
 import core.data_loader
 import core.labor_calculator
 import core.excel_io
+import core.catalog_source_storage
 
 # Step 2: detect staleness via sentinels for names/params added in recent pushes.
 #
@@ -67,6 +68,11 @@ _stale = (
     or not hasattr(core.data_loader, "ScheduleColumnError")
     or not hasattr(core.data_loader, "build_placeholder_map")
     or not hasattr(core.data_loader, "_lookup_placeholder")
+    # Catalog column aliases — excel_io imports these from data_loader, so a
+    # stale data_loader would make the (reloaded) excel_io fail to import and
+    # the old one would hand back sheets with no `.aliased`.
+    or not hasattr(core.data_loader, "canonical_catalog_column")
+    or not hasattr(core.excel_io, "_is_sku_header")
     or "absorb_foreign_locations" not in _inspect.signature(
         core.data_loader.load_schedule).parameters
     or "efficiency" not in getattr(
@@ -94,6 +100,7 @@ if _stale:
         "core.data_loader",
         "core.labor_calculator",
         "core.excel_io",
+        "core.catalog_source_storage",
     ):
         _mod = _sys.modules.get(_modname)
         if _mod is not None:
@@ -173,6 +180,11 @@ from core.process_flow_storage import (
     DEFAULT_EDGES as PROCESS_FLOW_DEFAULTS,
     VALID_CLASSES as PROCESS_FLOW_VALID_CLASSES,
 )
+from core.catalog_source_storage import (
+    load_catalog_source,
+    record_import_to_github,
+    set_labor_locked_to_github,
+)
 from core.data_validator import validate_all
 from core.usage_tracker import (
     track_event,
@@ -228,7 +240,7 @@ def _csv_mtime(filename: str) -> float:
 # renames, new columns, etc.) so the cache invalidates even if the underlying
 # CSV file's mtime hasn't changed. The bump takes effect on the next script run
 # (no Cloud reboot): every CSV loader below passes it as a hashed cache arg.
-_LOADER_SCHEMA_VERSION = 9
+_LOADER_SCHEMA_VERSION = 10
 
 
 def _fmt_min_hr(value, *, with_thousands: bool = True, hr_decimals: int = 1) -> str:
@@ -381,6 +393,41 @@ def _load_uploaded_schedules_dict(mtime: float):
 def _load_process_flow_edges(mtime: float):
     """Load data/process_flow.json. Cached per file mtime (hashed)."""
     return load_process_flow()
+
+
+@st.cache_data(show_spinner=False)
+def _load_catalog_source_cached(mtime: float):
+    """Load data/catalog_source.json — import provenance + the labor-minute
+    lock. Cached per file mtime (hashed)."""
+    return load_catalog_source()
+
+
+def _catalog_source() -> dict:
+    """The current provenance/lock state, via the mtime-keyed cache."""
+    return _load_catalog_source_cached(_csv_mtime("catalog_source.json"))
+
+
+def _labor_locked() -> bool:
+    """True when the team has marked labor minutes as maintained in Excel —
+    the in-app editors then refuse minute edits and point at the import."""
+    return bool(_catalog_source().get("labor_locked", False))
+
+
+def _provenance_line(catalog_key: str) -> str:
+    """One-line 'where these standards came from' for an editor caption, or
+    "" if that catalog has never been imported from a workbook."""
+    rec = (_catalog_source().get("imports") or {}).get(catalog_key)
+    if not rec:
+        return ""
+    where = f"`{rec['file']}`" + (f" › `{rec['sheet']}`" if rec.get("sheet") else "")
+    when = rec.get("at", "")
+    bits = []
+    if rec.get("cells"):
+        bits.append(f"{rec['cells']} cell(s)")
+    if rec.get("new_skus"):
+        bits.append(f"{rec['new_skus']} new SKU(s)")
+    tail = f" — {', '.join(bits)}" if bits else ""
+    return f"📘 Labor standards last imported from {where} on {when}{tail}."
 
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -7415,20 +7462,68 @@ def _render_import_view(machine_df, acc_df) -> None:
     the in-app editors. Nothing is written until save is clicked.
     """
     st.subheader("📥 Import from Excel")
+    for _p in (_provenance_line("machine"), _provenance_line("accessory")):
+        if _p:
+            st.caption(_p)
     st.caption(
-        "Edit labor minutes in Excel and push them back. Start from the database "
-        "workbook (**📤 Export & Excel link**), change cells on the **Machine "
-        "catalog** / **Accessory catalog** sheet or add a SKU row at the bottom, "
-        "save, and upload it here. You'll see exactly what would change before "
-        "anything is written; the save merges only those cells on top of whatever "
-        "the team has committed since."
+        "Bring labor standards in from Excel. Upload the IE's cycle-time workbook "
+        "**as it is** — its own headers (`SKU ID`, `Warehouse (PICK)`, "
+        "`Final Assy (FN-ASSY)` …) are recognised — or the database workbook from "
+        "**📤 Export & Excel link** after editing it. You'll see exactly what would "
+        "change before anything is written; the save merges only those cells on top "
+        "of whatever the team has committed since. Routing, descriptions and the "
+        "`XXX` estimation placeholders live in the app and are never touched by an "
+        "import."
     )
+
+    # Who owns the labor minutes. Locking makes the in-app editors refuse
+    # minute edits so the workbook stays the single source; it's a button
+    # rather than a checkbox bound to the persisted flag so a stale widget in
+    # one session can never silently re-save over a change another user made.
+    _locked_now = _labor_locked()
+    _lc1, _lc2 = st.columns([3, 2])
+    with _lc1:
+        st.markdown(
+            "**Source of truth for labor minutes:** "
+            + ("🔒 **Excel** — the in-app catalog editors won't accept minute edits."
+               if _locked_now else
+               "🔓 **either** — minutes can be edited in the app or imported from Excel.")
+        )
+    with _lc2:
+        _lock_label = (
+            "🔓 Unlock in-app minute editing" if _locked_now
+            else "🔒 Lock — standards live in Excel"
+        )
+        if st.button(
+            _lock_label, key="catalog_labor_lock_btn", width="stretch",
+            help=(
+                "Team-wide, saved to GitHub. Locked: the Machine / Accessory "
+                "catalog editors make the labor-minute columns read-only and point "
+                "here. Routing, Description, SKU renames and the add-SKU / "
+                "placeholder forms stay editable either way."
+            ),
+        ):
+            _tok = _github_token()
+            if not _tok:
+                st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+            else:
+                try:
+                    set_labor_locked_to_github(not _locked_now, _tok)
+                    _load_catalog_source_cached.clear()
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"❌ Couldn't save the lock: {exc}")
+
     with st.expander("What the import does — and doesn't", expanded=False):
         st.markdown(
             """
 - **Which sheets:** `Machine catalog` and `Accessory catalog` (the exported
-  workbook's names). A single-sheet file that isn't named is recognised by its
-  header row — keep the exported header. Other sheets are ignored.
+  workbook's names), or `Machine` / `Acc` and a few other spellings. A sheet
+  that isn't named is recognised by its header row. **The IE workbook's own
+  headers work** — `SKU ID`, `Warehouse (PICK)`, `Wire Assy (PREP-WH)`,
+  `Final Assy (FN-ASSY)`, `Acc KIT (PREP-ACC)` and so on map onto the
+  catalog's columns, and the preview lists every mapping it made. Columns like
+  `Unit`, `Total`, `Lead`, `Flag` are ignored. Other sheets are ignored.
 - **Matching:** rows match catalog rows by **SKU** (case doesn't matter).
   A SKU that isn't in the catalog becomes a **new row**.
 - **Never deletes:** catalog SKUs that aren't on the sheet are left exactly
@@ -7483,10 +7578,13 @@ def _render_import_view(machine_df, acc_df) -> None:
 
     for key, sheet in book.sheets.items():
         source_df = machine_df if key == "machine" else acc_df
-        _render_catalog_import_section(sheet, source_df, sig)
+        _render_catalog_import_section(
+            sheet, source_df, sig, upload_name=getattr(uploaded, "name", ""),
+        )
 
 
-def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
+def _render_catalog_import_section(sheet, source_df, upload_sig: str,
+                                   upload_name: str = "") -> None:
     """Preview + save for one catalog sheet of an uploaded workbook."""
     spec = sheet.spec
     icon = "🏭" if spec.key == "machine" else "🔌"
@@ -7497,6 +7595,16 @@ def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
     if sheet.matched_by == "header":
         st.caption(
             f"Recognised by its header row (the sheet isn't called `{spec.sheet}`)."
+        )
+    if sheet.aliased:
+        # The IE workbook's spellings, and what each one landed on. Shown
+        # rather than silently applied: a planner about to overwrite standards
+        # should see that "Final Assy (FN-ASSY)" is FN_Assy, not guess.
+        _pairs = list(sheet.aliased.items())
+        st.caption(
+            "Recognised the workbook's own headers: "
+            + ", ".join(f"`{src}` → `{dst}`" for src, dst in _pairs[:12])
+            + (" …" if len(_pairs) > 12 else "")
         )
     if sheet.extra_columns:
         st.caption(
@@ -7597,6 +7705,20 @@ def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
         )
         if result:
             st.session_state[done_key] = result
+            # Provenance: which workbook these standards now come from. Best
+            # effort — the catalog save already landed, so a hiccup here is
+            # reported, not fatal.
+            try:
+                _tok = _github_token()
+                if _tok:
+                    record_import_to_github(
+                        spec.key, file=upload_name or "workbook",
+                        sheet=sheet.sheet_name, cells=len(diff.cells),
+                        new_skus=len(diff.new_rows), token=_tok,
+                    )
+                    _load_catalog_source_cached.clear()
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"Saved, but couldn't record where the standards came from: {exc}")
 
 
 def _remember_data_setup_view() -> None:
@@ -7748,16 +7870,32 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
 
     st.subheader("🏭 Machine catalog")
     _render_stale_data_banner("data/machine_clean.csv")
+    locked = _labor_locked()
+    if locked:
+        st.info(
+            "🔒 **Labor minutes are maintained in Excel.** The minute columns below "
+            "are read-only — change them in the workbook and bring them in with "
+            "**📥 Import from Excel**. Routing, Description, SKU renames and the "
+            "add-SKU form still work here."
+        )
+    _prov = _provenance_line("machine")
+    if _prov:
+        st.caption(_prov)
     st.caption(
-        f"Edit labor times in the table below — **all labor columns are "
-        f"person-minutes per unit** (not hours; `Bat` is a battery count). SKUs "
-        f"used in the current schedule are highlighted. Click **💾 Save** to push "
-        f"changes to GitHub — all users see new values after redeploy (~1 min). · "
-        f"Routing columns shown are for **{location}** ({fac_code}); switch "
-        f"facility in the sidebar to edit another plant's routing."
+        f"{'Labor times are shown' if locked else 'Edit labor times'} in the table "
+        f"below — **all labor columns are person-minutes per unit** (not hours; "
+        f"`Bat` is a battery count). SKUs used in the current schedule are "
+        f"highlighted. Click **💾 Save** to push changes to GitHub — all users see "
+        f"new values after redeploy (~1 min). · Routing columns shown are for "
+        f"**{location}** ({fac_code}); switch facility in the sidebar to edit "
+        f"another plant's routing."
     )
 
     editable_cols = ["Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "ETO", "Bat"]
+    # Under the lock the grid can't produce minute edits (the columns are
+    # disabled) — and the diff/save are told there are no minute columns
+    # either, so nothing a stale grid might carry can reach the file.
+    save_cols = [] if locked else editable_cols
     display_df = machine_df.reset_index(drop=True).copy()
     # Backward-compat: alias old "FN_Assy_old" → "FN_Assy" if cache is stale
     if "FN_Assy_old" in display_df.columns and "FN_Assy" not in display_df.columns:
@@ -7886,12 +8024,16 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
         ),
     }
     for c in editable_cols:
-        col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
+        col_cfg[c] = st.column_config.NumberColumn(
+            c, min_value=0, step=1, disabled=locked,
+            help=("Maintained in Excel — change it in the workbook and use "
+                  "📥 Import from Excel.") if locked else None,
+        )
 
     edited = st.data_editor(
         display_df,
         width="stretch", num_rows="fixed",
-        key=f"fv_machine_editor_{int(only_used)}", height=600,
+        key=f"fv_machine_editor_{int(only_used)}_{int(locked)}", height=600,
         column_config=col_cfg, hide_index=True,
     )
 
@@ -7903,14 +8045,14 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
         renames, machine_df, key_prefix="fv_m", used_map=used_fg,
     )
     _render_pending_changes(
-        edited_cells, machine_df, editable_cols,
+        edited_cells, machine_df, save_cols,
         text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
     )
 
     if st.button("💾 Save updated Machine catalog to GitHub", width="stretch"):
         _save_catalog_csv(
             edited=edited_cells, source_df=machine_df,
-            editable_cols=editable_cols,
+            editable_cols=save_cols,
             file_path="data/machine_clean.csv", label="machine",
             text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
             renames=renames, merge_approved=merge_approved,
@@ -7926,13 +8068,28 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     """The Accessory-catalog editor — extracted from tab_floor_verification."""
     st.subheader("🔌 Accessory catalog")
     _render_stale_data_banner("data/acc_clean.csv")
+    locked = _labor_locked()
+    if locked:
+        st.info(
+            "🔒 **Labor minutes are maintained in Excel.** The minute columns below "
+            "are read-only — change them in the workbook and bring them in with "
+            "**📥 Import from Excel**. Description, SKU renames and the add-SKU / "
+            "placeholder forms still work here."
+        )
+    _prov = _provenance_line("accessory")
+    if _prov:
+        st.caption(_prov)
     st.caption(
-        "Edit labor times in the table below. SKUs used in the current schedule "
-        "are highlighted. Click **💾 Save** to push changes to GitHub."
+        f"{'Labor times are shown' if locked else 'Edit labor times'} in the table "
+        "below. SKUs used in the current schedule are highlighted. Click "
+        "**💾 Save** to push changes to GitHub."
     )
 
     editable_cols = ["Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw",
                      "PMAcc", "GenAcc", "ComAcc"]
+    # See the machine editor: disabled columns can't produce edits, and the
+    # diff/save are told there are no minute columns besides.
+    save_cols = [] if locked else editable_cols
     display_df = acc_df.reset_index(drop=True).copy()
     # Backward-compat: alias "Compressor" → "ComAcc" if cache is stale
     if "Compressor" in display_df.columns and "ComAcc" not in display_df.columns:
@@ -8015,12 +8172,16 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
         ),
     }
     for c in editable_cols:
-        col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
+        col_cfg[c] = st.column_config.NumberColumn(
+            c, min_value=0, step=1, disabled=locked,
+            help=("Maintained in Excel — change it in the workbook and use "
+                  "📥 Import from Excel.") if locked else None,
+        )
 
     edited = st.data_editor(
         display_df,
         width="stretch", num_rows="fixed",
-        key=f"fv_acc_editor_{int(only_used)}", height=600,
+        key=f"fv_acc_editor_{int(only_used)}_{int(locked)}", height=600,
         column_config=col_cfg, hide_index=True,
     )
     st.caption(
@@ -8035,12 +8196,12 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     merge_approved = _render_rename_collisions(
         renames, acc_df, key_prefix="fv_a", used_map=used_acc,
     )
-    _render_pending_changes(edited_cells, acc_df, editable_cols, text_cols=["Description"])
+    _render_pending_changes(edited_cells, acc_df, save_cols, text_cols=["Description"])
 
     if st.button("💾 Save updated Accessory catalog to GitHub", width="stretch"):
         _save_catalog_csv(
             edited=edited_cells, source_df=acc_df,
-            editable_cols=editable_cols,
+            editable_cols=save_cols,
             file_path="data/acc_clean.csv", label="accessory",
             text_cols=["Description"], renames=renames,
             merge_approved=merge_approved,

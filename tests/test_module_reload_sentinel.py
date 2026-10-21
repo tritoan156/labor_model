@@ -78,3 +78,30 @@ class TestShimStillWired:
         # stale loader survives the reload that was meant to replace it.
         m = re.search(r"for _modname in \((.*?)\):", SOURCE, re.DOTALL)
         assert m and '"core.data_loader"' in m.group(1)
+
+
+class TestNewCoreNamesAreProbed:
+    """Point-checks for names added after the shim was written. Each one is a
+    name that a *reloaded* module imports from another core module (or that
+    app.py reads off a returned object), so a stale source module breaks the
+    import or the attribute access on a warm Streamlit Cloud process even
+    though every local test passes.
+
+    Add a line here whenever you add such a name — and add the matching
+    sentinel to app.py's `_stale` block."""
+
+    @pytest.mark.parametrize("probe", [
+        'hasattr(core.data_loader, "canonical_catalog_column")',  # excel_io imports it
+        'hasattr(core.excel_io, "_is_sku_header")',                # app reads sheet.aliased
+    ])
+    def test_probed_in_stale_block(self, probe):
+        assert STALE_BLOCK, "couldn't find the `_stale = (...)` block in app.py"
+        assert probe in STALE_BLOCK.group(1), (
+            f"app.py's `_stale` block no longer probes {probe}; a warm process "
+            "would pair the new app.py with a stale core module."
+        )
+
+    def test_new_store_module_is_imported_and_reloaded(self):
+        assert "import core.catalog_source_storage" in SOURCE
+        m = re.search(r"for _modname in \((.*?)\):", SOURCE, re.DOTALL)
+        assert m and '"core.catalog_source_storage"' in m.group(1)

@@ -37,7 +37,7 @@ import io
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -45,9 +45,11 @@ import pandas as pd
 
 from .catalog_storage import GITHUB_BRANCH, GITHUB_REPO
 from .data_loader import (
+    CATALOG_COLUMN_ALIASES,
     ScheduleColumnError,
     _REQUIRED_SCHEDULE_COLUMNS,
     _find_column,
+    canonical_catalog_column,
 )
 from .exec_scenario_storage import load_all_exec_scenarios
 from .facility_settings_storage import load_all_facility_settings
@@ -689,6 +691,10 @@ class CatalogSheet:
     #: ``"name"`` (sheet called e.g. ``Machine catalog``) or ``"header"``
     #: (worked out from the labor columns in its header row).
     matched_by: str = "name"
+    #: Sheet headers that weren't the app's own names but resolved through
+    #: :data:`CATALOG_COLUMN_ALIASES` — ``{"Warehouse (PICK)": "Warehouse"}``.
+    #: Shown in the preview so a planner sees the mapping rather than trusting it.
+    aliased: dict[str, str] = field(default_factory=dict)
 
     @property
     def file_path(self) -> str:
@@ -779,15 +785,27 @@ def _sheet_key_for_name(name) -> str | None:
     return None
 
 
+#: Header cells that mean "this is the SKU column" — the app's ``SKU`` and the
+#: IE workbook's ``SKU ID`` / ``FG SKU``. Exact (case-insensitive) on purpose:
+#: a header cell is the whole name, and a substring test would see ``SKU`` in
+#: a schedule sheet's ``SKU IN BC`` and take that tab for a catalog.
+_SKU_HEADER_NAMES = frozenset(
+    a.upper() for a in CATALOG_COLUMN_ALIASES["machine"]["SKU"]
+)
+
+
+def _is_sku_header(cell) -> bool:
+    return _cell_to_text(cell).strip().upper() in _SKU_HEADER_NAMES
+
+
 def find_catalog_header_row(raw: pd.DataFrame) -> int | None:
     """Index of the first row (within :data:`HEADER_SCAN_ROWS`) that has a
-    cell reading ``SKU`` (case-insensitive) — the catalog header. ``raw`` is
-    a sheet read with ``header=None``."""
+    SKU header cell — ``SKU`` as the app writes it, or ``SKU ID`` as the IE
+    workbook does. ``raw`` is a sheet read with ``header=None``."""
     if raw is None or raw.empty:
         return None
     for i in range(min(len(raw), HEADER_SCAN_ROWS)):
-        cells = [_cell_to_text(c).lower() for c in raw.iloc[i].tolist()]
-        if "sku" in cells:
+        if any(_is_sku_header(c) for c in raw.iloc[i].tolist()):
             return i
     return None
 
@@ -799,12 +817,14 @@ def _header_names(raw: pd.DataFrame, header_row: int) -> list[str]:
 def _infer_key_from_header(header: list[str]) -> str | None:
     """Which catalog a header belongs to, judged by its labor columns: the
     spec with the most of its numeric columns present wins; it needs at least
-    one, and a tie (e.g. ``SKU`` + ``Warehouse`` only) is *no* answer."""
-    present = {h.strip().lower() for h in header}
-    scores = {
-        key: sum(1 for c in spec.numeric_cols if c.lower() in present)
-        for key, spec in CATALOG_SPECS.items()
-    }
+    one, and a tie (e.g. ``SKU`` + ``Warehouse`` only) is *no* answer.
+
+    Headers are resolved through :func:`canonical_catalog_column` first, so
+    the IE workbook's ``Final Assy (FN-ASSY)`` counts as ``FN_Assy``."""
+    scores = {}
+    for key, spec in CATALOG_SPECS.items():
+        resolved = {canonical_catalog_column(h, key) for h in header}
+        scores[key] = sum(1 for c in spec.numeric_cols if c in resolved)
     best = max(scores.values()) if scores else 0
     if best == 0:
         return None
@@ -825,8 +845,18 @@ def _build_catalog_sheet(spec: CatalogSpec, sheet_name: str, raw: pd.DataFrame,
     body = raw.iloc[header_row + 1:]
     data: dict[str, list[str]] = {}
     extra: list[str] = []
+    aliased: dict[str, str] = {}
     for pos, cell in enumerate(header):
         live_name = lookup.get(cell.strip().lower())
+        if live_name is None:
+            # Not one of the app's own names — try the IE workbook's spelling
+            # ("Warehouse (PICK)", "SKU ID", "🔋Bat" …). Only a column the live
+            # CSV actually has may be targeted, so a stale header can't make
+            # the import write somewhere the save wouldn't recognise.
+            canonical = canonical_catalog_column(cell, spec.key)
+            if canonical is not None and canonical.lower() in lookup:
+                live_name = lookup[canonical.lower()]
+                aliased[cell] = live_name
         if live_name is None:
             if cell:
                 extra.append(cell)
@@ -851,7 +881,7 @@ def _build_catalog_sheet(spec: CatalogSpec, sheet_name: str, raw: pd.DataFrame,
     return CatalogSheet(
         spec=spec, sheet_name=sheet_name, frame=frame, live_columns=live_cols,
         columns=columns, missing_columns=missing, extra_columns=extra,
-        duplicate_skus=duplicates, matched_by=matched_by,
+        duplicate_skus=duplicates, matched_by=matched_by, aliased=aliased,
     )
 
 

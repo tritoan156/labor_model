@@ -807,3 +807,128 @@ app._render_catalog_import_section(book.sheets["machine"], load_machine_labor(),
         assert problems["Value"].tolist() == ["4O"]
         save = [b for b in at.button if b.label.startswith("💾 Save")]
         assert len(save) == 1 and save[0].disabled
+
+
+# ---------------------------------------------------------------------------
+# The IE workbook as it is — its own headers, not the app's export
+# ---------------------------------------------------------------------------
+IE_MACHINE_HEADER = [
+    "🟡", "Unit", "SKU ID", "Description", "Warehouse (PICK)", "Wire Assy (PREP-WH)",
+    "Sub Trl (SUB-TRL)", "Final Assy (FN-ASSY)", "PDI (TEST-PDI)", "QC (TEST-FN-QC)",
+    "Ship (MAT-REIC-SHIP)", "Total", "🔋Bat", "Lead", "Flag",
+]
+IE_ACC_HEADER = [
+    "SKU ID", "Description", "Warehouse (PICK)", "Acc KIT (PREP-ACC)",
+    "Battery Assy (PREP-NP)", "Battery Sub raw (SUB-BTR raw)", "PM Acc (SUB-PM)",
+    "Gen Sub (SUB-GEN)", "Compressor (SUB-COM)", "Total",
+]
+
+
+class TestIEWorkbookNativeLayout:
+    """The industrial engineers' cycle-time workbook imports directly: a title
+    row, their header spellings, marker / total / lead columns. Nothing has to
+    be exported from the app first."""
+
+    def _machine_book(self, sheet_name="Cycle Times"):
+        rows = [
+            ["Cycle Times — Machines"] + [None] * (len(IE_MACHINE_HEADER) - 1),
+            [None] * len(IE_MACHINE_HEADER),
+            IE_MACHINE_HEADER,
+            # BOSS25-010: only FN_Assy differs from the live catalog (45 → 50).
+            [None, "EA", "BOSS25-010", "EBOSS 25 TRAILER", 10, 60, 210, 50, 60, 60, 30, 480, 1, None, None],
+            # A SKU the catalog doesn't have.
+            [None, "EA", "NEW-001", "brand new", 5, 0, 0, 100, 30, 30, 15, 180, 0, None, None],
+        ]
+        return _workbook({sheet_name: rows})
+
+    def test_unnamed_sheet_is_detected_by_its_ie_header(self):
+        book = read_catalog_workbook(self._machine_book(), "CycleTimes.xlsx", live_columns=LIVE)
+        assert list(book.sheets) == ["machine"]
+        assert book.sheets["machine"].matched_by == "header"
+
+    def test_every_ie_header_lands_on_the_right_column_and_is_reported(self):
+        sheet = _sheet(self._machine_book())
+        assert sheet.aliased == {
+            "SKU ID": "SKU",
+            "Warehouse (PICK)": "Warehouse",
+            "Wire Assy (PREP-WH)": "Wire",
+            "Sub Trl (SUB-TRL)": "Trailer",
+            "Final Assy (FN-ASSY)": "FN_Assy",
+            "PDI (TEST-PDI)": "PDI",
+            "QC (TEST-FN-QC)": "QC",
+            "Ship (MAT-REIC-SHIP)": "Ship",
+            "🔋Bat": "Bat",
+        }
+        # "Description" is the app's own name — matched exactly, not aliased.
+        assert "Description" in sheet.columns and "Description" not in sheet.aliased
+        assert set(sheet.extra_columns) == {"🟡", "Unit", "Total", "Lead", "Flag"}
+        # The IE sheet has no ETO and no routing — those stay untouched.
+        assert "ETO" in sheet.missing_columns
+        assert "Final Station HND" in sheet.missing_columns
+        assert "Warehouse" not in sheet.missing_columns
+
+    def test_diff_changes_exactly_the_edited_minute_and_adds_the_new_sku(self):
+        diff = diff_catalog_sheet(_sheet(self._machine_book()), _machine_live())
+        assert not diff.blocked
+        assert diff.cell_tuples() == [("BOSS25-010", "FN_Assy", 50.0)]
+        assert diff.new_skus == ["NEW-001"]
+        # Catalog SKUs the IE sheet doesn't list are left alone — placeholders survive.
+        assert set(diff.absent_skus) == {"BOSS70-002", "PDS185-001"}
+
+    def test_named_ie_sheet_also_reconciles_through_the_aliases(self):
+        # "Machine" is a recognised sheet name, so this one is matched by name —
+        # the header aliasing has to kick in regardless of how the sheet was found.
+        sheet = _sheet(self._machine_book(sheet_name="Machine"))
+        assert sheet.matched_by == "name"
+        assert sheet.aliased["Final Assy (FN-ASSY)"] == "FN_Assy"
+        assert diff_catalog_sheet(sheet, _machine_live()).cell_tuples() == [
+            ("BOSS25-010", "FN_Assy", 50.0),
+        ]
+
+    def test_accessory_sheet_in_ie_spelling(self):
+        rows = [
+            IE_ACC_HEADER,
+            # GenAcc 0 → 145; everything else equal to the live row.
+            ["BOSS25-A016", "KIT A", 10, 10, 0, 320, 60, 145, 0, 545],
+        ]
+        book = read_catalog_workbook(_workbook({"Acc": rows}), "CycleTimes.xlsx", live_columns=LIVE)
+        sheet = book.sheets["accessory"]
+        assert sheet.aliased == {
+            "SKU ID": "SKU",
+            "Warehouse (PICK)": "Warehouse",
+            "Acc KIT (PREP-ACC)": "AccKIT",
+            "Battery Assy (PREP-NP)": "Nameplate Prep",
+            "Battery Sub raw (SUB-BTR raw)": "BattSubRaw",
+            "PM Acc (SUB-PM)": "PMAcc",
+            "Gen Sub (SUB-GEN)": "GenAcc",
+            "Compressor (SUB-COM)": "ComAcc",
+        }
+        assert diff_catalog_sheet(sheet, _acc_live()).cell_tuples() == [
+            ("BOSS25-A016", "GenAcc", 145.0),
+        ]
+
+    def test_a_schedule_tab_is_not_mistaken_for_a_catalog(self):
+        # A schedule sheet has "SKU" inside other headers ("SKU IN BC",
+        # "Cycle Time FG SKU ID") but no SKU header cell of its own. The SKU
+        # header test is exact on purpose so this tab is skipped, not imported.
+        rows = [
+            ["PRIORITY", "LOCATION", "MODEL TYPE", "FG SKU ID", "BUILD QTY",
+             "SKU IN BC", "Cycle Time FG SKU ID", "Total Time"],
+            [1, "Spartanburg", "SDG45S", "SDG45-001", 1, "YES", 240, 300],
+        ]
+        book = read_catalog_workbook(_workbook({"Schedule": rows}), "sched.xlsx", live_columns=LIVE)
+        assert book.sheets == {}
+        assert book.skipped and "SKU" in book.skipped[0][1]
+
+    def test_routing_header_is_never_aliased_onto_final_assembly(self):
+        # With an empty live header the fallback live columns have no routing
+        # names, so "Final Station HND" can't match exactly — it must then be
+        # ignored, not aliased to FN_Assy through "Final".
+        rows = [["SKU", "FN_Assy", "Final Station HND"], ["BOSS25-010", 45, "Undercarriage"]]
+        book = read_catalog_workbook(
+            _workbook({"Machine catalog": rows}), "x.xlsx",
+            live_columns={"machine": [], "accessory": []},
+        )
+        sheet = book.sheets["machine"]
+        assert "Final Station HND" in sheet.extra_columns
+        assert sheet.aliased == {}

@@ -1,10 +1,13 @@
 # Floor versions — Streamlit Cloud picks compatible patch/minor releases.
 # Bump the floors when the team validates a newer combination locally.
 #
-# 1.36+ required for column_config(pinned=True) — pins SKU/Description in
-# the catalog editors so they stay visible during horizontal scroll. If we
-# ever fall below this floor those pins silently stop working.
-streamlit>=1.36
+# 1.51+ required: the app sizes every element with width="stretch" (buttons
+# gained `width` in 1.48, dataframe/data_editor/graphviz in 1.49, plotly_chart
+# in 1.51). The old use_container_width= kwarg is deprecated and scheduled for
+# removal, so with no upper cap here a Cloud version bump would break the app
+# if we ever fell back to it. 1.36+ (column_config pinned=True, which keeps
+# SKU/Description frozen in the catalog editors) is implied by this floor.
+streamlit>=1.51
 # Cap below pandas 3: core/data_loader.py disables the Arrow-string default via
 # `pd.set_option("future.infer_string", False)`. That option is removed in
 # pandas 3 (Arrow strings become mandatory), where the try/except shim silently

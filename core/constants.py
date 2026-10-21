@@ -238,37 +238,3 @@ def get_battery_type(fg_base: str) -> str:
     if s.startswith("BOSS125") or s.startswith("BOSS220") or s.startswith("BOSS400"):
         return "125-20"
     return "UNKNOWN"
-
-# Battery types in volume order (for prioritization in scheduler)
-BATTERY_TYPES = ["25-12", "70-16", "70-20", "125-20"]
-
-# Type volume rank for May 2026 (1=highest volume) — used for priority ordering.
-# This may shift in future months; the scheduler can recompute dynamically.
-TYPE_VOLUME_RANK_DEFAULT = {
-    "70-20": 1,
-    "125-20": 2,
-    "70-16": 3,
-    "25-12": 4,
-}
-
-# === Battery count overrides ===
-# Some SKUs need more batteries than the Machine_Clean default.
-# These take precedence if non-zero.
-BATTERY_COUNT_OVERRIDES = {
-    "BOSS220HS-002": 3,  # confirmed: 3 batteries (was 2)
-    "BOSS400HS-002": 5,  # confirmed: 5 batteries
-}
-
-# === Family priority for sequencing within Final Assembly ===
-# Higher-volume families first (carryover & ETO override this).
-FAMILY_PRIORITY_DEFAULT = {
-    "BOSS70-017": 1, "BOSS70-012": 2, "BOSS70HS-001": 3, "BOSS25-006": 4,
-    "BOSS25-010": 5, "BOSS25-014": 6, "BOSS125-004": 7, "BOSS70-019": 8,
-    "BOSS70-001": 9, "BOSS400HS-002": 10, "BOSS220HS-002": 11,
-}
-
-# === Marry batching rules (Final Assembly) ===
-MARRY_BATCH_SIZE = 5
-MARRY_RATE_FULL = 5  # 1 person can marry 5 same-family units/day
-MARRY_RATE_ORPHAN = 4  # 1 person can marry 4 mixed-kW orphans/day
-MARRY_PEOPLE = 2  # part of the 4 HC at Final Assembly

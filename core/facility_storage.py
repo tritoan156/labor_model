@@ -1,29 +1,34 @@
 """Facility crew config persistence — load from JSON, save via GitHub API.
 
 The JSON file `data/facility_crew.json` holds HC/Conc/Crew per station for
-each facility. Saves go directly to GitHub via the REST API so all users
-see updates after Streamlit Cloud redeploys.
+each facility. Saves go through ``catalog_storage`` like every other storage
+module — the same SHA-locked fetch → merge → PUT, retried once on
+``GitHubConflict`` — so they land on whichever branch
+``catalog_storage.GITHUB_BRANCH`` resolved from ``st.secrets["github_branch"]``
+(``main`` for the live app, ``staging`` for the staging app). This module
+used to hardcode ``main``, which sent the staging app's crew saves into the
+live data file.
 
 Requires a GitHub Personal Access Token stored in Streamlit Secrets
 (`st.secrets["github_token"]`) for the save path. Reads work without a token.
 """
 from __future__ import annotations
 
-import base64
 import json
 from pathlib import Path
 
 import pandas as pd
-import requests
 
+from .catalog_storage import (
+    fetch_catalog_csv_from_github,
+    save_catalog_to_github,
+    GitHubConflict,
+)
 from .constants import STATION_DEFAULTS, SUPPORT_ROLES
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 FACILITY_CREW_PATH = DATA_DIR / "facility_crew.json"
-
-GITHUB_REPO = "tritoan156/labor_model"
 GITHUB_FILE_PATH = "data/facility_crew.json"
-GITHUB_BRANCH = "main"
 
 
 def _default_facility_config() -> dict:
@@ -91,6 +96,41 @@ def load_facility_crew_df(facility: str) -> pd.DataFrame:
     return pd.DataFrame(ordered).set_index("Station")
 
 
+def _fetch_existing_from_github(token: str) -> "tuple[dict, str | None]":
+    """Pull current facility_crew.json from GitHub → (parsed_dict, sha).
+
+    A true 404 (the file doesn't exist on this branch yet) seeds from the local
+    copy, so a first save on a fresh branch carries every facility rather than
+    only the one being saved. Any OTHER failure — the file exists but its
+    content couldn't be read, or it isn't a JSON object — is RAISED instead of
+    falling back to this container's deploy-time copy: pushing that would
+    silently clobber crew edits other users made since our deploy.
+    """
+    content_bytes, sha = fetch_catalog_csv_from_github(GITHUB_FILE_PATH, token)
+    if not content_bytes:
+        if sha is not None:
+            raise RuntimeError(
+                f"{GITHUB_FILE_PATH} exists on GitHub but its contents couldn't "
+                "be read just now — not overwriting it. Try again in a moment."
+            )
+        return load_all_facility_configs(), None
+    parsed = json.loads(content_bytes.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{GITHUB_FILE_PATH} on GitHub is not a JSON object.")
+    return parsed, sha
+
+
+def _write_local(content: str) -> None:
+    """Mirror the latest JSON to the local data/ folder so the same container
+    sees the change immediately (without waiting for the GitHub redeploy)."""
+    try:
+        FACILITY_CREW_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(FACILITY_CREW_PATH, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception:
+        pass
+
+
 def save_facility_crew_to_github(facility: str, crew_df: pd.DataFrame, token: str) -> dict:
     """Update facility_crew.json on GitHub via the REST API.
 
@@ -99,30 +139,12 @@ def save_facility_crew_to_github(facility: str, crew_df: pd.DataFrame, token: st
       crew_df: DataFrame indexed by Station with HC/Conc/Crew columns
       token: GitHub Personal Access Token (Contents: write permission)
 
-    Returns the GitHub API response JSON. Raises on HTTP error.
+    Fetches the latest file from ``catalog_storage.GITHUB_BRANCH``, replaces
+    this facility's block, and PUTs it back SHA-locked; a ``GitHubConflict``
+    (someone else saved in between) is retried once with a fresh fetch, then
+    re-raised. Mirrors the result locally. Returns the GitHub API response
+    JSON. Raises on HTTP error.
     """
-    api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-    }
-
-    # Fetch the current file SHA (required to update)
-    sha = None
-    existing = {}
-    r = requests.get(api_url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=15)
-    if r.status_code == 200:
-        sha = r.json().get("sha")
-        try:
-            existing = json.loads(base64.b64decode(r.json()["content"]).decode("utf-8"))
-        except Exception:
-            existing = load_all_facility_configs()
-    elif r.status_code == 404:
-        existing = load_all_facility_configs()
-    else:
-        r.raise_for_status()
-
-    # Build the new content
     new_facility_cfg = {
         st_name: {
             "HC": int(crew_df.loc[st_name, "HC"]),
@@ -131,18 +153,20 @@ def save_facility_crew_to_github(facility: str, crew_df: pd.DataFrame, token: st
         }
         for st_name in crew_df.index
     }
-    existing[facility] = new_facility_cfg
-    new_content = json.dumps(existing, indent=2)
 
-    # Commit via PUT
-    payload = {
-        "message": f"Update {facility} crew config via app",
-        "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
-        "branch": GITHUB_BRANCH,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    put_r = requests.put(api_url, headers=headers, json=payload, timeout=15)
-    put_r.raise_for_status()
-    return put_r.json()
+    for attempt in (1, 2):
+        existing, sha = _fetch_existing_from_github(token)
+        existing[facility] = new_facility_cfg
+        new_content = json.dumps(existing, indent=2)
+        try:
+            response = save_catalog_to_github(
+                new_content, GITHUB_FILE_PATH, token,
+                message=f"Update {facility} crew config via app",
+                sha=sha,
+            )
+            _write_local(new_content)
+            return response
+        except GitHubConflict:
+            if attempt == 2:
+                raise
+            continue

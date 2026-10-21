@@ -20,6 +20,13 @@ Two jobs, both Streamlit-free so they're unit-testable:
    once for the whole database, once for the current session's analysis
    (schedule / per-unit labor / capacity table).
 
+3. **Write-back** — :func:`read_catalog_workbook` finds the ``Machine catalog``
+   / ``Accessory catalog`` sheets in an uploaded workbook (the export, or a
+   planner's own single-sheet file) and :func:`diff_catalog_sheet` turns a
+   sheet into the same per-cell diffs the in-app editor saves, so Excel edits
+   go through the app's fetch-fresh + SHA-locked merge instead of replacing
+   the file.
+
 :func:`raw_github_url` and :func:`power_query_m_for_csv` back the "link Excel
 to the live data" panel — the data files are plain CSV/JSON on GitHub, so
 Excel's *Get Data → From Web* can read them directly and refresh on demand.
@@ -30,6 +37,7 @@ import io
 import json
 import math
 import re
+from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -577,4 +585,602 @@ def build_database_workbook(data_dir: Path | str | None = None, *,
     return build_workbook(
         database_tables(data_dir, include_saved_schedule_rows=include_saved_schedule_rows),
         readme=database_readme(include_saved_schedule_rows=include_saved_schedule_rows),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inbound — catalog workbook → cell-level changes for the SHA-locked save
+# ---------------------------------------------------------------------------
+# A planner exports the database workbook, edits labor minutes (or adds a SKU
+# row) on the ``Machine catalog`` / ``Accessory catalog`` sheet in Excel, and
+# uploads the file back. :func:`read_catalog_workbook` finds those sheets and
+# checks their header against the live CSV; :func:`diff_catalog_sheet` turns a
+# sheet into the same ``(sku, column, new_value)`` cell diffs the in-app
+# editor produces, so the app can push them through its existing fetch-fresh
+# + SHA-locked merge instead of overwriting the file.
+
+#: Labor (person-minute) columns of each catalog, in CSV order — the cells the
+#: in-app editors let a planner type into. ``Bat`` is a battery count rather
+#: than minutes, but it is edited and validated the same way (a number ≥ 0).
+MACHINE_LABOR_COLUMNS: tuple[str, ...] = (
+    "Warehouse", "Wire", "Trailer", "FN_Assy", "PDI", "QC", "Ship", "ETO", "Bat",
+)
+ACCESSORY_LABOR_COLUMNS: tuple[str, ...] = (
+    "Warehouse", "AccKIT", "Nameplate Prep", "BattSubRaw", "PMAcc", "GenAcc", "ComAcc",
+)
+
+#: What the machine editor's routing dropdowns offer, per station. Mirrors the
+#: ``SelectboxColumn(options=...)`` lists in ``app.tab_floor_verification_machine``
+#: — tests/test_excel_catalog_import.py checks the two stay in step. A blank
+#: cell is also accepted (the loader falls back to the station's own default).
+ROUTING_OPTIONS: dict[str, tuple[str, ...]] = {
+    "Final": ("Final", "Undercarriage", "ComAcc", "GenAcc", "PMAcc"),
+    "AccKIT": ("AccKIT", "ComAcc", "GenAcc", "PMAcc", "Final"),
+    "PDI": ("PDI", "ComAcc", "GenAcc", "PMAcc", "Final", "QC"),
+    "Wire": ("Wire", "GenAcc", "ComAcc", "PMAcc", "Final", "Trailer"),
+    "Undercarriage": ("Undercarriage", "ComAcc", "GenAcc", "PMAcc", "Final"),
+}
+
+#: ``Final Station HND`` → station ``Final``, facility code ``HND``. Any
+#: facility code is accepted so a fourth plant's columns import unchanged.
+_ROUTING_COLUMN_RE = re.compile(
+    r"^(Final|AccKIT|PDI|Wire|Undercarriage) Station ([A-Z]{2,4})$"
+)
+
+#: A SKU may not start with these — Excel / Sheets would run the cell as a
+#: formula when the CSV is opened (same guard as the in-app add-SKU forms).
+FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+@dataclass(frozen=True)
+class CatalogSpec:
+    """One importable catalog: which sheet / file it is and what's numeric."""
+    key: str
+    label: str
+    sheet: str
+    file_name: str
+    numeric_cols: tuple[str, ...]
+    #: Other sheet names (lower-case) that mean this catalog, so a planner's
+    #: own single-sheet file called ``machines`` is picked up by name too.
+    aliases: tuple[str, ...] = ()
+
+    @property
+    def file_path(self) -> str:
+        return f"data/{self.file_name}"
+
+
+CATALOG_SPECS: dict[str, CatalogSpec] = {
+    "machine": CatalogSpec(
+        key="machine", label="machine", sheet="Machine catalog",
+        file_name="machine_clean.csv", numeric_cols=MACHINE_LABOR_COLUMNS,
+        aliases=("machine", "machines", "machine_clean", "fg", "fg catalog"),
+    ),
+    "accessory": CatalogSpec(
+        key="accessory", label="accessory", sheet="Accessory catalog",
+        file_name="acc_clean.csv", numeric_cols=ACCESSORY_LABOR_COLUMNS,
+        aliases=("accessory", "accessories", "acc_clean", "acc", "acc catalog"),
+    ),
+}
+
+
+class CatalogImportError(ValueError):
+    """The upload can't be read as a workbook at all (garbage bytes, no
+    sheets). Per-sheet trouble is reported on the :class:`CatalogWorkbook`
+    instead, so the planner sees every sheet's verdict at once."""
+
+
+@dataclass
+class CatalogSheet:
+    """One catalog sheet as read from the upload, header already reconciled
+    with the live CSV. ``frame`` is all text (``_cell_to_text``), one row per
+    non-blank SKU, columns in live-header order."""
+    spec: CatalogSpec
+    sheet_name: str
+    frame: pd.DataFrame
+    live_columns: list[str]
+    #: Live columns the sheet carries (what the diff may touch).
+    columns: list[str]
+    #: Editable live columns the sheet lacks — left untouched on every row.
+    missing_columns: list[str]
+    #: Sheet columns the live CSV doesn't have — ignored.
+    extra_columns: list[str]
+    #: SKUs (upper-cased) listed more than once on the sheet.
+    duplicate_skus: list[str]
+    #: ``"name"`` (sheet called e.g. ``Machine catalog``) or ``"header"``
+    #: (worked out from the labor columns in its header row).
+    matched_by: str = "name"
+
+    @property
+    def file_path(self) -> str:
+        return self.spec.file_path
+
+
+@dataclass
+class CatalogWorkbook:
+    sheets: dict[str, CatalogSheet]
+    #: ``(sheet name, why it was not used)`` for every other sheet.
+    skipped: list[tuple[str, str]]
+    sheet_names: list[str]
+
+
+def live_catalog_columns(data_dir: Path | str | None = None) -> dict[str, list[str]]:
+    """Header of each catalog CSV as deployed, keyed like :data:`CATALOG_SPECS`.
+    A missing file gives an empty list (the reader then validates against the
+    spec's known columns)."""
+    data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
+    out: dict[str, list[str]] = {}
+    for key, spec in CATALOG_SPECS.items():
+        path = data_dir / spec.file_name
+        if path.exists():
+            head = pd.read_csv(path, nrows=0, encoding="utf-8-sig")
+            out[key] = [str(c).strip() for c in head.columns]
+        else:
+            out[key] = []
+    return out
+
+
+def routing_station(column) -> str | None:
+    """``"PDI Station CYP"`` → ``"PDI"``; ``None`` for a non-routing column."""
+    m = _ROUTING_COLUMN_RE.match(str(column or "").strip())
+    return m.group(1) if m else None
+
+
+def editable_columns(spec: CatalogSpec, live_cols) -> tuple[list[str], list[str]]:
+    """``(numeric, text)`` columns the import may change, in live-header
+    order: the catalog's labor columns, ``Description``, and every
+    per-facility routing column. ``SKU`` and ``Last Modified`` are never
+    written from a sheet (the save stamps Last Modified itself)."""
+    live_cols = [str(c) for c in live_cols]
+    numeric = [c for c in live_cols if c in spec.numeric_cols]
+    text = [c for c in live_cols if c == "Description" or routing_station(c)]
+    return numeric, text
+
+
+def parse_labor_value(raw) -> float | None:
+    """A labor cell as a number: ``"45"`` / ``"45.0"`` / ``45`` / ``" 1,200 "``
+    → ``float``; a blank cell → ``None`` (meaning *no value given*). Raises
+    ``ValueError`` with a planner-readable reason for anything else, including
+    negative or non-finite numbers (the editors cap at ``min_value=0``)."""
+    text = _cell_to_text(raw)
+    if text == "":
+        return None
+    cleaned = text.replace(",", "").replace(" ", "")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        raise ValueError(f"'{text}' is not a number") from None
+    if not math.isfinite(value):
+        raise ValueError(f"'{text}' is not a finite number")
+    if value < 0:
+        raise ValueError(f"'{text}' is negative — labor minutes can't be below 0")
+    return value
+
+
+def normalize_routing_value(column: str, raw) -> str:
+    """The dropdown spelling of a routing cell (``"final"`` → ``"Final"``).
+    A blank cell stays blank. Raises ``ValueError`` when the value isn't one
+    of that station's options — the same list the in-app editor offers."""
+    station = routing_station(column)
+    text = _cell_to_text(raw)
+    if text == "" or station is None:
+        return text
+    options = ROUTING_OPTIONS.get(station, ())
+    for option in options:
+        if option.lower() == text.lower():
+            return option
+    raise ValueError(f"'{text}' is not one of: {', '.join(options)}")
+
+
+def _sheet_key_for_name(name) -> str | None:
+    n = str(name or "").strip().lower()
+    for key, spec in CATALOG_SPECS.items():
+        if n == spec.sheet.lower() or n in spec.aliases:
+            return key
+    return None
+
+
+def find_catalog_header_row(raw: pd.DataFrame) -> int | None:
+    """Index of the first row (within :data:`HEADER_SCAN_ROWS`) that has a
+    cell reading ``SKU`` (case-insensitive) — the catalog header. ``raw`` is
+    a sheet read with ``header=None``."""
+    if raw is None or raw.empty:
+        return None
+    for i in range(min(len(raw), HEADER_SCAN_ROWS)):
+        cells = [_cell_to_text(c).lower() for c in raw.iloc[i].tolist()]
+        if "sku" in cells:
+            return i
+    return None
+
+
+def _header_names(raw: pd.DataFrame, header_row: int) -> list[str]:
+    return [_cell_to_text(c) for c in raw.iloc[header_row].tolist()]
+
+
+def _infer_key_from_header(header: list[str]) -> str | None:
+    """Which catalog a header belongs to, judged by its labor columns: the
+    spec with the most of its numeric columns present wins; it needs at least
+    one, and a tie (e.g. ``SKU`` + ``Warehouse`` only) is *no* answer."""
+    present = {h.strip().lower() for h in header}
+    scores = {
+        key: sum(1 for c in spec.numeric_cols if c.lower() in present)
+        for key, spec in CATALOG_SPECS.items()
+    }
+    best = max(scores.values()) if scores else 0
+    if best == 0:
+        return None
+    winners = [k for k, s in scores.items() if s == best]
+    return winners[0] if len(winners) == 1 else None
+
+
+def _build_catalog_sheet(spec: CatalogSpec, sheet_name: str, raw: pd.DataFrame,
+                         header_row: int, live_cols: list[str],
+                         matched_by: str) -> CatalogSheet:
+    if not live_cols:
+        live_cols = ["SKU", "Description", *spec.numeric_cols, "Last Modified"]
+    live_cols = [str(c) for c in live_cols]
+    lookup = {c.strip().lower(): c for c in live_cols}
+    lookup.setdefault("sku", "SKU")
+
+    header = _header_names(raw, header_row)
+    body = raw.iloc[header_row + 1:]
+    data: dict[str, list[str]] = {}
+    extra: list[str] = []
+    for pos, cell in enumerate(header):
+        live_name = lookup.get(cell.strip().lower())
+        if live_name is None:
+            if cell:
+                extra.append(cell)
+            continue
+        if live_name in data:
+            continue  # the same header twice — first column wins
+        data[live_name] = [_cell_to_text(v) for v in body.iloc[:, pos].tolist()]
+
+    columns = [c for c in live_cols if c in data]
+    if "SKU" in data and "SKU" not in columns:
+        columns.insert(0, "SKU")
+    frame = pd.DataFrame({c: data[c] for c in columns}, dtype=object)
+    duplicates: list[str] = []
+    if "SKU" in frame.columns:
+        frame["SKU"] = [str(s).strip() for s in frame["SKU"]]
+        frame = frame[frame["SKU"] != ""].reset_index(drop=True)
+        upper = pd.Series([s.upper() for s in frame["SKU"]], dtype=object)
+        duplicates = sorted(set(upper[upper.duplicated(keep=False)].tolist()))
+
+    numeric, text = editable_columns(spec, live_cols)
+    missing = [c for c in numeric + text if c not in columns]
+    return CatalogSheet(
+        spec=spec, sheet_name=sheet_name, frame=frame, live_columns=live_cols,
+        columns=columns, missing_columns=missing, extra_columns=extra,
+        duplicate_skus=duplicates, matched_by=matched_by,
+    )
+
+
+def read_catalog_workbook(raw_bytes: bytes, filename: str = "",
+                          live_columns: dict[str, list[str]] | None = None,
+                          ) -> CatalogWorkbook:
+    """Find the catalog sheet(s) in an uploaded workbook.
+
+    Sheets are matched by name first (``Machine catalog`` / ``Accessory
+    catalog`` — the exported workbook's names — or a few aliases, case-
+    insensitive). When no sheet is called that, a planner's own file is
+    assumed and each sheet is judged by its header instead: the first row
+    carrying a ``SKU`` cell is the header, and the catalog is the one whose
+    labor columns it carries. A header below a title row is fine.
+
+    Each sheet's header is reconciled with the live CSV's columns
+    (``live_columns``, keyed like :data:`CATALOG_SPECS`; read from ``data/``
+    when not given): matching is case-insensitive, extra columns are listed
+    and ignored, missing ones are listed and left untouched.
+
+    Raises :class:`CatalogImportError` only when the bytes aren't a workbook
+    or it has no sheets. A sheet with no ``SKU`` header lands in ``skipped``
+    with a reason rather than raising, so one bad tab doesn't hide a good one.
+    """
+    label = f"**{filename}**" if filename else "the workbook"
+    live = live_columns if live_columns is not None else live_catalog_columns()
+    names: list[str] = []
+    sheets: dict[str, CatalogSheet] = {}
+    skipped: list[tuple[str, str]] = []
+    try:
+        with pd.ExcelFile(io.BytesIO(raw_bytes), engine="openpyxl") as xf:
+            names = [str(n) for n in xf.sheet_names]
+            by_name = {n: _sheet_key_for_name(n) for n in names}
+            candidates: list[tuple[str, str, str]] = []
+            if any(by_name.values()):
+                for n, k in by_name.items():
+                    if k:
+                        candidates.append((n, k, "name"))
+                    else:
+                        skipped.append((n, "not a catalog sheet"))
+            else:
+                for n in names:
+                    head = xf.parse(n, header=None, dtype=object, nrows=HEADER_SCAN_ROWS)
+                    hr = find_catalog_header_row(head)
+                    if hr is None:
+                        skipped.append((n, "no header row with a `SKU` column"))
+                        continue
+                    k = _infer_key_from_header(_header_names(head, hr))
+                    if k is None:
+                        skipped.append((
+                            n, "header doesn't carry either catalog's labor columns "
+                               "(or carries both)",
+                        ))
+                        continue
+                    candidates.append((n, k, "header"))
+            for n, k, how in candidates:
+                spec = CATALOG_SPECS[k]
+                if k in sheets:
+                    skipped.append((
+                        n, f"`{sheets[k].sheet_name}` already supplies the {spec.sheet}",
+                    ))
+                    continue
+                raw = xf.parse(n, header=None, dtype=object)
+                hr = find_catalog_header_row(raw)
+                if hr is None:
+                    skipped.append((
+                        n, "no header row with a `SKU` column — keep the exported header row",
+                    ))
+                    continue
+                sheets[k] = _build_catalog_sheet(spec, n, raw, hr, live.get(k) or [], how)
+    except Exception as exc:  # noqa: BLE001 — surface whatever openpyxl said
+        raise CatalogImportError(
+            f"We couldn't open {label} as an Excel workbook ({exc}). "
+            "Save it as .xlsx and re-upload."
+        ) from exc
+    if not names:
+        raise CatalogImportError(f"{label} has no sheets.")
+    return CatalogWorkbook(sheets=sheets, skipped=skipped, sheet_names=names)
+
+
+# ---- Diff: sheet vs the loaded catalog ------------------------------------
+@dataclass(frozen=True)
+class CellChange:
+    sku: str
+    column: str
+    old: object
+    new: object
+
+
+@dataclass(frozen=True)
+class CellProblem:
+    sku: str
+    column: str
+    value: str
+    reason: str
+
+
+def _fmt_cell(value) -> str:
+    """Display form of an old/new value: whole floats without ``.0``."""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return str(int(value))
+        return repr(value)
+    return str(value)
+
+
+@dataclass
+class CatalogDiff:
+    """Everything applying one sheet would do — rendered as the preview, and
+    (via :meth:`cell_tuples` / ``new_rows``) fed to the app's save path."""
+    spec: CatalogSpec
+    cells: list[CellChange]
+    new_rows: list[dict]
+    absent_skus: list[str]
+    problems: list[CellProblem]
+    duplicate_skus: list[str]
+    n_rows: int
+    n_existing: int
+    numeric_cols: list[str]
+    text_cols: list[str]
+
+    @property
+    def blocked(self) -> bool:
+        """True when something on the sheet failed validation; the app refuses
+        to save until the planner fixes those cells in Excel and re-uploads."""
+        return bool(self.problems or self.duplicate_skus)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.cells and not self.new_rows
+
+    @property
+    def new_skus(self) -> list[str]:
+        return [r["SKU"] for r in self.new_rows]
+
+    @property
+    def changed_skus(self) -> list[str]:
+        seen: list[str] = []
+        for c in self.cells:
+            if c.sku not in seen:
+                seen.append(c.sku)
+        return seen
+
+    def cell_tuples(self) -> list[tuple[str, str, object]]:
+        """The ``(sku, column, new_value)`` list ``_apply_diffs_and_serialize``
+        in app.py consumes — identical in shape to the editor's diff."""
+        return [(c.sku, c.column, c.new) for c in self.cells]
+
+    def cells_frame(self) -> pd.DataFrame:
+        rows = []
+        for c in self.cells:
+            delta = ""
+            if isinstance(c.old, (int, float)) and isinstance(c.new, (int, float)):
+                delta = _fmt_cell(float(c.new) - float(c.old))
+                if not delta.startswith("-") and delta not in ("", "0"):
+                    delta = "+" + delta
+            rows.append({"SKU": c.sku, "Column": c.column,
+                         "Old": _fmt_cell(c.old), "New": _fmt_cell(c.new), "Δ": delta})
+        return pd.DataFrame(rows, columns=["SKU", "Column", "Old", "New", "Δ"])
+
+    def new_rows_frame(self) -> pd.DataFrame:
+        cols = ["SKU", *self.numeric_cols, *self.text_cols]
+        rows = [{c: _fmt_cell(r.get(c, "")) for c in cols} for r in self.new_rows]
+        return pd.DataFrame(rows, columns=cols)
+
+    def problems_frame(self) -> pd.DataFrame:
+        rows = [{"SKU": p.sku, "Column": p.column, "Value": p.value, "Problem": p.reason}
+                for p in self.problems]
+        return pd.DataFrame(rows, columns=["SKU", "Column", "Value", "Problem"])
+
+
+def _live_value(live: pd.DataFrame, sku, column: str):
+    if column not in live.columns:
+        return None
+    value = live.loc[sku, column]
+    if isinstance(value, pd.Series):  # duplicate SKUs on file — first wins
+        value = value.iloc[0] if len(value) else None
+    return value
+
+
+def _live_number(live: pd.DataFrame, sku, column: str) -> float:
+    value = _live_value(live, sku, column)
+    try:
+        if value is None or pd.isna(value):
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _live_text(live: pd.DataFrame, sku, column: str) -> str:
+    value = _live_value(live, sku, column)
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def diff_catalog_sheet(sheet: CatalogSheet, live: pd.DataFrame | None) -> CatalogDiff:
+    """What applying ``sheet`` to ``live`` (the loaded catalog, indexed by SKU
+    — ``load_machine_labor`` / ``load_acc_labor`` output) would change.
+
+    The rules mirror the in-app editor's save, so the two paths can't disagree:
+
+    * a sheet row is matched to a catalog row by SKU, case-insensitively; the
+      catalog's spelling is what gets written
+    * a **blank cell never changes anything** — type ``0`` to zero a value
+      (this also keeps a never-edited row's blank routing cells, which the
+      loader shows as the default station, from reading as a change)
+    * labor columns compare as numbers (``45.0`` is ``45``); ``Description``
+      as trimmed text; routing cells are normalised to the dropdown spelling
+    * catalog SKUs that aren't on the sheet are left exactly as they are — an
+      import never deletes a row
+    * a row whose SKU isn't in the catalog becomes a new row (blank labor
+      cells stay blank, which the loader reads as 0)
+    * anything that doesn't validate — not a number, negative, a routing value
+      the editor wouldn't offer, a formula-prefixed SKU, a SKU listed twice —
+      is a :class:`CellProblem`; ``blocked`` is then True and nothing from the
+      sheet should be saved until the planner fixes the file
+    """
+    spec = sheet.spec
+    if live is None:
+        live = pd.DataFrame()
+    numeric_all, text_all = editable_columns(spec, sheet.live_columns)
+    numeric = [c for c in numeric_all if c in sheet.columns]
+    text = [c for c in text_all if c in sheet.columns]
+
+    canon: dict[str, object] = {}
+    for s in live.index:
+        canon.setdefault(str(s).strip().upper(), s)
+    dupes = {d.upper() for d in sheet.duplicate_skus}
+
+    cells: list[CellChange] = []
+    new_rows: list[dict] = []
+    problems: list[CellProblem] = []
+    seen: set[str] = set()
+    n_existing = 0
+    frame = sheet.frame
+    if "SKU" not in frame.columns:
+        frame = pd.DataFrame(columns=["SKU"])
+
+    for row in frame.to_dict("records"):
+        sku = str(row.get("SKU", "")).strip()
+        key = sku.upper()
+        if not sku:
+            continue
+        seen.add(key)  # on the sheet — so never "absent", even when duplicated
+        if key in dupes:
+            continue
+
+        if key in canon:
+            live_sku = canon[key]
+            n_existing += 1
+            for col in numeric:
+                raw = row.get(col, "")
+                if raw == "":
+                    continue
+                try:
+                    new = parse_labor_value(raw)
+                except ValueError as exc:
+                    problems.append(CellProblem(sku, col, str(raw), str(exc)))
+                    continue
+                old = _live_number(live, live_sku, col)
+                if new != old:
+                    cells.append(CellChange(str(live_sku), col, old, new))
+            for col in text:
+                raw = str(row.get(col, "")).strip()
+                if raw == "":
+                    continue
+                if routing_station(col):
+                    try:
+                        new = normalize_routing_value(col, raw)
+                    except ValueError as exc:
+                        problems.append(CellProblem(sku, col, raw, str(exc)))
+                        continue
+                else:
+                    new = raw
+                old = _live_text(live, live_sku, col)
+                if new != old:
+                    cells.append(CellChange(str(live_sku), col, old, new))
+            continue
+
+        # Not in the catalog → a new row.
+        if sku[:1] in FORMULA_PREFIXES:
+            problems.append(CellProblem(
+                sku, "SKU", sku,
+                "a SKU can't start with =, +, - or @ (Excel would run it as a formula)",
+            ))
+            continue
+        new_row: dict = {"SKU": sku}
+        ok = True
+        for col in numeric:
+            raw = row.get(col, "")
+            if raw == "":
+                new_row[col] = ""
+                continue
+            try:
+                new_row[col] = parse_labor_value(raw)
+            except ValueError as exc:
+                problems.append(CellProblem(sku, col, str(raw), str(exc)))
+                ok = False
+        for col in text:
+            raw = str(row.get(col, "")).strip()
+            if routing_station(col):
+                try:
+                    new_row[col] = normalize_routing_value(col, raw)
+                except ValueError as exc:
+                    problems.append(CellProblem(sku, col, raw, str(exc)))
+                    ok = False
+            else:
+                new_row[col] = raw
+        if ok:
+            new_rows.append(new_row)
+
+    absent: list[str] = []
+    for s in live.index:
+        s_key = str(s).strip().upper()
+        if s_key not in seen and str(s) not in absent:
+            absent.append(str(s))
+
+    return CatalogDiff(
+        spec=spec, cells=cells, new_rows=new_rows, absent_skus=absent,
+        problems=problems, duplicate_skus=list(sheet.duplicate_skus),
+        n_rows=int(len(frame)), n_existing=n_existing,
+        numeric_cols=numeric, text_cols=text,
     )

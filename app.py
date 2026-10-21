@@ -71,6 +71,7 @@ _stale = (
     or "efficiency" not in getattr(
         core.facility_settings_storage, "DEFAULT_SETTINGS", {})
     or "Undercarriage" not in getattr(core.constants, "STATION_KEYS", [])
+    or not hasattr(core.excel_io, "read_catalog_workbook")
 )
 if _stale:
     # Reload in DEPENDENCY ORDER: constants first (every other module imports
@@ -117,6 +118,10 @@ from core.excel_io import (
     DATABASE_TABLES as EXCEL_DATABASE_TABLES,
     CSV_LINKABLE_FILES as EXCEL_CSV_LINKABLE_FILES,
     SAVED_SCHEDULE_ROWS_SHEET as EXCEL_SAVED_ROWS_SHEET,
+    read_catalog_workbook,
+    diff_catalog_sheet,
+    editable_columns as catalog_editable_columns,
+    CatalogImportError,
 )
 from core.labor_calculator import (
     expand_schedule, build_capacity_table,
@@ -4623,6 +4628,7 @@ The table's **`#`** column numbers the rows for you. A row takes the next number
 | See bottlenecks + suggested fixes | **🏠 Overview** → 🎯 Recommended actions, or **🔧 Recommendations** tab |
 | Get the whole database (or this analysis) into Excel | **📁 Data & Setup** → **📤 Export & Excel link** |
 | Link an Excel sheet to the live catalogs | **📁 Data & Setup** → **📤 Export & Excel link** → step 3 |
+| Push labor edits made in Excel back into the catalogs | **📁 Data & Setup** → **📥 Import from Excel** |
 
 **Tip:** hover any column header in a table to see its specific tooltip.
                 """
@@ -4724,6 +4730,9 @@ When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / l
 
 ### Export & Excel link
 **📁 Data & Setup → 📤 Export & Excel link** downloads the whole database (catalogs, crew, settings, scenarios, executive scenarios, saved schedules, process flow) as one `.xlsx`, or this session's schedule / per-unit labor / capacity tables. Step 3 there lists the raw GitHub URL of each CSV catalog plus a Power Query script, so an Excel sheet can read the live data and **Refresh All** whenever the team saves.
+
+### Import from Excel
+**📁 Data & Setup → 📥 Import from Excel** is the way back. Export the database workbook, edit labor minutes on the **Machine catalog** / **Accessory catalog** sheet (or add a SKU row at the bottom), save, and upload the file. The preview lists every cell that would change (SKU, column, old → new), every new SKU, and every catalog SKU that isn't on the sheet — those are left untouched; an import never deletes a row. Blank cells never change anything. A value that isn't a number, a negative, a routing value the dropdown wouldn't offer, or a SKU listed twice blocks the save until you fix the file. **💾 Save** then fetches the latest file from GitHub and merges only those cells on top — the same SHA-locked save the editors use, so a colleague's edit of another cell in the meantime survives.
 
 ### Catalog edits
 Every **💾 Save** button in **📁 Data & Setup** (Machine catalog, Accessory catalog, Items, Item packages, Reconciliation, Process flow) pushes to GitHub. Other users see the new values after the next ~1 minute Streamlit Cloud redeploy.
@@ -6915,6 +6924,214 @@ query → **Close & Load**.
         )
 
 
+# =============================================================
+# 📥 Import from Excel — catalog sheets → preview → SHA-locked cell merge
+# =============================================================
+@st.cache_data(show_spinner=False)
+def _parse_catalog_workbook_cached(raw_bytes: bytes, filename: str, schema_ver: int):
+    """Read the uploaded workbook once per upload (keyed by its bytes) so a
+    widget nudge doesn't re-open the file. ``schema_ver`` is in the key on
+    purpose (no leading underscore — Streamlit skips hashing those): the sheet
+    is reconciled against the live CSV header, which changes with the schema."""
+    return read_catalog_workbook(raw_bytes, filename)
+
+
+def _render_import_view(machine_df, acc_df) -> None:
+    """📥 Import from Excel sub-view of 📁 Data & Setup.
+
+    The way back from the export: a planner edits labor minutes (or adds a
+    SKU row) on the ``Machine catalog`` / ``Accessory catalog`` sheet of the
+    database workbook and uploads it. Each catalog sheet found gets a preview
+    — the cells that would change, the new SKUs, the catalog SKUs the sheet
+    doesn't mention — and its own 💾 Save, which pushes those cells through
+    :func:`_save_catalog_csv` (fetch fresh + SHA-locked merge), exactly like
+    the in-app editors. Nothing is written until save is clicked.
+    """
+    st.subheader("📥 Import from Excel")
+    st.caption(
+        "Edit labor minutes in Excel and push them back. Start from the database "
+        "workbook (**📤 Export & Excel link**), change cells on the **Machine "
+        "catalog** / **Accessory catalog** sheet or add a SKU row at the bottom, "
+        "save, and upload it here. You'll see exactly what would change before "
+        "anything is written; the save merges only those cells on top of whatever "
+        "the team has committed since."
+    )
+    with st.expander("What the import does — and doesn't", expanded=False):
+        st.markdown(
+            """
+- **Which sheets:** `Machine catalog` and `Accessory catalog` (the exported
+  workbook's names). A single-sheet file that isn't named is recognised by its
+  header row — keep the exported header. Other sheets are ignored.
+- **Matching:** rows match catalog rows by **SKU** (case doesn't matter).
+  A SKU that isn't in the catalog becomes a **new row**.
+- **Never deletes:** catalog SKUs that aren't on the sheet are left exactly
+  as they are. Columns the sheet doesn't have are left alone on every row;
+  extra columns are ignored. **A blank cell never changes anything** — type
+  `0` to zero a value.
+- **Validated like the editor:** labor cells must be numbers ≥ 0; routing
+  cells (`Final Station HND` …) must be one of the dropdown's options (case is
+  corrected for you); a SKU can't start with `=`, `+`, `-` or `@`; a SKU may
+  appear once. Any of those blocks the save until the file is fixed.
+- **Save:** fetches the latest file from GitHub, applies only the previewed
+  cells (and appends the new rows), and pushes with the file's SHA as a lock —
+  retrying once on a conflict. A colleague's edit of another cell in the
+  meantime survives. `Last Modified` is stamped on every changed row.
+            """
+        )
+
+    uploaded = st.file_uploader(
+        "Workbook (.xlsx / .xlsm) — the exported database workbook, or a single catalog sheet",
+        type=["xlsx", "xlsm"],
+        key="catalog_import_upload",
+    )
+    if uploaded is None:
+        return
+
+    sig = _upload_sig(uploaded)
+    try:
+        book = _parse_catalog_workbook_cached(
+            uploaded.getvalue(), getattr(uploaded, "name", ""), _LOADER_SCHEMA_VERSION,
+        )
+    except CatalogImportError as exc:
+        st.error(f"❌ {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 — never take the whole tab down
+        st.error(f"❌ Couldn't read **{getattr(uploaded, 'name', 'the file')}**: {exc}")
+        return
+
+    if not book.sheets:
+        st.error(
+            f"❌ No catalog sheet found in **{getattr(uploaded, 'name', 'the file')}**. "
+            "Expected a sheet named `Machine catalog` or `Accessory catalog` (as the "
+            "export names them), or a single sheet whose header row has `SKU` plus "
+            "that catalog's labor columns."
+        )
+        for name, why in book.skipped:
+            st.caption(f"• `{name}` — {why}")
+        return
+    if book.skipped:
+        st.caption(
+            "Ignored sheets: " + ", ".join(f"`{n}`" for n, _why in book.skipped)
+        )
+
+    for key, sheet in book.sheets.items():
+        source_df = machine_df if key == "machine" else acc_df
+        _render_catalog_import_section(sheet, source_df, sig)
+
+
+def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
+    """Preview + save for one catalog sheet of an uploaded workbook."""
+    spec = sheet.spec
+    icon = "🏭" if spec.key == "machine" else "🔌"
+    st.markdown("---")
+    st.markdown(f"#### {icon} {spec.sheet} ← sheet `{sheet.sheet_name}`")
+    _render_stale_data_banner(spec.file_path)
+
+    if sheet.matched_by == "header":
+        st.caption(
+            f"Recognised by its header row (the sheet isn't called `{spec.sheet}`)."
+        )
+    if sheet.extra_columns:
+        st.caption(
+            f"Ignored columns (not in `{spec.file_path}`): "
+            + ", ".join(f"`{c}`" for c in sheet.extra_columns[:12])
+            + (" …" if len(sheet.extra_columns) > 12 else "")
+        )
+    if sheet.missing_columns:
+        st.caption(
+            "Columns not on the sheet — left as they are on every row: "
+            + ", ".join(f"`{c}`" for c in sheet.missing_columns[:12])
+            + (" …" if len(sheet.missing_columns) > 12 else "")
+        )
+
+    try:
+        diff = diff_catalog_sheet(sheet, source_df)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"❌ Couldn't compare the sheet with the catalog: {exc}")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows on sheet", diff.n_rows)
+    c2.metric("Cells to change", len(diff.cells))
+    c3.metric("New SKUs", len(diff.new_rows))
+    c4.metric(
+        "Catalog SKUs not on sheet", len(diff.absent_skus),
+        help="Left untouched — an import never deletes a row.",
+    )
+
+    if diff.duplicate_skus:
+        st.error(
+            "❌ Listed more than once on the sheet: "
+            + ", ".join(f"`{s}`" for s in diff.duplicate_skus[:12])
+            + (" …" if len(diff.duplicate_skus) > 12 else "")
+            + ". Keep one row per SKU and re-upload."
+        )
+    if diff.problems:
+        st.error(
+            f"❌ {len(diff.problems)} cell(s) didn't validate. Fix them in Excel "
+            "and re-upload — nothing from this sheet is saved until the file is clean."
+        )
+        st.dataframe(diff.problems_frame(), use_container_width=True, hide_index=True)
+
+    if diff.cells:
+        with st.expander(
+            f"📝 {len(diff.cells)} cell change(s) across {len(diff.changed_skus)} SKU(s)",
+            expanded=True,
+        ):
+            st.dataframe(diff.cells_frame(), use_container_width=True, hide_index=True)
+    if diff.new_rows:
+        with st.expander(f"➕ {len(diff.new_rows)} new SKU(s)", expanded=True):
+            st.dataframe(diff.new_rows_frame(), use_container_width=True, hide_index=True)
+            st.caption(
+                "Blank labor cells are saved blank (the app reads them as 0); blank "
+                "routing cells use the station's default."
+            )
+    if diff.absent_skus:
+        with st.expander(
+            f"⏸️ {len(diff.absent_skus)} catalog SKU(s) not on the sheet — left untouched",
+            expanded=False,
+        ):
+            st.write(
+                ", ".join(f"`{s}`" for s in diff.absent_skus[:300])
+                + (" …" if len(diff.absent_skus) > 300 else "")
+            )
+
+    done_key = f"catalog_import_done::{upload_sig}::{spec.key}"
+    done = st.session_state.get(done_key)
+    if done:
+        st.success(
+            f"✅ Already applied from this upload (commit `{done}`). The preview "
+            "above still compares against the catalog as loaded *before* that "
+            "save — export a fresh workbook to make further changes."
+        )
+        return
+    if diff.is_empty:
+        st.info("Nothing to change — this sheet matches the catalog. (Blank cells never change anything.)")
+        return
+
+    bits = []
+    if diff.cells:
+        bits.append(f"{len(diff.cells)} cell change(s)")
+    if diff.new_rows:
+        bits.append(f"{len(diff.new_rows)} new SKU(s)")
+    label = f"💾 Save {' + '.join(bits)} to `{spec.file_path}` on GitHub"
+    if diff.blocked:
+        st.button(label, key=f"catalog_import_save_{spec.key}", use_container_width=True,
+                  disabled=True, help="Fix the problems listed above and re-upload.")
+        return
+
+    numeric_cols, text_cols = catalog_editable_columns(spec, sheet.live_columns)
+    if st.button(label, key=f"catalog_import_save_{spec.key}", use_container_width=True,
+                 type="primary"):
+        result = _save_catalog_csv(
+            edited=None, source_df=source_df, editable_cols=numeric_cols,
+            file_path=spec.file_path, label=spec.label, text_cols=text_cols,
+            diffs=diff.cell_tuples(), additions=diff.new_rows, via="Excel import",
+        )
+        if result:
+            st.session_state[done_key] = result
+
+
 def tab_data_setup(
     machine_df, acc_df, schedule_df, item_master_df, item_packages_df,
     units=None, schedule_df_full=None, location: str = "Henderson",
@@ -6933,6 +7150,7 @@ def tab_data_setup(
       🔬 Reconciliation & Apply — items-vs-aggregate diff + write-back
       🔍 Data Quality          — validation report
       📤 Export & Excel link   — whole database / this session as .xlsx + live links
+      📥 Import from Excel     — catalog sheets from a workbook → preview → SHA-locked save
     """
     st.header("📁 Data & Setup")
     st.caption(
@@ -6953,6 +7171,7 @@ def tab_data_setup(
             "🔬 Reconciliation & Apply",
             "🔍 Data Quality",
             "📤 Export & Excel link",
+            "📥 Import from Excel",
         ],
         horizontal=True,
         label_visibility="collapsed",
@@ -7010,6 +7229,9 @@ def tab_data_setup(
             schedule_df_full if schedule_df_full is not None else schedule_df,
             units, capacity, inputs, location,
         )
+
+    elif sub == "📥 Import from Excel":
+        _render_import_view(machine_df, acc_df)
 
 
 def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: str = "Henderson"):
@@ -8122,8 +8344,57 @@ def _validate_renames(renames, fresh_df, merge_approved=None):
     return clean, merges, None
 
 
+def _append_catalog_rows(fresh_df, additions):
+    """Append brand-new SKU rows (from an Excel import) to the freshly-fetched
+    catalog frame, matching its column schema.
+
+    Each addition is a ``{column: value}`` dict carrying at least ``SKU``;
+    columns the file doesn't have are dropped, columns the addition doesn't
+    mention are left blank (the loaders read a blank labor cell as 0 and a
+    blank routing cell as the station's default), and ``Last Modified`` is
+    stamped with today. A SKU already on the fetched file (someone added it
+    since the planner exported), a formula-prefixed SKU (``= + - @``), or a
+    repeat within the batch is skipped and reported, never overwritten — the
+    same rules as :func:`_import_missing_skus_to_catalog`.
+
+    Returns ``(frame, added_skus, skipped_skus)``.
+    """
+    additions = list(additions or [])
+    if not additions:
+        return fresh_df, [], []
+    fresh_df = fresh_df.copy()
+    if "Last Modified" not in fresh_df.columns:
+        fresh_df["Last Modified"] = ""
+    today = today_local_str()
+    existing = set(fresh_df["SKU"].astype(str).str.strip().str.upper()) \
+        if "SKU" in fresh_df.columns else set()
+    added: list[str] = []
+    skipped: list[str] = []
+    rows: list[dict] = []
+    for item in additions:
+        sku = str((item or {}).get("SKU", "")).strip()
+        if not sku:
+            continue
+        if sku[:1] in ("=", "+", "-", "@") or sku.upper() in existing:
+            skipped.append(sku)
+            continue
+        row = {col: "" for col in fresh_df.columns}
+        for col, val in item.items():
+            if col in row and col not in ("SKU", "Last Modified"):
+                row[col] = "" if val is None else val
+        row["SKU"] = sku
+        row["Last Modified"] = today
+        rows.append(row)
+        added.append(sku)
+        existing.add(sku.upper())
+    if rows:
+        fresh_df = pd.concat([fresh_df, pd.DataFrame(rows)], ignore_index=True)
+    return fresh_df, added, skipped
+
+
 def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
-                      text_cols=None, renames=None, merge_approved=None):
+                      text_cols=None, renames=None, merge_approved=None,
+                      diffs=None, additions=None, via="app"):
     """Cell-level merge: compute the user's diff, fetch the latest file from
     GitHub, apply only those cells (and any SKU renames) on top, and push back.
     Retries once on a 409 SHA conflict (the narrow race window where someone
@@ -8134,15 +8405,29 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
     ``(old_sku, new_sku)`` for inline SKU renames. `merge_approved` is the set
     of old SKUs the planner confirmed are typo-duplicates — a rename onto an
     existing SKU then deletes the duplicate instead of failing the save.
+
+    `diffs` lets a caller that already computed its ``(sku, col, new_value)``
+    list (the Excel import — :func:`core.excel_io.diff_catalog_sheet`) skip
+    the data_editor comparison; ``edited`` may then be None. `additions` is a
+    list of new-row dicts (``{"SKU": ..., col: value}``) appended to the fresh
+    file before the diffs are applied — see :func:`_append_catalog_rows`.
+    `via` names the path in the commit message (``"app"`` for the editors,
+    ``"Excel import"`` for the uploader).
+
+    Returns the short commit SHA (or ``"saved"`` if GitHub didn't return
+    one) on success, None when nothing was written.
     """
     renames = [r for r in (renames or []) if str(r[0]).strip() != str(r[1]).strip()]
+    additions = list(additions or [])
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
 
-    diffs = _compute_cell_diffs(edited, source_df, editable_cols, text_cols=text_cols)
-    if not diffs and not renames:
+    if diffs is None:
+        diffs = _compute_cell_diffs(edited, source_df, editable_cols, text_cols=text_cols)
+    diffs = list(diffs)
+    if not diffs and not renames and not additions:
         st.info("No changes detected.")
         return
 
@@ -8152,9 +8437,12 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
     # commit message and the counts below are finalized inside the loop.
     n_ren = len(renames)
     n_merged = 0
+    n_added = 0
+    added_skus: list[str] = []
+    skipped_additions: list[str] = []
     applied_renames = list(renames)
     applied_merges = []
-    commit_message = f"Update {label} catalog via app"
+    commit_message = f"Update {label} catalog via {via}"
 
     response = None
     for attempt in (1, 2):
@@ -8173,6 +8461,25 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
                 if rename_err:
                     st.error(f"❌ SKU rename rejected: {rename_err}")
                     return
+                # New rows (Excel import) go on first, against the fetched
+                # file, so a SKU someone added meanwhile is skipped rather
+                # than duplicated; the cell diffs only ever touch rows that
+                # were already there.
+                fresh_df, added_skus, skipped_additions = _append_catalog_rows(
+                    fresh_df, additions,
+                )
+                n_added = len(added_skus)
+                if not diffs and not clean_renames and not merges and not n_added:
+                    st.info(
+                        "No changes to save — "
+                        + (
+                            "every SKU this would add is already on file "
+                            f"({', '.join(f'`{s}`' for s in skipped_additions[:8])}); "
+                            "export a fresh workbook to update those rows instead."
+                            if skipped_additions else "nothing differs from the file."
+                        )
+                    )
+                    return
                 csv_text, changed_skus_count, n_renamed, n_merged = _apply_diffs_and_serialize(
                     fresh_df, diffs, editable_cols, renames=clean_renames,
                     merges=merges,
@@ -8187,9 +8494,11 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
                     _parts.append(f"{n_ren} SKU rename(s)")
                 if n_merged:
                     _parts.append(f"{n_merged} duplicate SKU(s) merged")
+                if n_added:
+                    _parts.append(f"{n_added} new SKU(s)")
                 commit_message = (
-                    f"Update {label} catalog via app ({', '.join(_parts)})"
-                    if _parts else f"Update {label} catalog via app"
+                    f"Update {label} catalog via {via} ({', '.join(_parts)})"
+                    if _parts else f"Update {label} catalog via {via}"
                 )
                 response = save_catalog_to_github(
                     csv_text, file_path, token,
@@ -8223,7 +8532,7 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
 
     _track_and_flush(
         "catalog_save", file=file_path, label=label, cells=n_diffs, renames=n_ren,
-        merges=n_merged,
+        merges=n_merged, added=n_added, via=via,
     )
 
     _saved_bits = []
@@ -8233,6 +8542,8 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         _saved_bits.append(f"{n_ren} SKU rename(s)")
     if n_merged:
         _saved_bits.append(f"{n_merged} duplicate SKU(s) merged")
+    if n_added:
+        _saved_bits.append(f"{n_added} new SKU(s)")
     st.success(
         f"✅ Saved {' + '.join(_saved_bits)} to `{file_path}` "
         + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
@@ -8265,6 +8576,16 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
             f"{_lost_note} Schedule rows still referencing the removed SKU will "
             "show as *missing SKU* until you re-point or re-upload them."
         )
+    if n_added:
+        st.info("➕ Added: " + ", ".join(f"`{s}`" for s in added_skus[:12])
+                + (" …" if len(added_skus) > 12 else ""))
+    if skipped_additions:
+        st.warning(
+            "⏭️ Already on file, left as-is (added by someone else since your "
+            "export): " + ", ".join(f"`{s}`" for s in skipped_additions[:12])
+            + (" …" if len(skipped_additions) > 12 else "")
+            + ". Export a fresh workbook to update those rows."
+        )
     st.info(
         "⏳ **Streamlit Cloud is now redeploying** with the new values "
         "(~1–2 minutes). The Refresh banner at the top of this tab will let "
@@ -8272,6 +8593,7 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
     )
     if st.button("🔄 I waited — try reloading now", key=f"reload_after_save_{label}"):
         st.rerun()
+    return commit_sha or "saved"
 
 
 @st.fragment

@@ -195,7 +195,9 @@ Catalog and schedule saves use **cell-level merge** with SHA-locked optimistic c
 
 ## Glossary
 
-In the running app: open the sidebar's **ℹ️ Help & glossary** expander. It's organized into five tabs:
+In the running app: open the sidebar's **ℹ️ Help & glossary** expander and flip
+**Show help** (the pages load on demand so they don't slow down every click).
+It's organized into five tabs:
 
 - **🚀 Quick start** — status colors, sidebar map, "where to find common features"
 - **📐 How the model works** — time units, labor vs throughput utilization, safety / efficiency

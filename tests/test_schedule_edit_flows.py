@@ -298,6 +298,10 @@ class TestManualModeInTheApp:
         monkeypatch.setattr(usage_tracker, "USAGE_LOG_PATH", tmp_path / "usage_log.jsonl")
         a, b = _two_skus(catalogs)
         at = AppTest.from_file(str(APP_PATH), default_timeout=120)
+        # Only the tab in front is built: _analysed_schedule reads the 📋
+        # Schedule table inside 📁 Data & Setup, so bring that tab up. The
+        # Sequencer expander (Accept proposal) sits above the tabs regardless.
+        at.session_state[app.ACTIVE_TAB_KEY] = app.TAB_DATA_SETUP
         at.session_state[f"manual_seed_{LOCATION}"] = pd.DataFrame({
             "FG SKU": [a, b], "Accessory SKU": ["", ""], "Qty": [3, 2],
         })

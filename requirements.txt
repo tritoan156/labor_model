@@ -7,7 +7,10 @@
 # removal, so with no upper cap here a Cloud version bump would break the app
 # if we ever fell back to it. 1.36+ (column_config pinned=True, which keeps
 # SKU/Description frozen in the catalog editors) is implied by this floor.
-streamlit>=1.51
+# 1.57+ required for the top-level tab strip (st.segmented_control with
+# required=True and width="stretch") and the @st.fragment tab bodies that keep
+# each click to one panel. Validated locally on 1.57; Streamlit Cloud runs 1.58.
+streamlit>=1.57
 # Cap below pandas 3: core/data_loader.py disables the Arrow-string default via
 # `pd.set_option("future.infer_string", False)`. That option is removed in
 # pandas 3 (Arrow strings become mandatory), where the try/except shim silently

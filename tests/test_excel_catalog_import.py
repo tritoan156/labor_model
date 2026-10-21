@@ -712,6 +712,9 @@ class TestImportViewRenders:
         monkeypatch.setattr(usage_tracker, "USAGE_LOG_PATH", tmp_path / "usage_log.jsonl")
 
         at = AppTest.from_file(str(APP), default_timeout=300)
+        # Only the tab in front is built, so bring 📁 Data & Setup up first;
+        # its view picker doesn't exist while 🏠 Overview is showing.
+        at.session_state[app.ACTIVE_TAB_KEY] = app.TAB_DATA_SETUP
         at.run()
         assert not at.exception
         view = next(r for r in at.main.radio if "📥 Import from Excel" in list(r.options))

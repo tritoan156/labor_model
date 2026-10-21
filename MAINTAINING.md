@@ -281,7 +281,9 @@ If the company spins up a fourth manufacturing facility:
 
 ## Where the admin usage analytics live
 
-Sidebar → very bottom → **⚙️ Admin** expander. Shows:
+Sidebar → very bottom → **⚙️ Admin** expander → flip **Load analytics**
+(the dashboard is built only while that switch is on, so a collapsed expander
+costs nothing per click). Shows:
 - Sessions today / this week / all-time
 - 14-day sessions line chart
 - Sessions by facility

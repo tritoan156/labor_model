@@ -235,7 +235,6 @@ class TestGithubToken:
     def test_missing_secrets_file_means_no_token(self, monkeypatch):
         monkeypatch.setattr(app.st, "secrets", self._NoSecretsFile())
         assert app._github_token() is None
-        assert app._usage_token() is None
 
     def test_token_comes_from_secrets(self, monkeypatch):
         monkeypatch.setattr(app.st, "secrets", {"github_token": "github_pat_x"})

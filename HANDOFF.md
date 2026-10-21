@@ -25,11 +25,16 @@ against per-station headcount + throughput capacity.
   used to build all eight on every click). Keep it that way: a new tab is a
   `TAB_*` constant plus one `elif` in `main()`.
 - `core/` — `data_loader.py`, `labor_calculator.py`, `constants.py`,
-  `catalog_storage.py`, plus scenario/schedule/facility/process-flow storage,
-  `usage_tracker.py`, `data_validator.py`.
+  `catalog_storage.py` (the one GitHub GET/PUT every save goes through),
+  plus the storage modules for scenarios, uploaded schedules, facility crew,
+  facility settings, executive scenarios and the process flow,
+  `excel_io.py` (Excel upload / export), `usage_tracker.py`,
+  `data_validator.py`.
 - `data/` — `machine_clean.csv` (FG SKU catalog), `acc_clean.csv` (accessory
-  catalog), JSON for crew/scenarios/schedules/flow, and local-only
-  `usage_log.jsonl`.
+  catalog), `item_master.csv` / `item_packages.csv`, and JSON for crew, crew
+  settings, scenarios, executive scenarios, uploaded schedules and the flow.
+  `usage_log.jsonl` is written by the running app only — git-ignored and
+  untracked, so it never shows up in `git status`.
 - `MAINTAINING.md` — ops checklist (PAT rotation, schema bumps, adding a
   facility, routing/pinning gotchas). **Read this first.**
 
@@ -39,18 +44,23 @@ against per-station headcount + throughput capacity.
    right now.
 2. **`_LOADER_SCHEMA_VERSION` in `app.py` is a cache-buster.** Bump it after ANY
    CSV column add/remove/rename/type change, or users get stale cached data.
-   Currently `9`. The bump takes effect on the first script run after the
+   The current value lives in `app.py` (search for the constant) — this doc
+   doesn't repeat it so it can't drift. The bump takes effect on the first script run after the
    deploy — no Cloud reboot needed. The CSV loaders are cached on file mtime +
    this constant, passed as plain (non-underscore) `st.cache_data` arguments;
    `tests/test_cache_keys.py` fails if anyone re-prefixes them (Streamlit skips
    `_`-prefixed params when building the cache key, which is how this used to
    be broken).
-3. **Commit ritual:** stash `data/usage_log.jsonl` (local telemetry, never
-   commit) → `git add` specific files → commit with a
+3. **Commit ritual:** `git add` specific files → commit with a
    `Co-Authored-By: Claude` trailer → `git pull --rebase origin main` →
-   `git stash pop` → `git push origin main`.
+   `git push origin main`. (`data/usage_log.jsonl` is untracked and
+   git-ignored, so there is nothing to stash first.)
 4. Local dev on Windows: run Python as `./.venv/Scripts/python.exe`. Syntax
    check with `python -m compileall -q app.py`.
+5. **The stale-module shim at the top of `app.py`** (bare `import core.X`
+   list → `_stale` sentinels → reload list) must be kept in step whenever you
+   add/remove a `core/` module or add a name `app.py` imports. See
+   `MAINTAINING.md` → "The stale-module sentinel".
 
 ## Key architecture you'll hit
 
@@ -80,10 +90,8 @@ against per-station headcount + throughput capacity.
 
 ## Open follow-ups (not done)
 
-- New SKUs leave the 9 routing columns blank → default routing, won't inherit
+- New SKUs leave the 15 routing columns blank → default routing, won't inherit
   custom per-facility routing. Consider seeding them.
-- Confirm the sidebar "type a few SKUs" loader (validation-only path) never feeds
-  compute without `_project_facility_routing`.
 - Many tables now carry both p-min and p-hr columns — wider; a global toggle may
   help if width becomes an issue.
 

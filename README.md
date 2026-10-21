@@ -14,13 +14,15 @@ Built so planners and execs can answer:
 - **Multi-location** — per-facility headcount, station setup, scenarios, and saved schedules.
 - **Three ways to enter a plan** — upload your normal schedule as CSV **or as the Excel workbook itself** (any column naming works, header can sit below a title row or on a later tab), **paste a SKU list straight out of a spreadsheet**, or type a handful of SKUs for a quick what-if.
 - **Export & Excel link** — download the whole database (catalogs, crew, settings, scenarios, saved schedules, process flow) or the current analysis as one `.xlsx`, or point Excel at the live CSV catalogs with Power Query so a sheet refreshes itself.
-- **Six interactive tabs:**
+- **Eight interactive tabs:**
   - 🏠 **Overview** — executive dashboard with status banner, KPIs, recommended actions
+  - 📋 **Executive Summary** — monthly executive labor roll-up (new-hire ramp, absenteeism, overtime) saved per facility as reloadable snapshots, with a side-by-side multi-facility table
+  - 📆 **Calendar** — week and day roll-ups of the whole month's plan, independent of the sidebar time window
   - 📊 **Capacity** — per-station utilization (labor + throughput), with 🔋 Battery throughput embedded
   - 🔧 **Recommendations** — bottleneck mitigation playbook + rotation candidates
   - ⏱ **Build Time** — total labor + lead time per FG/Accessory pairing
   - 🔀 **Process Flow** — editable per-class flow chart of each unit's route
-  - 📁 **Data & Setup** — Schedule · Machine catalog · Accessory catalog · Items · Item packages · Reconciliation · Data Quality
+  - 📁 **Data & Setup** — Schedule · Sequence · Customer suffix cleanup · Machine catalog · Accessory catalog · Items · Item packages · Reconciliation & Apply · Data Quality · Export & Excel link
 - **Editable catalogs** — every CSV/JSON catalog can be edited in-app and saved back to GitHub. Cell-level merge protects concurrent edits.
 - **Save / load build plans** — both manual scenarios and uploaded schedules persist per facility to GitHub so teammates can reload them.
 - **Quiet analytics** — anonymous session + save telemetry under a discreet `⚙️ Admin` expander; local to each Streamlit Cloud container.
@@ -153,17 +155,19 @@ The workbook is built from the data files as deployed, so a save shows up in the
 | `item_master.csv` | Items catalog — defaults + family variants + per-accessory entries |
 | `item_packages.csv` | Named bundles (CWP / NE / AWP) |
 | `facility_crew.json` | Per-facility station headcount (HC / Stations / Crew) |
+| `facility_settings.json` | Per-facility planning assumptions (new-hire share & productivity, absenteeism, overtime, efficiency, safety, excluded stations) |
 | `scenarios.json` | Saved manual-entry build plans |
+| `exec_scenarios.json` | Saved Executive Summary snapshots (assumptions + computed metrics, per facility) |
 | `uploaded_schedules.json` | Saved uploaded CSVs (per facility) |
 | `process_flow.json` | Manufacturing precedence graph (edges, per unit class) |
-| `usage_log.jsonl` | **Local-only**, gitignored — anonymous session telemetry for the admin dashboard |
+| `usage_log.jsonl` | **Local-only**, gitignored and untracked — anonymous session telemetry for the admin dashboard, created by the running app |
 
 ---
 
 ## Configuration
 
 - **Sidebar** — pick facility, switch between CSV upload and manual SKU entry, edit working time (days / shift / safety / efficiency), per-facility station headcount, save scenarios / schedules.
-- **`core/constants.py`** — station defaults, FINAL_LABOR by class, battery count overrides, utilization thresholds (`UTIL_THRESHOLD_OVER/NEAR/TIGHT`).
+- **`core/constants.py`** — station defaults, FINAL_LABOR by class, battery type rules, utilization thresholds (`UTIL_THRESHOLD_OVER/NEAR/TIGHT`).
 
 ---
 
@@ -183,7 +187,7 @@ In the running app: open the sidebar's **ℹ️ Help & glossary** expander. It's
 
 - **🚀 Quick start** — status colors, sidebar map, "where to find common features"
 - **📐 How the model works** — time units, labor vs throughput utilization, safety / efficiency
-- **🏷 Catalog & stations** — unit classes, SKU naming, the full 13-station map
+- **🏷 Catalog & stations** — unit classes, SKU naming, the full 14-station map
 - **💾 Saving your work** — what gets persisted where (scenarios vs uploaded schedules vs catalog edits)
 - **🔧 For admins** — GitHub token, wild-CSV behavior, redeploy timing
 

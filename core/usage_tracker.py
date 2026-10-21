@@ -1,60 +1,55 @@
 """Anonymous usage tracking for the Labor Capacity Tool.
 
 Quiet, low-overhead logger that records a few interesting events to
-``data/usage_log.jsonl`` on GitHub (append-only) so the tool owner can answer
-"who/how much/what gets used" without exposing tracking UI to end users.
+``data/usage_log.jsonl`` on the Streamlit Cloud container's own disk, so the
+tool owner can answer "who/how much/what gets used" without exposing tracking
+UI to end users.
 
 Design notes
 ------------
 - **Identity**: one UUID per Streamlit session, kept in ``st.session_state``.
   No PII — never IP, never user-agent, never names.
 - **Buffer + flush**: events accumulate in ``st.session_state['analytics_buffer']``
-  and are flushed to GitHub when ≥10 events queue up or when the caller
-  piggybacks a flush on an existing save (free GitHub round-trip).
+  and are appended to the log when ≥ ``FLUSH_THRESHOLD`` events queue up or
+  when a caller forces a flush (every save handler does, so each save lands
+  in the log right away).
 - **Storage**: ``data/usage_log.jsonl`` — newline-delimited JSON, one event
-  per line. Append-only; the file is overwritten whole each flush (with the
-  prior contents + the new lines) because the GitHub Contents API doesn't
-  support real appends. Conflicts retry once via the same SHA-locked pattern
-  used by ``scenario_storage``.
-- **Local mirror**: after a successful push, the JSONL is written to the
-  local ``data/`` folder so the admin view in the same session sees fresh
-  data without waiting for the Streamlit Cloud redeploy.
+  per line, append-only. The file is **local to the container and
+  git-ignored**: it is never pushed to GitHub, because the repo is public and
+  the operational tempo it records (facility activity, save cadence) shouldn't
+  be. Events survive across sessions within one deploy and reset on the next
+  redeploy. On a fresh container the file doesn't exist yet; readers treat
+  that as an empty log and the first flush creates it.
 
 Event schema (one line each):
-    {"ts": "2026-05-21T13:42:10", "uid": "<short uuid>",
-     "type": "session_start" | "save" | "schedule_load" | ...,
+    {"ts": "2026-05-21T13:42:10-07:00", "uid": "<short uuid>",
+     "type": "session_start" | "catalog_save" | "schedule_load" | ...,
      "facility": "Henderson", "file": "machine_clean.csv", ...}
 
 Public API:
     get_or_create_uid()           -> str
     track_event(event_type, **)   -> None
-    flush_to_github(token)        -> int  (events flushed)
+    flush_buffer(force=False)     -> int  (events written)
     load_usage_log()              -> list[dict]
-    refresh_from_github(token)    -> list[dict]  (admin-only force pull)
+    get_buffer_snapshot()         -> list[dict]  (un-flushed events)
 """
 from __future__ import annotations
 
 import json
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import streamlit as st
 
-from .catalog_storage import (
-    fetch_catalog_csv_from_github,
-    save_catalog_to_github,
-    GitHubConflict,
-)
 from .constants import now_local
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 USAGE_LOG_PATH = DATA_DIR / "usage_log.jsonl"
-GITHUB_FILE_PATH = "data/usage_log.jsonl"
 
-# Buffer flush threshold — events accumulate locally until we hit this count,
-# then we flush to GitHub. Save handlers also force a flush so each catalog
-# save commits the analytics piggyback at the same time.
+# Buffer flush threshold — events accumulate in the session until we hit this
+# count, then they're appended to the log. Save handlers force a flush so each
+# save shows up in the admin view immediately.
 FLUSH_THRESHOLD = 10
 
 _BUFFER_KEY = "analytics_buffer"
@@ -105,55 +100,27 @@ def _serialize_event(event: dict) -> str:
     return json.dumps(event, ensure_ascii=False, separators=(",", ":"))
 
 
-def _fetch_remote_log(token: str) -> "tuple[str, Optional[str]]":
-    """Pull the current usage_log.jsonl bytes from GitHub.
-
-    Returns ``(text, sha)``. Empty string + None on 404 or any error.
-    """
-    try:
-        content_bytes, sha = fetch_catalog_csv_from_github(GITHUB_FILE_PATH, token)
-        if not content_bytes:
-            return "", sha
-        return content_bytes.decode("utf-8"), sha
-    except Exception:
-        return "", None
-
-
 def _write_local(content: str) -> None:
-    """Mirror the latest JSONL to local disk so the admin view in the same
-    Streamlit Cloud container sees fresh data without waiting for redeploy."""
-    try:
-        USAGE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(USAGE_LOG_PATH, "w", encoding="utf-8") as f:
-            f.write(content)
-    except Exception:
-        # Filesystem might be read-only on some hosts — that's OK; GitHub
-        # still has the source of truth.
-        pass
+    """Write the whole JSONL to local disk, creating ``data/`` if needed.
+
+    Errors propagate to :func:`flush_buffer`, which keeps the buffer for
+    the next attempt (read-only filesystem, etc.).
+    """
+    USAGE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(USAGE_LOG_PATH, "w", encoding="utf-8") as f:
+        f.write(content)
 
 
-def flush_to_github(token: Optional[str], force: bool = False) -> int:
+def flush_buffer(force: bool = False) -> int:
     """Append buffered events to the on-container usage log. Returns count
-    flushed.
-
-    Despite the historical name (kept so existing callers don't need to
-    update), this function does **not** push to GitHub anymore. The
-    public-repo exposure of operational telemetry (facility tempo, save
-    cadence) outweighed the benefit of cross-redeploy persistence, so events
-    now live only in the Streamlit Cloud container's filesystem at
-    ``data/usage_log.jsonl``. They survive across sessions within one deploy
-    and are reset by the next redeploy.
-
-    The ``token`` parameter is accepted but ignored. Callers keep passing
-    it because they don't know (and shouldn't have to) whether the back-end
-    is local-only or remote.
+    written.
 
     Behavior:
     - If buffer is empty → returns 0.
     - If buffer size < ``FLUSH_THRESHOLD`` and ``force`` is False → returns 0.
-    - On any filesystem error → keeps the buffer for the next attempt.
+    - On any filesystem error → keeps the buffer for the next attempt and
+      returns 0.
     """
-    _ = token  # accepted for API compatibility; intentionally unused
     buffer: List[dict] = st.session_state.get(_BUFFER_KEY, [])
     if not buffer:
         return 0
@@ -166,7 +133,7 @@ def flush_to_github(token: Optional[str], force: bool = False) -> int:
     try:
         # Read whatever's already on disk and append our buffer to it. The
         # admin dashboard reads the same file, so the new events show up in
-        # the next render.
+        # the next render. A missing file is simply an empty log.
         existing_text = ""
         if USAGE_LOG_PATH.exists():
             try:
@@ -193,9 +160,9 @@ def flush_to_github(token: Optional[str], force: bool = False) -> int:
 def load_usage_log() -> List[dict]:
     """Read ``data/usage_log.jsonl`` from local disk and return parsed events.
 
-    Streamlit Cloud syncs this file via redeploy, so the local copy is the
-    most recent committed version. Combine with the in-session buffer in the
-    admin view to show un-flushed activity too.
+    A missing file (fresh container, nothing flushed yet) is an empty log.
+    Malformed lines are skipped. Combine with :func:`get_buffer_snapshot` in
+    the admin view to show un-flushed activity too.
     """
     if not USAGE_LOG_PATH.exists():
         return []
@@ -217,22 +184,11 @@ def load_usage_log() -> List[dict]:
     return events
 
 
-def refresh_from_github(token: Optional[str]) -> List[dict]:
-    """Re-read the on-container usage log and return parsed events.
-
-    Historically pulled from GitHub; now that the log is local-only this is
-    just an alias for :func:`load_usage_log`. The ``token`` argument is
-    accepted for API stability and ignored.
-    """
-    _ = token
-    return load_usage_log()
-
-
 def get_buffer_snapshot() -> List[dict]:
     """Return a copy of the in-session buffer (un-flushed events).
 
     The admin view merges this with the on-disk log so the operator sees the
-    current session's actions immediately, even if they haven't been pushed
-    to GitHub yet.
+    current session's actions immediately, even if they haven't been written
+    to disk yet.
     """
     return list(st.session_state.get(_BUFFER_KEY, []))

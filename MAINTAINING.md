@@ -53,10 +53,13 @@ How to rotate:
 
 ## When you change a CSV column
 
-`app.py:_LOADER_SCHEMA_VERSION` (currently `8`) is a cache-buster. Every
-cached DataFrame loader includes this constant as a `@st.cache_data`
-argument, so bumping it forces every user's browser session to re-read
-the CSV with the new schema.
+`app.py:_LOADER_SCHEMA_VERSION` (currently `9`) is a cache-buster. The four
+CSV loaders in `app.py` (`_load_machine_df`, `_load_acc_df`,
+`_load_item_master_df`, `_load_item_packages_df`) are cached on the file's
+mtime **plus** this constant, so bumping it invalidates the cached frames the
+first time the new code runs — no Cloud reboot, no browser refresh. The JSON
+loaders (scenarios, uploaded schedules, process flow, usage log) are keyed on
+file mtime alone.
 
 **Bump the constant whenever you:**
 - Rename a column (e.g. `Compressor` → `ComAcc`).
@@ -64,9 +67,16 @@ the CSV with the new schema.
 - Remove a column.
 - Change the type / unit of a column (e.g. minutes → hours).
 
-If you forget, the team will see stale data with the old column name
-until they hard-refresh the browser or the Streamlit Cloud container
-recycles.
+If you forget, a warm Streamlit process keeps serving the cached frame with
+the old columns until the CSV itself changes on disk (an in-app 💾 Save) or
+the Cloud container recycles.
+
+**Don't rename the cache arguments with a leading underscore.** Streamlit
+skips `_`-prefixed parameters when building the `st.cache_data` key, and a
+parameter's default value is never part of the key either. The loaders used to
+be declared `(_mtime, _schema_ver=_LOADER_SCHEMA_VERSION)` and were therefore
+cached on nothing — that's why older notes said a bump "may require a Cloud
+reboot". `tests/test_cache_keys.py` fails the suite if that comes back.
 
 ---
 
@@ -303,8 +313,11 @@ guard — plus the manual table's `#` numbering helpers.
 `tests/test_manual_editor_rows.py` drives the whole app through Streamlit's
 `AppTest` harness to cover row numbering against the data_editor's own widget
 state (rows pasted or typed straight into the grid); it's the slowest file in
-the suite at a few seconds, because each step is a full app run. Several tests are explicit regression guards for
-audit fixes (e.g. `get_battery_type` case-normalization, `_fmt_min_hr` NaN/Inf,
+the suite at a few seconds, because each step is a full app run.
+`tests/test_cache_keys.py` scans `app.py` for every `@st.cache_data` function
+and checks the data loaders really re-run for a new file mtime or a bumped
+`_LOADER_SCHEMA_VERSION` (see "When you change a CSV column"). Several tests
+are explicit regression guards for audit fixes (e.g. `get_battery_type` case-normalization, `_fmt_min_hr` NaN/Inf,
 `Crew=0`/`Conc=0` capacity edge cases). If you change a formula on purpose,
 update the matching expected value in `tests/` in the same commit.
 

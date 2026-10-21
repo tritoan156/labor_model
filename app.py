@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import calendar
 import csv
+import hashlib
 import io
 import re
 from datetime import date
@@ -1131,6 +1132,233 @@ def _upload_sig(uploaded_file) -> str:
     return f"{getattr(uploaded_file, 'name', '')}:{getattr(uploaded_file, 'size', '')}"
 
 
+# ---------------------------------------------------------------------------
+# Active-schedule resolution — shared by both sidebar modes
+# ---------------------------------------------------------------------------
+# The sidebar offers two ways to describe the build plan. Both end up as the
+# same schedule frame, and every reshape action (Sequencer ✅ Accept, 🗓 Sequence
+# Apply, 🔀 Bulk move, 🧹 Suffix strip, 📅 Move into plan month) hands its
+# result over through ONE one-shot channel, ``_loaded_schedule_buffer``, which
+# the next run's resolver consumes:
+#
+#   • 📤 Upload mode → ``_load_schedule_df`` promotes the buffer to the
+#     persistent ``_active_schedule_csv`` (which is also what 💾 Save schedule
+#     pushes to GitHub).
+#   • ✏️ Manual mode → ``_resolve_manual_schedule`` keeps it as
+#     ``_manual_schedule_override``, pinned to a signature of the sidebar grid,
+#     so the reshape rides along across reruns but is dropped the moment the
+#     planner changes the rows it was built from.
+#
+# Before the manual half existed, a buffer written in manual mode was never
+# read ("accepted — refreshing…" and nothing changed), and the leftover buffer
+# then hijacked the next load after a switch to upload mode.
+SCHEDULE_MODE_UPLOAD = "📤 Upload schedule file"
+SCHEDULE_MODE_MANUAL = "✏️ Paste or type SKUs"
+
+# Session keys whose content was computed against ONE mode's schedule and must
+# not survive a switch to the other: a pending Sequencer proposal, and a
+# reshape waiting in the one-shot buffer.
+_CROSS_MODE_SCHEDULE_KEYS = (
+    "_loaded_schedule_buffer",
+    "_loaded_schedule_source",
+    "_proposed_schedule",
+    "_proposed_schedule_overloads",
+)
+
+
+def _discard_cross_mode_schedule_state() -> None:
+    """Drop a proposal / pending reshape computed in the other sidebar mode."""
+    for key in _CROSS_MODE_SCHEDULE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def _note_schedule_mode(schedule_mode: str) -> bool:
+    """Record the sidebar mode for this run; on a change from the previous run,
+    discard the cross-mode state. Returns True when the mode changed."""
+    prev = st.session_state.get("_schedule_mode_seen")
+    changed = prev is not None and prev != schedule_mode
+    if changed:
+        _discard_cross_mode_schedule_state()
+    st.session_state["_schedule_mode_seen"] = schedule_mode
+    return changed
+
+
+def _manual_schedule_signature(base_df) -> str:
+    """Identity of the manual grid's content: which rows (location, SKU,
+    accessory, qty) in which order. Blank rows never reach ``base_df``, so
+    adding or deleting one doesn't count; changing a SKU or a quantity does."""
+    if base_df is None or getattr(base_df, "empty", True):
+        return ""
+    cols = [
+        c for c in ("LOCATION", "FG SKU ID", "FG ACCRY SKU ID", "BUILD QTY")
+        if c in base_df.columns
+    ]
+    text = "\n".join(
+        "\t".join("" if pd.isna(v) else str(v).strip() for v in row)
+        for row in base_df[cols].itertuples(index=False)
+    )
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _resolve_manual_schedule(base_df, location, machine_df, acc_df, plan_month=None):
+    """Manual-mode half of the active-schedule resolver.
+
+    ``base_df`` is the schedule freshly built from the sidebar grid. A reshape
+    waiting in ``_loaded_schedule_buffer`` is adopted as the override for this
+    grid content; an override that already exists for this grid content is
+    returned instead of ``base_df`` — re-read through the same ``load_schedule``
+    path an upload takes, so row splits from a 🔀 Bulk move and SKU rewrites
+    from a 🧹 Suffix strip survive. Otherwise — including when the grid changed
+    since the reshape was made, or the grid is empty — ``base_df`` wins and any
+    stale override or buffer is dropped.
+
+    Either way the result is auto-spread so undated rows land in the plan
+    month, exactly as before.
+    """
+    sig = _manual_schedule_signature(base_df)
+    buf = st.session_state.pop("_loaded_schedule_buffer", None)
+    st.session_state.pop("_loaded_schedule_source", None)
+    if buf is not None and sig:
+        st.session_state["_manual_schedule_override"] = {
+            "sig": sig, "csv": buf.getvalue(),
+        }
+    override = st.session_state.get("_manual_schedule_override")
+    if isinstance(override, dict) and sig and override.get("sig") == sig:
+        df = None
+        try:
+            df = load_schedule(
+                io.BytesIO(override.get("csv") or b""), location=location,
+                machine_skus=set(machine_df["SKU"]),
+                placeholder_map=build_placeholder_map(machine_df),
+                acc_skus=set(acc_df["SKU"].astype(str)),
+            )
+        except Exception:
+            df = None
+        if df is not None and not df.empty:
+            _auto_spread_dates(
+                df, machine_df, acc_df, location, target_month_hint=plan_month,
+            )
+            return df
+        st.session_state.pop("_manual_schedule_override", None)
+    elif override is not None:
+        # The grid rows changed since the reshape was made — it described a
+        # plan that no longer exists, so fall back to the freshly built one.
+        st.session_state.pop("_manual_schedule_override", None)
+    if base_df is not None and not base_df.empty:
+        _auto_spread_dates(
+            base_df, machine_df, acc_df, location, target_month_hint=plan_month,
+        )
+    return base_df
+
+
+def _has_active_schedule(uploaded_file=None) -> bool:
+    """True when 💾 Save schedule has something to save in upload mode — see
+    :func:`_active_schedule_bytes`. Cheap: never converts a workbook."""
+    if st.session_state.get("_loaded_schedule_buffer") is not None:
+        return True
+    if (
+        uploaded_file is not None
+        and _upload_sig(uploaded_file) != st.session_state.get("_seen_upload_sig")
+    ):
+        return True
+    return st.session_state.get("_active_schedule_csv") is not None
+
+
+def _active_schedule_bytes(uploaded_file=None) -> "bytes | None":
+    """CSV bytes of the schedule the app is analysing in upload mode — the
+    same precedence ``_load_schedule_df`` applies, without consuming anything:
+    a reshape waiting in the one-shot buffer, then a file the uploader holds
+    that the loader hasn't promoted yet (converted to CSV the same way), then
+    the persisted active schedule. ``None`` when there is nothing analysable —
+    e.g. the only upload so far had no usable columns."""
+    buf = st.session_state.get("_loaded_schedule_buffer")
+    if buf is not None:
+        return buf.getvalue()
+    if (
+        uploaded_file is not None
+        and _upload_sig(uploaded_file) != st.session_state.get("_seen_upload_sig")
+    ):
+        csv_bytes, _sheet = upload_to_schedule_csv(
+            getattr(uploaded_file, "name", ""), uploaded_file.getvalue(),
+        )
+        return csv_bytes
+    return st.session_state.get("_active_schedule_csv")
+
+
+# ---------------------------------------------------------------------------
+# Month-aware week buckets
+# ---------------------------------------------------------------------------
+# ``WEEK_OF_MONTH`` is the Monday-anchored week index within a row's OWN month,
+# so a carryover row dated in an earlier month shares its number with this
+# month's rows. Every week filter therefore keys on (year, month, week) derived
+# from PRODUCTION DAY — never on the week number alone, which used to merge e.g.
+# September's week 2 into October's.
+def _month_weeks(year: int, month: int) -> list[int]:
+    """Week numbers of (year, month) that contain at least one M–F working day:
+    four to six of them (e.g. ``[2, 3, 4, 5, 6]`` for a 31-day month that
+    starts on a weekend), never a hardcoded 1–5."""
+    return sorted({week_of_month(d) for d in _working_days_in_month(year, month)})
+
+
+def _month_week_mask(df, year: int, month: int, week: int) -> pd.Series:
+    """Boolean mask of the rows whose PRODUCTION DAY falls in week ``week`` of
+    (year, month). Undated rows never match."""
+    if df is None or df.empty or "PRODUCTION DAY" not in df.columns:
+        return pd.Series(False, index=(df.index if df is not None else None), dtype=bool)
+    days = pd.to_datetime(df["PRODUCTION DAY"], errors="coerce")
+    weeks = pd.Series(week_of_month_series(days), index=df.index)
+    mask = (
+        (days.dt.year == int(year))
+        & (days.dt.month == int(month))
+        & (weeks == int(week))
+    )
+    return mask.fillna(False).astype(bool)
+
+
+def _month_week_keys(df) -> list[tuple[int, int, int]]:
+    """Sorted distinct (year, month, week) buckets of the dated rows in ``df``."""
+    if df is None or df.empty or "PRODUCTION DAY" not in df.columns:
+        return []
+    days = pd.to_datetime(df["PRODUCTION DAY"], errors="coerce").dropna()
+    return sorted({(int(d.year), int(d.month), int(week_of_month(d))) for d in days})
+
+
+def _month_week_label(year: int, month: int, week: int, with_month: bool) -> str:
+    """Heatmap column label: ``Wk 3`` within one month, ``Sep Wk 5`` when the
+    schedule's dated rows span more than one month."""
+    return f"{calendar.month_abbr[int(month)]} Wk {week}" if with_month else f"Wk {week}"
+
+
+def _first_working_day_of_week(year: int, month: int, week: int) -> pd.Timestamp:
+    """First M–F working day of week ``week`` in (year, month); the month's
+    first working day when that week has none (a weekend-only week 1)."""
+    working = _working_days_in_month(year, month)
+    for d in working:
+        if week_of_month(d) == int(week):
+            return pd.Timestamp(d)
+    return pd.Timestamp(working[0]) if working else pd.Timestamp(date(year, month, 1))
+
+
+def _calendar_month_slice(work: pd.DataFrame, plan_month=None):
+    """Restrict ``work`` (rows with a real PRODUCTION DAY) to ONE month — the
+    plan month, or, when none is given, the month most of the rows fall in —
+    and return ``(sliced, (year, month))``. The Calendar's week cards are keyed
+    on week-of-month, so letting two months through would merge a September
+    carryover row's week 2 into October's."""
+    if plan_month is not None:
+        ym = (int(plan_month[0]), int(plan_month[1]))
+    else:
+        ym = (
+            int(work["PRODUCTION DAY"].dt.year.mode()[0]),
+            int(work["PRODUCTION DAY"].dt.month.mode()[0]),
+        )
+    sliced = work[
+        (work["PRODUCTION DAY"].dt.year == ym[0])
+        & (work["PRODUCTION DAY"].dt.month == ym[1])
+    ].copy()
+    return sliced, ym
+
+
 def _load_schedule_df(
     uploaded_file=None, location: str = "HENDERSON",
     target_month_hint: "tuple[int, int] | None" = None,
@@ -1141,8 +1369,10 @@ def _load_schedule_df(
     Resolution order:
       1. A one-shot ``st.session_state['_loaded_schedule_buffer']`` — produced
          by "📂 Load saved schedule", a Sequencer Accept, a 🗓 Sequence Apply,
-         a Bulk Move, or a 🧹 Suffix Strip. Consumed once, then **promoted** to
-         the persistent active schedule (below).
+         a Bulk Move, a 🧹 Suffix Strip, or 📅 Move into plan month. Consumed
+         once, then **promoted** to the persistent active schedule (below).
+         (In ✏️ manual mode the same buffer is consumed by
+         :func:`_resolve_manual_schedule` instead.)
       2. A genuinely new ``uploaded_file`` from ``st.file_uploader`` (detected
          via :func:`_upload_sig`). Becomes the persistent active schedule.
       3. The persistent ``st.session_state['_active_schedule_csv']`` — whatever
@@ -1560,18 +1790,25 @@ def _render_sequencer_controls(
     return schedule_df
 
 
-def _render_sequencer_view(schedule_df: pd.DataFrame) -> None:
+def _render_sequencer_view(
+    schedule_df: pd.DataFrame,
+    plan_month: "tuple[int, int] | None" = None,
+    plan_month_label: str = "",
+    manual_mode: bool = False,
+) -> None:
     """The 🗓 Sequence sub-section under Data & Setup.
 
     Two side-by-side controls that together form the manual-reshape UX:
       • Editable table with PRODUCTION DAY as a date-picker column. Edit
         rows inline, click Apply to write back into the session schedule.
-      • Bulk move form: shift N units of SKU X from Week A → Week B in
-        one operation.
+      • Bulk move form: shift N units of SKU X from Week A → Week B of the
+        plan month in one operation.
 
     Both write the reshaped CSV through ``st.session_state["_loaded_schedule_buffer"]``
-    so the standard loader picks it up on the next rerun and the analysis
-    tabs immediately reflect the new sequence.
+    so the active-schedule resolver of the current sidebar mode picks it up
+    on the next rerun and the analysis tabs immediately reflect the new
+    sequence. ``manual_mode`` only changes the captions: in ✏️ manual mode the
+    reshape is session-only (a saved scenario keeps the SKU list, not dates).
     """
     st.subheader("🗓 Sequence — manual reshape")
     if schedule_df is None or schedule_df.empty:
@@ -1581,12 +1818,25 @@ def _render_sequencer_view(schedule_df: pd.DataFrame) -> None:
         )
         return
 
-    st.caption(
-        "Edit individual `PRODUCTION DAY` cells in the table, OR use the "
-        "**Bulk move** form below to shift many units at once. Changes "
-        "live in your browser session — use **📥 Download** to save a copy "
-        "you can re-upload later (or save via the sidebar's 📂 Save panel)."
-    )
+    if manual_mode:
+        st.caption(
+            "Edit individual `PRODUCTION DAY` cells in the table, OR use the "
+            "**Bulk move** form below to shift many units at once. In "
+            "**✏️ Paste or type SKUs** mode the reshaped dates live in your "
+            "browser session only — a saved scenario keeps the SKU list, not "
+            "the dates — and they're dropped if you change the SKU rows in the "
+            "sidebar. Use **📥 Download** to keep a copy; to save it for the "
+            "team, switch to **📤 Upload schedule file** mode, upload the "
+            "download, and click 💾 Save schedule."
+        )
+    else:
+        st.caption(
+            "Edit individual `PRODUCTION DAY` cells in the table, OR use the "
+            "**Bulk move** form below to shift many units at once. Changes "
+            "live in your browser session until you save — **💾 Save schedule** "
+            "in the sidebar's 📂 panel saves the reshaped plan for the team, "
+            "or use **📥 Download** for a copy you can re-upload later."
+        )
 
     # Reset button — toss any reshape edits so the table reflects the
     # canonical schedule again. The edits live in the data_editor's widget
@@ -1696,7 +1946,13 @@ def _render_sequencer_view(schedule_df: pd.DataFrame) -> None:
             use_container_width=True,
             help=(
                 "Saves the current view (including unsaved edits) as a CSV "
-                "you can re-upload or save via the 📂 Save panel."
+                "you can re-upload later."
+                + (
+                    " In manual mode this is how you keep a reshape."
+                    if manual_mode else
+                    " (💾 Save schedule in the 📂 panel saves the applied "
+                    "plan directly.)"
+                )
             ),
         )
     except Exception:
@@ -1710,7 +1966,9 @@ def _render_sequencer_view(schedule_df: pd.DataFrame) -> None:
         )
 
     st.markdown("---")
-    _render_bulk_move_form(schedule_df)
+    _render_bulk_move_form(
+        schedule_df, plan_month=plan_month, plan_month_label=plan_month_label,
+    )
 
 
 def _merge_sequencer_edits_into_full(
@@ -1757,28 +2015,112 @@ def _apply_sequencer_edits(base_df: pd.DataFrame, edited: pd.DataFrame) -> None:
         st.error(f"❌ Couldn't apply edits: {e}")
 
 
-def _render_bulk_move_form(schedule_df: pd.DataFrame) -> None:
-    """Bulk move N units of an FG SKU from one week to another."""
-    st.markdown("**🔀 Bulk move**")
-    st.caption(
-        "Shift a batch of units of the same FG SKU from one week to "
-        "another. Useful when you want to even out a single problem week "
-        "without editing rows one at a time."
-    )
+def _bulk_move_units(
+    schedule_df: pd.DataFrame, sku: str, from_week: int, to_week: int, qty: int,
+    year: int, month: int,
+) -> "tuple[pd.DataFrame, int]":
+    """Pure core of 🔀 Bulk move: move ``qty`` units of ``sku`` from week
+    ``from_week`` to week ``to_week`` of (year, month). Returns
+    ``(new_df, moved)``.
 
-    if "WEEK_OF_MONTH" not in schedule_df.columns:
+    Only rows DATED in that month's ``from_week`` are eligible — a carryover
+    row from an earlier month that happens to share the week number is left
+    alone — and the moved units land on the first working day of ``to_week``
+    in that same month. Per-row BUILD QTY can be >1, so rows are consumed
+    until the requested count is covered, splitting the last one when partial.
+    """
+    mask = (
+        (schedule_df["FG SKU ID"].astype(str).str.strip() == str(sku).strip())
+        & _month_week_mask(schedule_df, year, month, from_week)
+    )
+    eligible = schedule_df[mask]
+    if eligible.empty:
+        return schedule_df, 0
+
+    target_day = _first_working_day_of_week(year, month, to_week)
+    target_week = week_of_month(target_day)
+    moved = 0
+    new_df = schedule_df.copy()
+    new_rows = []  # for any split (partial-move) cases
+    for idx, row in eligible.iterrows():
+        if moved >= qty:
+            break
+        row_qty = int(row.get("BUILD QTY", 0) or 0)
+        if row_qty <= 0:
+            continue
+        take = min(row_qty, qty - moved)
+        if take == row_qty:
+            # Move the whole row by re-dating it to the target week.
+            new_df.at[idx, "PRODUCTION DAY"] = target_day
+            if "WEEK_OF_MONTH" in new_df.columns:
+                new_df.at[idx, "WEEK_OF_MONTH"] = target_week
+        else:
+            # Split: keep `row_qty - take` in the original row, add a new
+            # row with `take` units dated to the target week.
+            new_df.at[idx, "BUILD QTY"] = row_qty - take
+            split_row = row.copy()
+            split_row["BUILD QTY"] = take
+            split_row["PRODUCTION DAY"] = target_day
+            if "WEEK_OF_MONTH" in new_df.columns:
+                split_row["WEEK_OF_MONTH"] = target_week
+            new_rows.append(split_row)
+        moved += take
+
+    if new_rows:
+        new_df = pd.concat([new_df, pd.DataFrame(new_rows)], ignore_index=True)
+    return new_df, moved
+
+
+def _render_bulk_move_form(
+    schedule_df: pd.DataFrame,
+    plan_month: "tuple[int, int] | None" = None,
+    plan_month_label: str = "",
+) -> None:
+    """Bulk move N units of an FG SKU from one week of the plan month to
+    another. Weeks are the plan month's Monday-anchored calendar weeks (a
+    month that starts on a weekend has six), and only rows dated in the plan
+    month are movable — an off-month / carryover row goes through 📅 Move into
+    plan month first."""
+    st.markdown("**🔀 Bulk move**")
+
+    if "PRODUCTION DAY" not in schedule_df.columns:
         st.info("Week info isn't available — your schedule has no PRODUCTION DAY.")
         return
 
-    weeks = sorted(
-        int(w) for w in schedule_df["WEEK_OF_MONTH"].dropna().unique()
-    )
-    if len(weeks) < 1:
-        st.info("No week-bucketed rows to move.")
-        return
+    days = pd.to_datetime(schedule_df["PRODUCTION DAY"], errors="coerce")
+    if plan_month is None:
+        # Defensive — main() always passes the sidebar's Plan month. Fall back
+        # to the month most dated rows are in, so weeks never mix months.
+        dated = days.dropna()
+        if dated.empty:
+            st.info("No dated rows to move.")
+            return
+        _p = dated.dt.to_period("M").mode().iloc[0]
+        plan_month = (int(_p.year), int(_p.month))
+    year, month = int(plan_month[0]), int(plan_month[1])
+    label = plan_month_label or f"{calendar.month_name[month]} {year}"
 
-    skus = sorted(schedule_df.get("FG SKU ID", pd.Series(dtype=str))
-                  .astype(str).str.strip().unique())
+    st.caption(
+        f"Shift a batch of units of the same FG SKU from one week of **{label}** "
+        "to another. Useful when you want to even out a single problem week "
+        "without editing rows one at a time. Weeks are the plan month's "
+        "Monday-anchored calendar weeks; rows dated in another month aren't "
+        f"movable here — use **📅 Move … into {label}** at the top of the page "
+        "first."
+    )
+
+    in_month = (days.dt.year == year) & (days.dt.month == month)
+    week_col = pd.Series(week_of_month_series(days), index=schedule_df.index)
+    weeks_in_use = sorted(int(w) for w in week_col[in_month].dropna().unique())
+    if not weeks_in_use:
+        st.info(f"No rows are dated in {label} — nothing to move by week.")
+        return
+    # Target weeks follow the plan month's calendar (4–6 weeks), not a fixed 1–5.
+    to_week_opts = sorted(set(_month_weeks(year, month)) | set(weeks_in_use))
+
+    skus = sorted(
+        schedule_df.loc[in_month, "FG SKU ID"].astype(str).str.strip().unique()
+    ) if "FG SKU ID" in schedule_df.columns else []
     if not skus:
         return
 
@@ -1786,9 +2128,8 @@ def _render_bulk_move_form(schedule_df: pd.DataFrame) -> None:
         c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
         chosen_sku = c1.selectbox("FG SKU", options=skus, key="bulk_move_sku")
         from_week = c2.selectbox(
-            "From week", options=weeks, key="bulk_move_from",
+            "From week", options=weeks_in_use, key="bulk_move_from",
         )
-        to_week_opts = sorted(set(weeks + [w for w in (1, 2, 3, 4, 5) if w not in weeks]))
         to_week = c3.selectbox(
             "To week", options=to_week_opts, key="bulk_move_to",
         )
@@ -1803,54 +2144,13 @@ def _render_bulk_move_form(schedule_df: pd.DataFrame) -> None:
     if not submitted:
         return
 
-    # Pick the matching rows in the source week — newest first by index so
-    # the move targets the bottom of that week's stack.
-    mask = (
-        (schedule_df["FG SKU ID"].astype(str).str.strip() == chosen_sku)
-        & (schedule_df["WEEK_OF_MONTH"] == from_week)
+    new_df, moved = _bulk_move_units(
+        schedule_df, chosen_sku, int(from_week), int(to_week), int(qty), year, month,
     )
-    eligible = schedule_df[mask].copy()
-    if eligible.empty:
-        st.warning(f"No units of **{chosen_sku}** found in week {from_week}.")
-        return
-
-    # Per-row BUILD QTY can be >1, so we accumulate rows until we cover the
-    # requested move count, splitting a row when partial.
-    moved = 0
-    new_df = schedule_df.copy()
-    new_rows = []  # for any split (partial-move) cases
-    for idx, row in eligible.iterrows():
-        if moved >= qty:
-            break
-        row_qty = int(row.get("BUILD QTY", 0) or 0)
-        if row_qty <= 0:
-            continue
-        take = min(row_qty, qty - moved)
-        if take == row_qty:
-            # Move the whole row by updating its PRODUCTION DAY to the
-            # first working day of the target week.
-            new_df.at[idx, "PRODUCTION DAY"] = _first_day_of_week(
-                new_df.at[idx, "PRODUCTION DAY"], to_week,
-            )
-            new_df.at[idx, "WEEK_OF_MONTH"] = to_week
-        else:
-            # Split: keep `row_qty - take` in the original row, add a new
-            # row with `take` units dated to the target week.
-            new_df.at[idx, "BUILD QTY"] = row_qty - take
-            split_row = row.copy()
-            split_row["BUILD QTY"] = take
-            split_row["PRODUCTION DAY"] = _first_day_of_week(
-                row.get("PRODUCTION DAY"), to_week,
-            )
-            split_row["WEEK_OF_MONTH"] = to_week
-            new_rows.append(split_row)
-        moved += take
-
-    if new_rows:
-        new_df = pd.concat([new_df, pd.DataFrame(new_rows)], ignore_index=True)
-
     if moved == 0:
-        st.warning(f"Nothing moved — couldn't find {qty} unit(s) of {chosen_sku}.")
+        st.warning(
+            f"No units of **{chosen_sku}** found in week {from_week} of {label}."
+        )
         return
 
     # Commit through the same buffer the editor uses.
@@ -1864,31 +2164,9 @@ def _render_bulk_move_form(schedule_df: pd.DataFrame) -> None:
     )
     st.success(
         f"🔀 Moved **{moved}** unit(s) of **{chosen_sku}** from "
-        f"week {from_week} → week {to_week}."
+        f"week {from_week} → week {to_week} of {label}."
     )
     st.rerun()
-
-
-def _first_day_of_week(reference, target_week: int):
-    """Return a pd.Timestamp for the first working day (Monday-ish) of the
-    given week-of-month, anchored on the same month as ``reference``.
-
-    Falls back to today's month if ``reference`` isn't a parseable date.
-    """
-    ref = pd.to_datetime(reference, errors="coerce")
-    if pd.isna(ref):
-        ref_dt = now_local()
-    else:
-        ref_dt = ref
-    year = int(ref_dt.year)
-    month = int(ref_dt.month)
-    working = _working_days_in_month(year, month)
-    # Pick the first working day whose week-of-month matches.
-    for d in working:
-        if week_of_month(d) == int(target_week):
-            return pd.Timestamp(d)
-    # Fallback — first working day of the month
-    return pd.Timestamp(working[0]) if working else pd.Timestamp(ref_dt.date())
 
 
 def _strip_one_sku(sku: str, valid_bases: set) -> "tuple[str, str]":
@@ -2037,7 +2315,7 @@ def _strip_customer_suffixes_from_schedule(
 
 
 def _render_suffix_cleanup_view(
-    schedule_df: pd.DataFrame, machine_df, acc_df,
+    schedule_df: pd.DataFrame, machine_df, acc_df, manual_mode: bool = False,
 ) -> None:
     """🧹 Customer suffix cleanup — sub-section UI.
 
@@ -2143,8 +2421,13 @@ def _render_suffix_cleanup_view(
                 n_fg=n_fg_preview, n_acc=n_acc_preview,
             ),
             help=(
-                "Saves the cleaned schedule as a CSV. Re-upload, or save "
-                "via the 📂 Save panel for the team."
+                "Saves the cleaned schedule as a CSV you can re-upload later."
+                + (
+                    " In manual mode this is how you keep the cleanup."
+                    if manual_mode else
+                    " (After 🔄 Strip, 💾 Save schedule in the 📂 panel saves "
+                    "the cleaned plan directly.)"
+                )
             ),
         )
     except Exception:
@@ -2218,22 +2501,20 @@ def _render_calendar_view(
         st.info("No rows have a valid PRODUCTION DAY value.")
         return
 
-    # Restrict to the selected Plan month — the picker is authoritative, so the
-    # Calendar only divides / shows that month. (Out-of-month rows get a
-    # top-of-page warning in main(); they're intentionally not shown here.)
-    if plan_month is not None:
-        _py, _pm = plan_month
-        work = work[
-            (work["PRODUCTION DAY"].dt.year == _py)
-            & (work["PRODUCTION DAY"].dt.month == _pm)
-        ].copy()
-        if work.empty:
-            st.info(
-                f"No units are dated in **{plan_month_label}**. Either pick a "
-                "different **Plan month** in the sidebar, or add dates in that "
-                "month to your schedule."
-            )
-            return
+    # Restrict to ONE month — the selected Plan month (the picker is
+    # authoritative, so the Calendar only divides / shows that month; out-of-
+    # month rows get a top-of-page warning in main() and are intentionally not
+    # shown here), or, with no picker value, the month most rows fall in. The
+    # week cards below are keyed on week-of-month, so two months must never
+    # reach them together.
+    work, _ym = _calendar_month_slice(work, plan_month)
+    if work.empty:
+        st.info(
+            f"No units are dated in **{plan_month_label}**. Either pick a "
+            "different **Plan month** in the sidebar, or add dates in that "
+            "month to your schedule."
+        )
+        return
 
     # Recompute WEEK_OF_MONTH on the filtered frame so it matches the
     # Monday-anchored scheme used for the week cards below.
@@ -2242,10 +2523,6 @@ def _render_calendar_view(
     # Map each Monday-anchored week of the Plan month → its Mon–Fri working
     # days (clamped to the month) so every card shows a real calendar span,
     # e.g. "Jun 1 – Jun 5", even for partial first / last weeks.
-    _ym = plan_month if plan_month is not None else (
-        int(work["PRODUCTION DAY"].dt.year.mode()[0]),
-        int(work["PRODUCTION DAY"].dt.month.mode()[0]),
-    )
     _week_days: dict[int, list] = {}
     for _d in _working_days_in_month(_ym[0], _ym[1]):
         _week_days.setdefault(week_of_month(_d), []).append(_d)
@@ -2736,28 +3013,35 @@ def _render_uploaded_schedules_panel(location: str, uploaded_file) -> None:
         )
 
         # ------------------------------------------------------------------
-        # SAVE — uses the live uploader bytes if present, otherwise the
-        # bundled sample (so a planner can save the "current view" they're
-        # working with without re-uploading).
+        # SAVE — what's saved is the schedule the app is analysing right now
+        # (see _active_schedule_bytes): the upload as converted to CSV, or,
+        # after a Sequencer ✅ Accept / 🗓 Apply / 🔀 Bulk move / 🧹 Strip /
+        # 📅 Move into plan month, the reshaped plan. A schedule loaded from
+        # the list below can therefore be edited and re-saved without the
+        # uploader holding a file. (It used to push the uploader's raw file,
+        # so none of those edits ever reached GitHub.)
         # ------------------------------------------------------------------
-        st.markdown("**Save current upload as**")
+        st.markdown("**Save the active schedule as**")
         save_name = st.text_input(
             "Schedule name",
             key=f"uploaded_schedule_save_name_{location}",
             placeholder="e.g. May 2026 production plan",
             label_visibility="collapsed",
         )
+        _can_save = _has_active_schedule(uploaded_file)
         if st.button(
             "💾 Save schedule",
             key=f"uploaded_schedule_save_btn_{location}",
             use_container_width=True,
-            disabled=(uploaded_file is None),
+            disabled=not _can_save,
             help=(
-                "Saves the file you uploaded above to GitHub under this "
-                "facility, so teammates can reload it. Upload a file first."
-                if uploaded_file is None else
-                "Pushes your current uploaded CSV to GitHub. Teammates can "
-                "reload it from the dropdown below."
+                "Nothing to save yet — upload a schedule file, or load one "
+                "from the list below, first."
+                if not _can_save else
+                "Pushes the schedule the app is analysing right now — your "
+                "upload, including any Sequencer / 🗓 Sequence / 🧹 cleanup "
+                "changes you applied — to GitHub under this facility. "
+                "Teammates can reload it from the dropdown below."
             ),
         ):
             _uploaded_schedule_save(location, save_name, uploaded_file, schedule_names)
@@ -2795,7 +3079,13 @@ def _render_uploaded_schedules_panel(location: str, uploaded_file) -> None:
 def _uploaded_schedule_save(
     location: str, name: str, uploaded_file, existing_names: list,
 ) -> None:
-    """Save the planner's currently-uploaded CSV under ``name`` to GitHub.
+    """Save the schedule the app is analysing under ``name`` to GitHub.
+
+    The bytes come from :func:`_active_schedule_bytes` — the persisted active
+    schedule (with every reshape applied this session), not the uploader's
+    raw file — so what teammates reload is what the planner was looking at.
+    ``uploaded_file`` only matters on the one run where a brand-new upload
+    hasn't been promoted by the loader yet.
 
     Mirrors ``_scenario_save`` — same overwrite-confirmation pattern (per-
     location key carrying the name we warned about, cleared on save) so a
@@ -2805,8 +3095,16 @@ def _uploaded_schedule_save(
     if not name:
         st.warning("Please enter a schedule name before saving.")
         return
-    if uploaded_file is None:
-        st.warning("Upload a schedule file first, then save it.")
+    try:
+        raw = _active_schedule_bytes(uploaded_file)
+    except Exception as e:
+        st.error(f"❌ Couldn't read the uploaded file: {e}")
+        return
+    if raw is None:
+        st.warning(
+            "Nothing to save yet — upload a schedule file, or load one from "
+            "the list below, first."
+        )
         return
 
     confirm_key = f"_uploaded_schedule_overwrite_pending_{location}"
@@ -2827,22 +3125,16 @@ def _uploaded_schedule_save(
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
 
-    # Decode the upload to CSV text. An Excel workbook is converted to CSV
-    # first (same sheet detection as the loader), so what's saved is always a
-    # CSV the loader can re-read. The loader handles latin-1 / UTF-8 /
-    # UTF-8-with-BOM transparently; here we just need *some* text encoding
-    # we can re-parse. Try utf-8 first, fall back to latin-1.
+    # Decode the active CSV bytes to text. (An Excel upload was already
+    # converted to CSV when it became the active schedule — same sheet
+    # detection as the loader — so what's saved is always a CSV the loader can
+    # re-read.) The loader handles latin-1 / UTF-8 / UTF-8-with-BOM
+    # transparently; here we just need *some* text encoding we can re-parse.
+    # Try utf-8 first, fall back to latin-1.
     try:
-        raw, _sheet = upload_to_schedule_csv(
-            getattr(uploaded_file, "name", ""), uploaded_file.getvalue(),
-        )
-        try:
-            csv_text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            csv_text = raw.decode("latin-1")
-    except Exception as e:
-        st.error(f"❌ Couldn't read the uploaded file: {e}")
-        return
+        csv_text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        csv_text = raw.decode("latin-1")
 
     try:
         with st.spinner(f"Saving schedule '{name}' for {location}..."):
@@ -3951,7 +4243,7 @@ def render_sidebar() -> dict:
     st.sidebar.markdown("#### Step 2 · Tell us what to build")
     schedule_mode = st.sidebar.radio(
         "How would you like to enter the build plan?",
-        ["📤 Upload schedule file", "✏️ Paste or type SKUs"],
+        [SCHEDULE_MODE_UPLOAD, SCHEDULE_MODE_MANUAL],
         index=0,
         help=(
             "Upload a full production schedule (CSV or Excel workbook) — best "
@@ -3959,11 +4251,15 @@ def render_sidebar() -> dict:
             "(and add a few rows by hand) — best for quick what-if scenarios."
         ),
     )
+    # A Sequencer proposal or a reshape waiting in the one-shot buffer was
+    # computed against the OTHER mode's schedule; consuming it after a switch
+    # would silently replace this mode's plan with the old mode's rows.
+    _note_schedule_mode(schedule_mode)
 
     uploaded = None
     manual_entries = None
 
-    if schedule_mode == "📤 Upload schedule file":
+    if schedule_mode == SCHEDULE_MODE_UPLOAD:
         uploaded = st.sidebar.file_uploader(
             "Choose a CSV or Excel file",
             type=["csv", "xlsx", "xlsm"],
@@ -4654,7 +4950,7 @@ The table's **`#`** column numbers the rows for you. A row takes the next number
 |---|---|
 | Paste a SKU list out of Excel | Sidebar → **✏️ Paste or type SKUs** → **📋 Paste a list from Excel** |
 | Save your manual build plan | Sidebar → **📂 Save / load scenarios** (when in "Paste or type SKUs" mode) |
-| Save your uploaded schedule | Sidebar → **📂 Save / load uploaded schedules** (when in "Upload schedule file" mode) |
+| Save your uploaded schedule — including any Sequencer / 🗓 Sequence / 🧹 cleanup changes | Sidebar → **📂 Save / load uploaded schedules** → **💾 Save schedule** (when in "Upload schedule file" mode) |
 | Get a blank upload template | Sidebar → **📥 Download blank template** (under the file uploader) |
 | Edit labor times | **📁 Data & Setup** tab → Machine / Accessory catalog |
 | Add a missing SKU | **📁 Data & Setup** → catalog → **➕ Add a new SKU** |
@@ -4760,7 +5056,7 @@ Answers the question planners ask once they care: *"will the team see what I jus
 When you're in **✏️ Paste or type SKUs** mode, the sidebar's **📂 Save / load scenarios** expander lets you name and save your manual SKU list. Saved per facility to `data/scenarios.json` on GitHub — anyone planning for the same facility can reload them.
 
 ### Save / load uploaded schedules (upload mode)
-When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / load uploaded schedules** expander lets you save your uploaded schedule under a name. Saved per facility to `data/uploaded_schedules.json` on GitHub. The **raw CSV** is preserved (an Excel upload is saved as the CSV it was converted to), so any columns the app currently ignores still survive the round-trip for future use.
+When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / load uploaded schedules** expander lets you save the schedule the app is analysing under a name — your upload as loaded, or, after a Sequencer **✅ Accept**, a 🗓 **🔄 Apply edits**, a **🔀 Bulk move**, a 🧹 **Strip**, or a **📅 Move into plan month**, the reshaped plan. A schedule loaded from the list can be edited and re-saved the same way (the uploader doesn't need to hold a file). Saved per facility to `data/uploaded_schedules.json` on GitHub. An untouched upload is saved as its CSV (an Excel upload as the CSV it was converted to), so any columns the app currently ignores still survive the round-trip for future use.
 
 ### Export & Excel link
 **📁 Data & Setup → 📤 Export & Excel link** downloads the whole database (catalogs, crew, settings, scenarios, executive scenarios, saved schedules, process flow) as one `.xlsx`, or this session's schedule / per-unit labor / capacity tables. Step 3 there lists the raw GitHub URL of each CSV catalog plus a Power Query script, so an Excel sheet can read the live data and **Refresh All** whenever the team saves.
@@ -4821,12 +5117,16 @@ The Sequencer turns the static schedule into something you can *re-balance* inte
 
 The proposal appears as a side-by-side preview heatmap on the Overview (Current vs Proposed). **✅ Accept** swaps the analysis to use the proposed sequence; **🚫 Discard** drops it.
 
+Suggest / Accept work in both sidebar modes — with an uploaded schedule and with a pasted or typed SKU list.
+
 **🗓 Sequence sub-section** (📁 Data & Setup) — manual reshape:
 - *Editable table* — every row's `PRODUCTION DAY` is a date-picker cell. Edit, then click **🔄 Apply edits** to push the changes into the analysis.
-- *🔀 Bulk move* form — shift N units of a chosen FG SKU from one week to another in one click. Useful when you want to flatten a single problem week without per-row edits.
-- *📥 Download* — reshaped schedule as CSV. Re-upload to save, or push it through the **📂 Save uploaded schedule** panel.
+- *🔀 Bulk move* form — shift N units of a chosen FG SKU from one week of the plan month to another in one click. Useful when you want to flatten a single problem week without per-row edits. The week list follows the plan month's calendar (a month that starts on a weekend has six Monday-anchored weeks); rows dated in another month aren't movable here — use **📅 Move … into plan month** at the top of the page first.
+- *📥 Download* — reshaped schedule as CSV, for a copy you can re-upload later.
 
-Reshape edits live in your browser session only — they don't persist to GitHub unless you save through the existing 📂 Save panel.
+Reshape edits live in your browser session until you save. In **📤 Upload schedule file** mode, **💾 Save schedule** in the 📂 panel saves the reshaped plan for the team. In **✏️ Paste or type SKUs** mode the reshape is session-only — a saved scenario keeps the SKU list, not the dates — and changing the SKU rows in the sidebar grid drops it (it described a plan that no longer exists); download it to keep a copy, or upload the download in upload mode to save it. Switching modes discards a pending proposal.
+
+**Week filters and carryover.** *This week*, the Overview's weekly heatmap, the Calendar and Bulk move all bucket rows by the **month and week** their `PRODUCTION DAY` falls in, so a carryover row dated in an earlier month never merges into this month's same-numbered week. When a schedule's dated rows span two months, the heatmap labels its columns `Sep Wk 5`, `Oct Wk 1`, ….
 
 ### 📆 Calendar (week & day rollups)
 Top-level tab (sits between **🏠 Overview** and **📊 Capacity**). Bucketed view of *what gets built each week and each day* — one expandable card per week of the month showing total units, total labor (p-min), and the top FG SKUs. Open a card to see:
@@ -4900,48 +5200,38 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
     """
     if schedule_df_full is None or schedule_df_full.empty:
         return None
-    if "WEEK_OF_MONTH" not in schedule_df_full.columns:
+    if "PRODUCTION DAY" not in schedule_df_full.columns:
         return None
-    weeks = sorted(
-        int(w) for w in schedule_df_full["WEEK_OF_MONTH"].dropna().unique()
-    )
-    if not weeks:
+    # One column per (year, month, week) bucket of PRODUCTION DAY — never per
+    # bare WEEK_OF_MONTH, which merged a September carryover row's week 2 into
+    # October's. Columns read "Wk 3" while every dated row is in one month and
+    # "Sep Wk 5" / "Oct Wk 1" once they span two.
+    buckets = _month_week_keys(schedule_df_full)
+    if not buckets:
         return None
+    with_month = len({(y, m) for y, m, _w in buckets}) > 1
 
     # Capacity for each week uses that week's TRUE count of M–F working days,
     # not a flat 5. A partial leading/trailing calendar week (week 1 or the last
     # week of most months) has only 1–4 working days; dividing its demand by a
     # 5-day capacity understates utilization by up to ~5× and paints a genuinely
-    # overloaded short week green. The working-day count is computed PER WEEK
-    # from the month that week's own rows fall in — so a multi-month schedule
-    # (dated rows in two months) never applies one month's calendar to another
-    # month's weeks. A week whose dates are absent falls back to 5. We
+    # overloaded short week green. The count comes from the bucket's own month,
+    # so a multi-month schedule never applies one month's calendar to another
+    # month's weeks. A week with no working days falls back to 5. We
     # deliberately don't pull the day count from inputs["days"] (that may be set
     # for the whole-month window).
-    def _working_days_for_week(slice_df, w):
+    def _working_days_for_week(y, m, w):
         try:
-            _wd = pd.to_datetime(
-                slice_df["PRODUCTION DAY"], errors="coerce"
-            ).dropna()
-            if _wd.empty:
-                return 5
-            # The month this week's rows fall in (dominant, if a bucket somehow
-            # straddles two months). Count that month's M–F days in week w.
-            _p = _wd.dt.to_period("M").mode()
-            if not len(_p):
-                return 5
-            _pp = _p.iloc[0]
             cnt = sum(
-                1 for _d in _working_days_in_month(int(_pp.year), int(_pp.month))
-                if week_of_month(_d) == int(w)
+                1 for _d in _working_days_in_month(y, m) if week_of_month(_d) == w
             )
             return cnt if cnt > 0 else 5
         except Exception:
             return 5
 
     out = {}
-    for w in weeks:
-        slice_df = schedule_df_full[schedule_df_full["WEEK_OF_MONTH"] == w]
+    for (y, m, w) in buckets:
+        slice_df = schedule_df_full[_month_week_mask(schedule_df_full, y, m, w)]
         if slice_df.empty:
             continue
         try:
@@ -4950,7 +5240,7 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
             continue
         if units_w.empty:
             continue
-        week_days = _working_days_for_week(slice_df, w)
+        week_days = _working_days_for_week(y, m, w)
         try:
             cap_w = _build_capacity_table_cached(
                 units_w, inputs["crew_config"], inputs["shift"], week_days,
@@ -4962,7 +5252,7 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
             )
         except Exception:
             continue
-        out[f"Wk {w}"] = cap_w["labor_util_safe"]
+        out[_month_week_label(y, m, w, with_month)] = cap_w["labor_util_safe"]
 
     if not out:
         return None
@@ -7016,15 +7306,21 @@ def tab_data_setup(
         # Sequence reshape needs the FULL schedule (not the time-window
         # subset) so the planner can move units across all weeks of the
         # month, not just the currently-filtered slice.
+        _inputs = inputs if isinstance(inputs, dict) else {}
         _render_sequencer_view(
             schedule_df_full if schedule_df_full is not None else schedule_df,
+            plan_month=_inputs.get("plan_month"),
+            plan_month_label=_inputs.get("plan_month_label", ""),
+            manual_mode=_inputs.get("schedule_mode") == SCHEDULE_MODE_MANUAL,
         )
 
     elif sub == "🧹 Customer suffix cleanup":
         # Same pattern as Sequence: cleanup operates on the full schedule.
+        _inputs = inputs if isinstance(inputs, dict) else {}
         _render_suffix_cleanup_view(
             schedule_df_full if schedule_df_full is not None else schedule_df,
             machine_df, acc_df,
+            manual_mode=_inputs.get("schedule_mode") == SCHEDULE_MODE_MANUAL,
         )
 
     elif sub == "🏭 Machine catalog":
@@ -7583,6 +7879,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
             st.cache_data.clear()
         except Exception:
             pass
+        _mark_catalog_saved(file_path, response)
         _track_and_flush("catalog_add_placeholder", file=file_path, sku=new_sku)
         st.success(
             f"✅ Added XXX placeholder accessory `{new_sku}` "
@@ -7737,6 +8034,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
             st.cache_data.clear()
         except Exception:
             pass
+        _mark_catalog_saved(file_path, response)
         _track_and_flush("catalog_add_sku", file=file_path, label=label, sku=new_sku)
         st.success(
             f"✅ Added `{new_sku}` to `{file_path}` "
@@ -7751,9 +8049,33 @@ def _latest_sha_cached(file_path: str, token: str) -> "str | None":
     return latest_catalog_sha(file_path, token)
 
 
+def _mark_catalog_saved(file_path: str, response=None) -> None:
+    """After our OWN successful commit to ``file_path``, record the new blob
+    SHA as the one this session has loaded, so the stale-data banner doesn't
+    flag the saver's own save as "updated by another user".
+
+    ``response`` is the GitHub Contents-API PUT payload; its ``content.sha``
+    is exactly what :func:`latest_catalog_sha` returns next. When the payload
+    doesn't carry it, forget the loaded SHA instead — the banner's next render
+    re-records whatever is current.
+    """
+    key = f"loaded_sha::{file_path}"
+    sha = None
+    if isinstance(response, dict):
+        content = response.get("content")
+        if isinstance(content, dict):
+            sha = content.get("sha")
+    if sha:
+        st.session_state[key] = str(sha)
+    else:
+        st.session_state.pop(key, None)
+
+
 def _render_stale_data_banner(file_path: str) -> None:
     """Show a yellow banner if another user committed to `file_path` after
-    we recorded our 'loaded' SHA. The user can click 🔄 to refresh."""
+    we recorded our 'loaded' SHA. The user can click 🔄 to refresh. Every save
+    path calls :func:`_mark_catalog_saved` so the saver's own commit is never
+    reported as someone else's."""
     token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
     if not token:
         return  # No token → can't poll; silently skip the banner
@@ -8022,11 +8344,12 @@ def _import_missing_skus_to_catalog(
         merged = pd.concat([fresh_df, pd.DataFrame(new_rows)], ignore_index=True)
         csv_text = merged.to_csv(index=False)
         try:
-            save_catalog_to_github(
+            response = save_catalog_to_github(
                 csv_text, file_path, token,
                 message=f"Import {len(added)} missing {label} SKU(s) from schedule via app",
                 sha=fresh_sha,
             )
+            _mark_catalog_saved(file_path, response)
             return added, skipped
         except GitHubConflict:
             if attempt == 2:
@@ -8260,6 +8583,7 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         st.cache_data.clear()
     except Exception:
         pass
+    _mark_catalog_saved(file_path, response)
 
     _track_and_flush(
         "catalog_save", file=file_path, label=label, cells=n_diffs, renames=n_ren,
@@ -9497,6 +9821,7 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
         st.cache_data.clear()
     except Exception:
         pass
+    _mark_catalog_saved(file_path, response)
     _track_and_flush("recon_apply", file=file_path, cells=n_diffs)
     st.success(
         f"✅ Wrote {n_diffs} updated cell(s) to acc_clean.csv "
@@ -9759,7 +10084,7 @@ def main():
     schedule_df = pd.DataFrame()
     empty_banner_msg = None
 
-    if inputs.get("schedule_mode") == "✏️ Paste or type SKUs":
+    if inputs.get("schedule_mode") == SCHEDULE_MODE_MANUAL:
         manual_entries = inputs.get("manual_entries")
         if manual_entries is None or manual_entries.empty:
             empty_banner_msg = (
@@ -9776,23 +10101,26 @@ def main():
                     "✏️ **Manual entry mode** — fill in at least one row (FG SKU + Quantity > 0) in "
                     "the sidebar. You can still use **📁 Data & Setup** to edit catalogs."
                 )
-            else:
-                # Manual rows don't carry a PRODUCTION DAY — run auto-spread
-                # so the Calendar tab, the Sequencer Suggest button, and the
-                # weekly heatmap all light up the same way they do for an
-                # uploaded CSV. The sidebar "Plan month" picker is the
-                # authoritative target month; fall back to a scenario-name
-                # guess only if the picker is somehow missing.
-                _hint = inputs.get("plan_month")
-                if _hint is None:
-                    _last_scen = st.session_state.get(
-                        f"_last_loaded_scenario_name_{inputs['location']}", ""
-                    )
-                    _hint = _parse_month_from_name(_last_scen)
-                _auto_spread_dates(
-                    schedule_df, machine_df, acc_df, inputs["location"],
-                    target_month_hint=_hint,
-                )
+        # Manual rows don't carry a PRODUCTION DAY — the resolver auto-spreads
+        # them so the Calendar tab, the Sequencer Suggest button, and the
+        # weekly heatmap all light up the same way they do for an uploaded
+        # CSV. The sidebar "Plan month" picker is the authoritative target
+        # month; fall back to a scenario-name guess only if the picker is
+        # somehow missing.
+        _hint = inputs.get("plan_month")
+        if _hint is None:
+            _last_scen = st.session_state.get(
+                f"_last_loaded_scenario_name_{inputs['location']}", ""
+            )
+            _hint = _parse_month_from_name(_last_scen)
+        # Same one-shot channel as upload mode: a Sequencer ✅ Accept, 🗓
+        # Apply, 🔀 Bulk move, 🧹 Strip or 📅 Move into plan month that just
+        # ran lands here as the override for this grid content (and an empty
+        # grid drops any pending buffer instead of leaking it into the next
+        # mode). See _resolve_manual_schedule.
+        schedule_df = _resolve_manual_schedule(
+            schedule_df, inputs["location"], machine_df, acc_df, plan_month=_hint,
+        )
     else:
         try:
             schedule_df = _load_schedule_df(
@@ -9864,8 +10192,11 @@ def main():
                 )
             else:
                 current_week = week_of_month(_today_date)
+                # Key on (today's year, month, week) via PRODUCTION DAY — not
+                # on WEEK_OF_MONTH alone, which would also pull in a carryover
+                # row from an earlier month's same-numbered week.
                 schedule_df = schedule_df[
-                    schedule_df["WEEK_OF_MONTH"] == current_week
+                    _month_week_mask(schedule_df, _now.year, _now.month, current_week)
                 ].copy()
                 if schedule_df.empty and not empty_banner_msg:
                     empty_banner_msg = (

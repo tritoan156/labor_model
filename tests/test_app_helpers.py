@@ -202,21 +202,26 @@ class TestWeeklyUtilizationPartialWeeks:
         # but June's week 1 (Jun 1–5) is a genuinely FULL 5-working-day week and
         # must be divided by 5 — not by May's week 1 (May 1 only = 1 day), which
         # would read 5× too high and paint a fine week as overloaded.
+        #
+        # Since the 2026-10-20 audit the buckets are keyed on (year, month,
+        # week) of PRODUCTION DAY and a multi-month schedule labels its columns
+        # with the month, so June's week 1 is "Jun Wk 1" (and can never merge
+        # with May's week 1).
         machine_df = app._load_machine_df(0.0)
         acc_df = app._load_acc_df(0.0)
-        # Jun 1 → WEEK_OF_MONTH 1 (June); May 11 → WEEK_OF_MONTH 3 (May), so the
-        # two months land in different buckets. May has more rows → mode = May.
+        # Jun 1 → week 1 of June; May 11 → week 3 of May. May has more rows.
         full = self._units_on(machine_df, acc_df,
                               [("2026-06-01", 10), ("2026-05-11", 40)])
         inputs = self._inputs()
         wu = app._compute_weekly_utilization(full, machine_df, acc_df, inputs)
+        assert list(wu.columns) == ["May Wk 3", "Jun Wk 1"]
         # June's week-1 rows only; its true capacity is the full 5-day week.
-        june_wk1 = full[full["WEEK_OF_MONTH"] == 1]
+        june_wk1 = full[full["PRODUCTION DAY"].dt.month == 6]
         units_w = app._expand_schedule(june_wk1, machine_df, acc_df)
         from core.labor_calculator import build_capacity_table
         cap5 = build_capacity_table(units_w, inputs["crew_config"], 480, 5, 1.0, 1.0)
         for station in ("PM Acc (Headunit)", "PDI"):
-            fixed = float(wu.loc[station, "Wk 1"])
+            fixed = float(wu.loc[station, "Jun Wk 1"])
             correct = float(cap5.loc[station, "labor_util_safe"])
             assert correct > 0
             assert abs(fixed - correct) < 1e-6

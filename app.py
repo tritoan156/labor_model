@@ -412,12 +412,29 @@ def _build_capacity_table_cached(units, crew_config, shift_minutes, working_days
     )
 
 
-def _usage_token() -> "str | None":
-    """Token lookup mirroring the catalog save handlers."""
+def _github_token() -> "str | None":
+    """The GitHub PAT from Streamlit Secrets, or None when there isn't one.
+
+    Every save handler and the stale-data banner read the token through this
+    rather than ``st.secrets`` directly. ``st.secrets.get`` doesn't return its
+    default when no secrets file exists at all — it raises
+    ``StreamlitSecretNotFoundError`` — so a local run without a
+    ``.streamlit/secrets.toml`` used to crash the catalog editors and the
+    Excel import preview instead of landing on the "GitHub token not
+    configured" path. A blank token counts as missing.
+    """
     try:
-        return st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+        if not hasattr(st, "secrets"):
+            return None
+        token = st.secrets.get("github_token", None)
     except Exception:
         return None
+    return token or None
+
+
+def _usage_token() -> "str | None":
+    """Token lookup mirroring the catalog save handlers."""
+    return _github_token()
 
 
 def _track_and_flush(event_type: str, *, force_flush: bool = True, **payload) -> None:
@@ -2517,7 +2534,7 @@ def _scenario_save(location: str, name: str, seed_key: str, existing_names: list
         # so a later attempt at an existing name re-triggers the confirmation.
         st.session_state.pop(confirm_key, None)
 
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
@@ -2643,7 +2660,7 @@ def _scenario_delete(location: str, name: str) -> None:
         "click **🗑 Delete** again to confirm.",
     ):
         return
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
@@ -2787,7 +2804,7 @@ def _uploaded_schedule_save(
     else:
         st.session_state.pop(confirm_key, None)
 
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
@@ -2860,7 +2877,7 @@ def _uploaded_schedule_delete(location: str, name: str) -> None:
         "— click **🗑 Delete** again to confirm.",
     ):
         return
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
@@ -4462,7 +4479,7 @@ def render_sidebar() -> dict:
 
         if st.button(f"💾 Save planning assumptions for {location}",
                      use_container_width=True, key=f"save_assump_{location}"):
-            token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+            token = _github_token()
             if not token:
                 st.error(
                     "GitHub token not configured. Ask your admin to add "
@@ -4547,7 +4564,7 @@ def render_sidebar() -> dict:
 
         # Save button
         if st.button(f"💾 Save crew for {location}", use_container_width=True):
-            token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+            token = _github_token()
             if not token:
                 st.error(
                     "GitHub token not configured. Ask your admin to add "
@@ -5399,7 +5416,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
             )
             if st.button("💾 Save executive scenario",
                          key=f"exec_save_btn_{location}", use_container_width=True):
-                token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+                token = _github_token()
                 name = (_save_name or "").strip()
                 if not name:
                     st.warning("Enter a scenario name first.")
@@ -5465,7 +5482,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                         f"⚠️ Delete executive scenario **{pick}** for everyone? "
                         "This can't be undone — click **🗑 Delete** again to confirm.",
                 ):
-                    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+                    token = _github_token()
                     if not token:
                         st.error("GitHub token not configured.")
                     else:
@@ -7698,7 +7715,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
             )
             return
 
-        token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+        token = _github_token()
         if not token:
             st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
             return
@@ -7841,7 +7858,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
                      "Edit the existing row in the table above instead.")
             return
 
-        token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+        token = _github_token()
         if not token:
             st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
             return
@@ -7936,7 +7953,7 @@ def _latest_sha_cached(file_path: str, token: str) -> "str | None":
 def _render_stale_data_banner(file_path: str) -> None:
     """Show a yellow banner if another user committed to `file_path` after
     we recorded our 'loaded' SHA. The user can click 🔄 to refresh."""
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         return  # No token → can't poll; silently skip the banner
 
@@ -8419,7 +8436,7 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
     """
     renames = [r for r in (renames or []) if str(r[0]).strip() != str(r[1]).strip()]
     additions = list(additions or [])
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
@@ -9183,7 +9200,7 @@ def _render_flow_editor(edges: list) -> None:
 
 
 def _flow_save(edited_df) -> None:
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
@@ -9223,7 +9240,7 @@ def _flow_reset(current_count: int | None = None, default_count: int | None = No
         f"{_lost} and can't be undone — click **🔄 Reset to default** again to confirm.",
     ):
         return
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
         return
@@ -9694,7 +9711,7 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
     — the actual write is layered on top of a freshly-fetched copy from
     GitHub.
     """
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
         return
@@ -9934,7 +9951,7 @@ def _save_simple_csv(df, file_path, label):
     A fetch failure raises (caught below → "Save failed"), so a transient blip
     aborts rather than clobbering.
     """
-    token = st.secrets.get("github_token", None) if hasattr(st, "secrets") else None
+    token = _github_token()
     if not token:
         st.error("GitHub token not configured. Ask your admin to add `github_token` to Streamlit Secrets.")
         return
@@ -10403,12 +10420,7 @@ def main():
         # placeholder (zero labor, today's date) so its units stop being
         # dropped. The planner fills in real labor times afterwards.
         _n_missing = len(_skipped_fg) + len(_unknown_acc)
-        # Defensive: st.secrets.get() raises if no secrets.toml exists at all
-        # (e.g. local runs). Streamlit Cloud always has one, but guard anyway.
-        try:
-            _token = st.secrets.get("github_token", None)
-        except Exception:
-            _token = None
+        _token = _github_token()
         _ic1, _ic2 = st.columns([2, 3])
         with _ic1:
             _do_import = st.button(

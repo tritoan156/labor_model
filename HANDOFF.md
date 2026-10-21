@@ -18,7 +18,12 @@ against per-station headcount + throughput capacity.
 
 ## Layout
 
-- `app.py` — the entire UI (~7,600 lines): all tabs, sidebar, catalog editors.
+- `app.py` — the entire UI (~10,000 lines): all tabs, sidebar, catalog editors.
+  The top-level tab strip is a `st.segmented_control` keyed on
+  `st.session_state["_active_tab"]`, and `main()` builds only the selected
+  tab's body (`st.tabs` can't tell the server which tab is in front, so it
+  used to build all eight on every click). Keep it that way: a new tab is a
+  `TAB_*` constant plus one `elif` in `main()`.
 - `core/` — `data_loader.py`, `labor_calculator.py`, `constants.py`,
   `catalog_storage.py`, plus scenario/schedule/facility/process-flow storage,
   `usage_tracker.py`, `data_validator.py`.

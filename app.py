@@ -376,6 +376,46 @@ def _load_usage_log_cached(mtime: float):
 
 
 # ---------------------------------------------------------------------------
+# Targeted cache clears.
+#
+# Every save used to call st.cache_data.clear(), which also threw away the
+# content-keyed analysis caches (schedule expansion, capacity table, weekly
+# heatmap) that the save never touched — so the first click after any save
+# paid for a full recompute. Now that the loaders above key on file mtime, a
+# file this container rewrites (scenarios, saved schedules, process flow, the
+# usage log) invalidates on its own; the clears below are cheap insurance for
+# that path. The catalog CSVs are the exception: a save goes to GitHub only
+# and the local copy stays as deployed, so no clear can show the new rows
+# before the redeploy — but the 30-second SHA lookup must be dropped so the
+# stale-data banner sees the new commit at once instead of up to 30 s later.
+# ---------------------------------------------------------------------------
+def _catalog_loader_for(file_path: str):
+    """The cached loader that reads ``file_path`` (any ``data/...`` spelling)."""
+    return {
+        "machine_clean.csv": _load_machine_df_cached,
+        "acc_clean.csv": _load_acc_df_cached,
+        "item_master.csv": _load_item_master_df_cached,
+        "item_packages.csv": _load_item_packages_df_cached,
+    }.get(Path(file_path).name)
+
+
+def _clear_catalog_cache(*file_paths: str) -> None:
+    """Drop the cached frame(s) for the catalog CSV(s) just pushed to GitHub
+    and the cached SHA lookup behind the stale-data banner."""
+    for fp in file_paths:
+        loader = _catalog_loader_for(fp)
+        if loader is not None:
+            try:
+                loader.clear()
+            except Exception:
+                pass
+    try:
+        _latest_sha_cached.clear()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Cached analysis pipeline.
 #
 # Streamlit reruns the WHOLE script on every widget interaction, and the heavy
@@ -2516,7 +2556,7 @@ def _scenario_save(location: str, name: str, seed_key: str, existing_names: list
         commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
         commit_url = (response or {}).get("commit", {}).get("html_url", "")
         try:
-            st.cache_data.clear()
+            _load_scenarios_dict.clear()
         except Exception:
             pass
         _track_and_flush("scenario_save", facility=location, name=name)
@@ -2639,7 +2679,7 @@ def _scenario_delete(location: str, name: str) -> None:
         with st.spinner(f"Deleting scenario '{name}'..."):
             delete_scenario_on_github(location, name, token)
         try:
-            st.cache_data.clear()
+            _load_scenarios_dict.clear()
         except Exception:
             pass
         _track_and_flush("scenario_delete", facility=location, name=name)
@@ -2799,7 +2839,7 @@ def _uploaded_schedule_save(
         commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
         commit_url = (response or {}).get("commit", {}).get("html_url", "")
         try:
-            st.cache_data.clear()
+            _load_uploaded_schedules_dict.clear()
         except Exception:
             pass
         _track_and_flush(
@@ -2852,7 +2892,7 @@ def _uploaded_schedule_delete(location: str, name: str) -> None:
         with st.spinner(f"Deleting saved schedule '{name}'..."):
             delete_uploaded_schedule_on_github(location, name, token)
         try:
-            st.cache_data.clear()
+            _load_uploaded_schedules_dict.clear()
         except Exception:
             pass
         _track_and_flush("schedule_delete", facility=location, name=name)
@@ -3732,7 +3772,7 @@ def _render_admin_dashboard() -> None:
         if st.button("🔄 Refresh", key="_admin_refresh_empty"):
             _refresh_usage_from_github(_usage_token())
             try:
-                st.cache_data.clear()
+                _load_usage_log_cached.clear()
             except Exception:
                 pass
             st.rerun()
@@ -3871,10 +3911,286 @@ def _render_admin_dashboard() -> None:
     if cc2.button("🔄 Refresh", key="_admin_refresh", use_container_width=True):
         _refresh_usage_from_github(_usage_token())
         try:
-            st.cache_data.clear()
+            _load_usage_log_cached.clear()
         except Exception:
             pass
         st.rerun()
+
+
+@st.fragment
+def _render_help_glossary() -> None:
+    """Body of the sidebar "ℹ️ Help & glossary" expander.
+
+    A collapsed st.expander still executes its body on every rerun, so the
+    five help tabs (a few hundred lines of markdown) used to be built on
+    every click. They now render only once the planner flips the toggle, and
+    the toggle lives in a fragment so flipping it reruns just this expander,
+    not main().
+    """
+    if not st.toggle(
+        "Show help", key="_show_help",
+        help="Loads the quick start, model notes, catalog guide, saving tips and admin notes.",
+    ):
+        st.caption("Flip the switch to load the help pages.")
+        return
+    with st.container():
+        # Five focused tabs replace the previous 85-line wall of markdown.
+        # Tabs render cleanly inside expanders and give planners a way to
+        # jump straight to the section they need.
+        _help_quick, _help_model, _help_catalog, _help_save, _help_admin = st.tabs([
+            "🚀 Quick start",
+            "📐 How the model works",
+            "🏷 Catalog & stations",
+            "💾 Saving your work",
+            "🔧 For admins",
+        ])
+
+        with _help_quick:
+            st.markdown(
+                """
+**Status colors**
+🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility
+
+**Sidebar in three steps**
+1. **Pick a facility** — Henderson, Spartanburg, or Cypress. Each has its own crew config.
+2. **Tell us what to build** — upload your monthly schedule CSV, or paste / type a few SKUs for a quick what-if.
+3. **Tune** — working days, shift length, safety, efficiency, and per-station headcount under the expanders below.
+
+**Pasting a list from Excel**
+Pick **✏️ Paste or type SKUs** in step 2, open **📋 Paste a list from Excel**, and paste the cells you copied. You don't need the full schedule layout — just SKUs, with an accessory column and a quantity column if you have them:
+
+| What you paste | How it's read |
+|---|---|
+| One SKU per line | Qty 1 each |
+| `SKU` + number | FG SKU + quantity |
+| `SKU` + `SKU` | FG SKU + accessory |
+| `SKU` + `SKU` + number | FG SKU + accessory + quantity |
+
+Column order doesn't matter — pasted SKUs are matched against the catalogs to work out which column is which, and a header row (`FG SKU ID`, `Qty`, …) is understood if you copied one. Extra columns like LOCATION or CUSTOMER are ignored. The preview shows what was read before anything is committed; then **➕ Add** appends to what's already there and **🔁 Replace** starts over. Either way the rows land in the editable table below, so you can still fix a SKU or add a few more by hand.
+
+The table's **`#`** column numbers the rows for you. A row takes the next number as soon as it has an FG SKU or an Accessory SKU in it — however it got there (pasted through the panel, pasted straight into the table, or typed by hand). Blank rows stay unnumbered and don't consume a number, and deleting a row closes the gap. It's display-only: it isn't part of the schedule and isn't saved with a scenario.
+
+**Where to find common features**
+
+| Want to… | Go to |
+|---|---|
+| Paste a SKU list out of Excel | Sidebar → **✏️ Paste or type SKUs** → **📋 Paste a list from Excel** |
+| Save your manual build plan | Sidebar → **📂 Save / load scenarios** (when in "Paste or type SKUs" mode) |
+| Save your uploaded schedule | Sidebar → **📂 Save / load uploaded schedules** (when in "Upload schedule file" mode) |
+| Get a blank upload template | Sidebar → **📥 Download blank template** (under the file uploader) |
+| Edit labor times | **📁 Data & Setup** tab → Machine / Accessory catalog |
+| Add a missing SKU | **📁 Data & Setup** → catalog → **➕ Add a new SKU** |
+| See what gets built each week / day | **📆 Calendar** tab |
+| Reshape the schedule (move SKUs between dates) | **📁 Data & Setup** → **🗓 Sequence** |
+| See bottlenecks + suggested fixes | **🏠 Overview** → 🎯 Recommended actions, or **🔧 Recommendations** tab |
+
+**Tip:** hover any column header in a table to see its specific tooltip.
+                """
+            )
+
+        with _help_model:
+            st.markdown(
+                """
+### Time units
+- **Person-minutes (p-min)** — labor *effort*. 1 person working 1 min = 1 p-min. 2 people working 30 min = 60 p-min. Independent of how many people you assign.
+- **Calendar minutes (cal-min)** — wall-clock *elapsed* time. With 1 person doing 60 p-min, cycle time is 60 cal-min. With 2 people working in parallel, the cycle is 30 cal-min.
+- **Cycle time (processing time)** — calendar minutes a unit physically occupies a station = `p-min ÷ Crew per unit`. Strictly this is the per-unit *processing time*; with several parallel cells the true line cycle (gap between finished units) is shorter (≈ processing ÷ cells).
+- **Lead time (days)** — calendar days for **one** person to do the whole unit's labor alone = `Total p-min ÷ (shift × efficiency)`. A single-operator *labor-content* yardstick for comparing units — **not** a delivery lead time (it excludes queue, move, and wait between stations).
+
+### People & stations
+- **Headcount (HC) / People** — number of people assigned to a station for the whole shift.
+- **Stations/Cells (Conc)** — how many identical bays/cells run in parallel at one station (units worked on at the same time) — *not* the number of process steps.
+- **Crew per unit** — number of people working together on one unit at a station. Drives processing (cycle) time.
+- **Required HC** — people needed to meet the schedule given safety + efficiency, rounded up per station. The facility total sums those per-station round-ups (assumes dedicated crews; shared floaters could need fewer).
+
+### Safety & efficiency
+- **Safety factor** — planning buffer applied to capacity. `0.85` = leave 15% slack.
+- **Efficiency factor** — share of the paid shift that becomes productive work after breaks, setup, rework, and line-balance loss; behaves like OEE availability × performance. `1.00` = no loss; `0.625` ≈ 5 productive hours in an 8-hr shift (a planning convention, not an external standard). Typical assembly plans run `0.80–0.90`.
+- **Effective capacity** = `HC × shift × days × efficiency × safety` person-minutes per period.
+
+### Labor vs Throughput utilization
+
+Each station has **two** utilization checks. The overall flag (🟢/🟡/🟠/🔴) is the worst of the two — because either one can be the actual bottleneck, and the fix is different.
+
+*These are **load ratios** — demand ÷ the **buffered** capacity (already cut by efficiency × safety). So 100% means "demand exactly fills the buffered allowance," not "the resource is 100% clock-busy," and the value can exceed 100%.*
+
+**Labor utilization** — *"Do I have enough people?"*
+- `labor_util = labor_demand ÷ labor_capacity`
+- `labor_capacity = HC × shift × days × efficiency × safety` (person-minutes available).
+- **Fix when red:** hire more, run overtime, extend the work week. Tuned by the **HC** sidebar control.
+
+**Throughput utilization** — *"Do I have enough stations/fixtures/bays?"*
+- `thru_util = units_per_day ÷ thru_capacity`
+- `thru_capacity = Stations/Cells × (shift ÷ avg_cycle) × efficiency × safety` (units/day the station can physically push through).
+- **Fix when red:** add more cells, shorten cycle time, extend working days. **Adding people only helps if the step is labor-paced** (more crew lowers `p-min ÷ Crew`, so each cell clears units faster); for **machine/process-paced** steps like Battery, crew size can't change the per-cell time — you need more cells. Tuned by the **Stations/Cells** sidebar control.
+
+**The classic example: Battery Assembly.** Each battery cell takes ~170 calendar minutes to build, regardless of how many people you put around it. If you have 4 cells but the plan needs 50 batteries/day, throughput maxes out at ~11/day — hiring more people does nothing. You need more cells.
+
+The Overview's **🎯 Recommended actions** splits these two cases so you don't waste a hiring request on a throughput bottleneck.
+
+**Takt time** (the demand beat = available productive time ÷ units needed/day) isn't shown directly — the **Need/day vs. cell capacity** check is the equivalent: a station keeps up when its processing time per unit ÷ parallel cells stays at or below takt.
+
+| If this is red | What's pinching | Where to look |
+|---|---|---|
+| Labor util | Headcount | Sidebar → **People (HC)** |
+| Throughput util | Physical capacity | Sidebar → **Stations/Cells** |
+| Both | Both — fix the cells first, hire to fill them | Both controls |
+                """
+            )
+
+        with _help_catalog:
+            st.markdown(
+                """
+### Unit classes
+- **STD** — Standard trailer (full assembly with marry)
+- **HS** — Head Skid only (no trailer)
+- **HT** — Head + Trailer (mount only, no marry)
+
+### SKU naming
+- **FG SKU** — finished-good SKU from `machine_clean.csv` (e.g. `BOSS25-006`).
+- **Accessory SKU** — accessory kit from `acc_clean.csv` (e.g. `BOSS25-A016`).
+- **Bat** — battery count for that FG SKU. PDS/SDG = 0.
+- **Last Modified** — date the row was last edited through the app (blank = never).
+
+### Placeholders
+- **`XXX` in a SKU** — estimation placeholder. Labor is an estimate, not measured. E.g. `BOSS220PM XXX`, `BOSS25 AXXX`. The Data Quality view flags any `XXX` row automatically.
+- Older `-A999` style placeholders may still appear in a few legacy catalog rows; they've been superseded by `XXX` for any new entries.
+
+### Stations (key → display name)
+- `Warehouse` = Warehouse (Pick) — pull parts
+- `Wire` = Wire Assembly — pre-wiring sub-assembly
+- `Battery` = Battery Assembly — battery cells (BOSS only)
+- `PMAcc` = PM Acc (Headunit) — PM/Head-unit accessories
+- `GenAcc` = Gen Accessories — generator-side accessories
+- `ComAcc` = Com Accessories — compressor-side accessories
+- `Trailer` = Trailer Assembly — trailer sub-assembly (STD/HT only)
+- `AccKIT` = Accessories KIT — kit prep
+- `ETO` = Engineering To Order — special engineering (BOSS220/BOSS400)
+- `Final` = Final Assembly — mount + marry (where used)
+- `PDI / QC / Ship` — Pre-Delivery Inspection · Quality Check · Shipping
+                """
+            )
+
+        with _help_save:
+            st.markdown(
+                """
+Answers the question planners ask once they care: *"will the team see what I just did?"*
+
+### Save / load scenarios (manual mode)
+When you're in **✏️ Paste or type SKUs** mode, the sidebar's **📂 Save / load scenarios** expander lets you name and save your manual SKU list. Saved per facility to `data/scenarios.json` on GitHub — anyone planning for the same facility can reload them.
+
+### Save / load uploaded schedules (upload mode)
+When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / load uploaded schedules** expander lets you save your uploaded CSV under a name. Saved per facility to `data/uploaded_schedules.json` on GitHub. The **raw CSV** is preserved, so any columns the app currently ignores still survive the round-trip for future use.
+
+### Catalog edits
+Every **💾 Save** button in **📁 Data & Setup** (Machine catalog, Accessory catalog, Items, Item packages, Reconciliation, Process flow) pushes to GitHub. Other users see the new values after the next ~1 minute Streamlit Cloud redeploy.
+
+### Confirmation pill
+After every successful schedule load, the sidebar shows a green ✅ confirmation like *"Loaded 193 rows from HENDERSON · month May-26"* so you can verify the loader understood your file correctly.
+
+### Unknown-SKU warning banner
+If your schedule references FG or accessory SKUs that aren't in the catalogs, a yellow banner appears at the **top of the page** listing them. Add the missing SKUs via **📁 Data & Setup → 🏭 Machine catalog → ➕ Add a new machine SKU** (or the equivalent for accessories) and they'll be picked up on the next reload.
+
+### Privacy
+Uploaded CSVs stay **only in your browser** unless you explicitly click **💾 Save schedule**. They aren't written to disk on the server or pushed to GitHub by default.
+                """
+            )
+
+        with _help_admin:
+            st.markdown(
+                """
+### GitHub token
+The 💾 Save buttons require a **GitHub Personal Access Token** with the `repo` scope. Add it to **Streamlit Cloud → Settings → Secrets**:
+
+```toml
+github_token = "ghp_xxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+If a planner sees *"GitHub token not configured"* when saving, the token is missing or expired. Read-only browsing works without it.
+
+### Wild-CSV upload behavior
+The loader auto-matches column names so the team can upload their normal Excel export without reformatting:
+- **Required columns** (any of these naming patterns will match): `LOCATION` / `Facility` / `Site`; `FG SKU ID` / `FG SKU` / `Finished Good`; `FG ACCRY SKU ID` / `Accessory SKU` / `Acc SKU`; `BUILD QTY` / `Qty` / `Quantity`; `PRODUCTION MONTH` / `Prod Month` / `Production Date` / `Month`.
+- **Optional:** `CUSTOMER NAME` / `Customer` / `Cust`; `PRODUCTION DAY` / `Prod Day` / `Build Date` / `Date`.
+- **Extra columns are ignored** — pandas reads them all but the loader only uses the ones it recognises.
+- **UTF-8 BOM is stripped** automatically — Excel's default save format on Windows just works.
+- **Date formats:** `Mon-YY` (e.g. `May-26`), `YY-Mon` carryover (e.g. `26-Apr`), US slash (`5/8/2026`), and ISO (`2026-05-08`) all parse correctly.
+- **Zero-qty rows** are dropped automatically.
+
+If a required column truly isn't there, the planner sees a yellow banner naming the missing column and listing the aliases the loader tried.
+
+### Auto-spread (level-loading dates)
+When a planner uploads a schedule without `PRODUCTION DAY` values (or with some rows dated and others blank), the tool **auto-assigns dates** to the blanks so the weekly heatmap has a meaningful baseline.
+
+The algorithm — Longest Processing Time (LPT) — sorts the blank rows by labor weight (sum of per-station p-min × `BUILD QTY`), largest first, then drops each onto the working day with the currently lightest running total. Result: weekly labor is roughly even, no week takes a disproportionate share of heavy units. Existing dated rows are preserved and their load seeds the day totals so the level-loading respects them.
+
+A yellow banner at the top of the page tells the planner when auto-spread fired and how many rows it touched. The pill in the sidebar gets a `📅 Auto-leveled …` suffix.
+
+**To override:** add real dates to your CSV's `PRODUCTION DAY` column and re-upload. Auto-spread won't touch rows that already have a date.
+
+### Sequencer (Suggest + manual reshape)
+The Sequencer turns the static schedule into something you can *re-balance* interactively.
+
+**💡 Suggest a level-loaded schedule** — top-of-page expander. Click *Generate proposal* and the tool runs a constraint-aware LPT scheduler:
+- Per-row labor weight = sum of per-station p-min × `BUILD QTY` (same path the rest of the analysis uses).
+- For each blank row, sorted largest-first, walk candidate days from lightest to heaviest. For each day, check that placing the unit wouldn't tip *any* station above 100% weekly utilization (computed against your current HC, shift, safety, efficiency). Take the first day that passes.
+- If no day satisfies the constraints, the row lands on the least-loaded day anyway and is flagged in an *overload diagnosis* showing which stations would be tipped over.
+
+The proposal appears as a side-by-side preview heatmap on the Overview (Current vs Proposed). **✅ Accept** swaps the analysis to use the proposed sequence; **🚫 Discard** drops it.
+
+**🗓 Sequence sub-section** (📁 Data & Setup) — manual reshape:
+- *Editable table* — every row's `PRODUCTION DAY` is a date-picker cell. Edit, then click **🔄 Apply edits** to push the changes into the analysis.
+- *🔀 Bulk move* form — shift N units of a chosen FG SKU from one week to another in one click. Useful when you want to flatten a single problem week without per-row edits.
+- *📥 Download* — reshaped schedule as CSV. Re-upload to save, or push it through the **📂 Save uploaded schedule** panel.
+
+Reshape edits live in your browser session only — they don't persist to GitHub unless you save through the existing 📂 Save panel.
+
+### 📆 Calendar (week & day rollups)
+Top-level tab (sits between **🏠 Overview** and **📊 Capacity**). Bucketed view of *what gets built each week and each day* — one expandable card per week of the month showing total units, total labor (p-min), and the top FG SKUs. Open a card to see:
+- **Daily breakdown** — one row per working day in that week: units built, labor p-min.
+- **Per-station labor mix** — horizontal bar chart showing how the week's labor splits across Warehouse / Wire / Battery / … / Ship. Quick read on where the week's heat goes.
+- **SKU detail** — collapsed table with every unit in the week (day, FG, accessory, qty, customer, location).
+
+Use Calendar when you want the *what's being built when* answer; use Sequence when you want to *reshape* the dates.
+
+### 🧹 Customer suffix cleanup
+Lives under **📁 Data & Setup → 🧹 Customer suffix cleanup**. ERP exports often label SKUs with a customer-decal tail like `BOSS70-001HRC`, `BOSS25-006ES`, `BOSS70-012UR`. The labor analysis already collapses these to their canonical base internally, but the suffixed text shows in the Sequence editor, the Calendar's "Top SKUs" line, and the downloaded / saved CSV.
+
+This sub-section detects every suffixed FG / Accessory SKU in your loaded schedule, lists them with their base (after stripping) and a ✓ / ✗ for whether the base exists in the catalog, and gives you two actions:
+- **🔄 Strip suffixes in loaded schedule** — rewrites your active schedule's SKU columns to the canonical base form. The analysis numbers don't change; only the *displayed* SKUs do. Catalogs are not touched.
+- **📥 Download cleaned schedule** — exports the cleaned CSV without committing the change.
+
+Rows whose base isn't in the catalog (orphan suffixes) are left untouched so analysis doesn't silently lose them.
+
+### Blank template
+The **📥 Download blank template** button under the file uploader hands the planner an empty CSV with the 5 required headers + 2 example rows. Quickest way to ensure formatting is right.
+
+### Usage analytics
+At the very bottom of the sidebar, the **⚙️ Admin** expander shows session counts, top actions, save events, and recent activity pulled from `data/usage_log.jsonl`. Anonymous UUID per browser — no PII collected.
+
+### Redeploy timing
+Every catalog / scenario / schedule / flow save triggers a Streamlit Cloud rebuild (~1 minute). Other users see the new values when their browsers reload after that. The 🔄 Refresh banner at the top of the relevant tab tells you when there's an updated copy to pull in mid-session.
+                """
+            )
+
+
+@st.fragment
+def _render_admin_panel() -> None:
+    """Body of the sidebar "⚙️ Admin" expander.
+
+    Same reasoning as _render_help_glossary: the usage-log load and the
+    plotly chart ran on every rerun even with the expander collapsed. The
+    dashboard's own 🔄 Refresh button calls st.rerun(), which from inside a
+    fragment still reruns the whole app (scope defaults to "app") — fine,
+    it's a rare, deliberate click.
+    """
+    if not st.toggle(
+        "Load analytics", key="_show_admin",
+        help="Reads data/usage_log.jsonl and draws the usage KPIs.",
+    ):
+        st.caption("Flip the switch to load session counts and recent activity.")
+        return
+    _render_admin_dashboard()
 
 
 def render_sidebar() -> dict:
@@ -4555,251 +4871,14 @@ def render_sidebar() -> dict:
     # Help / Glossary — always last
     # ----------------------------------------------------------------
     with st.sidebar.expander("ℹ️ Help & glossary", expanded=False):
-        # Five focused tabs replace the previous 85-line wall of markdown.
-        # Tabs render cleanly inside expanders and give planners a way to
-        # jump straight to the section they need.
-        _help_quick, _help_model, _help_catalog, _help_save, _help_admin = st.tabs([
-            "🚀 Quick start",
-            "📐 How the model works",
-            "🏷 Catalog & stations",
-            "💾 Saving your work",
-            "🔧 For admins",
-        ])
-
-        with _help_quick:
-            st.markdown(
-                """
-**Status colors**
-🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility
-
-**Sidebar in three steps**
-1. **Pick a facility** — Henderson, Spartanburg, or Cypress. Each has its own crew config.
-2. **Tell us what to build** — upload your monthly schedule CSV, or paste / type a few SKUs for a quick what-if.
-3. **Tune** — working days, shift length, safety, efficiency, and per-station headcount under the expanders below.
-
-**Pasting a list from Excel**
-Pick **✏️ Paste or type SKUs** in step 2, open **📋 Paste a list from Excel**, and paste the cells you copied. You don't need the full schedule layout — just SKUs, with an accessory column and a quantity column if you have them:
-
-| What you paste | How it's read |
-|---|---|
-| One SKU per line | Qty 1 each |
-| `SKU` + number | FG SKU + quantity |
-| `SKU` + `SKU` | FG SKU + accessory |
-| `SKU` + `SKU` + number | FG SKU + accessory + quantity |
-
-Column order doesn't matter — pasted SKUs are matched against the catalogs to work out which column is which, and a header row (`FG SKU ID`, `Qty`, …) is understood if you copied one. Extra columns like LOCATION or CUSTOMER are ignored. The preview shows what was read before anything is committed; then **➕ Add** appends to what's already there and **🔁 Replace** starts over. Either way the rows land in the editable table below, so you can still fix a SKU or add a few more by hand.
-
-The table's **`#`** column numbers the rows for you. A row takes the next number as soon as it has an FG SKU or an Accessory SKU in it — however it got there (pasted through the panel, pasted straight into the table, or typed by hand). Blank rows stay unnumbered and don't consume a number, and deleting a row closes the gap. It's display-only: it isn't part of the schedule and isn't saved with a scenario.
-
-**Where to find common features**
-
-| Want to… | Go to |
-|---|---|
-| Paste a SKU list out of Excel | Sidebar → **✏️ Paste or type SKUs** → **📋 Paste a list from Excel** |
-| Save your manual build plan | Sidebar → **📂 Save / load scenarios** (when in "Paste or type SKUs" mode) |
-| Save your uploaded schedule | Sidebar → **📂 Save / load uploaded schedules** (when in "Upload schedule file" mode) |
-| Get a blank upload template | Sidebar → **📥 Download blank template** (under the file uploader) |
-| Edit labor times | **📁 Data & Setup** tab → Machine / Accessory catalog |
-| Add a missing SKU | **📁 Data & Setup** → catalog → **➕ Add a new SKU** |
-| See what gets built each week / day | **📆 Calendar** tab |
-| Reshape the schedule (move SKUs between dates) | **📁 Data & Setup** → **🗓 Sequence** |
-| See bottlenecks + suggested fixes | **🏠 Overview** → 🎯 Recommended actions, or **🔧 Recommendations** tab |
-
-**Tip:** hover any column header in a table to see its specific tooltip.
-                """
-            )
-
-        with _help_model:
-            st.markdown(
-                """
-### Time units
-- **Person-minutes (p-min)** — labor *effort*. 1 person working 1 min = 1 p-min. 2 people working 30 min = 60 p-min. Independent of how many people you assign.
-- **Calendar minutes (cal-min)** — wall-clock *elapsed* time. With 1 person doing 60 p-min, cycle time is 60 cal-min. With 2 people working in parallel, the cycle is 30 cal-min.
-- **Cycle time (processing time)** — calendar minutes a unit physically occupies a station = `p-min ÷ Crew per unit`. Strictly this is the per-unit *processing time*; with several parallel cells the true line cycle (gap between finished units) is shorter (≈ processing ÷ cells).
-- **Lead time (days)** — calendar days for **one** person to do the whole unit's labor alone = `Total p-min ÷ (shift × efficiency)`. A single-operator *labor-content* yardstick for comparing units — **not** a delivery lead time (it excludes queue, move, and wait between stations).
-
-### People & stations
-- **Headcount (HC) / People** — number of people assigned to a station for the whole shift.
-- **Stations/Cells (Conc)** — how many identical bays/cells run in parallel at one station (units worked on at the same time) — *not* the number of process steps.
-- **Crew per unit** — number of people working together on one unit at a station. Drives processing (cycle) time.
-- **Required HC** — people needed to meet the schedule given safety + efficiency, rounded up per station. The facility total sums those per-station round-ups (assumes dedicated crews; shared floaters could need fewer).
-
-### Safety & efficiency
-- **Safety factor** — planning buffer applied to capacity. `0.85` = leave 15% slack.
-- **Efficiency factor** — share of the paid shift that becomes productive work after breaks, setup, rework, and line-balance loss; behaves like OEE availability × performance. `1.00` = no loss; `0.625` ≈ 5 productive hours in an 8-hr shift (a planning convention, not an external standard). Typical assembly plans run `0.80–0.90`.
-- **Effective capacity** = `HC × shift × days × efficiency × safety` person-minutes per period.
-
-### Labor vs Throughput utilization
-
-Each station has **two** utilization checks. The overall flag (🟢/🟡/🟠/🔴) is the worst of the two — because either one can be the actual bottleneck, and the fix is different.
-
-*These are **load ratios** — demand ÷ the **buffered** capacity (already cut by efficiency × safety). So 100% means "demand exactly fills the buffered allowance," not "the resource is 100% clock-busy," and the value can exceed 100%.*
-
-**Labor utilization** — *"Do I have enough people?"*
-- `labor_util = labor_demand ÷ labor_capacity`
-- `labor_capacity = HC × shift × days × efficiency × safety` (person-minutes available).
-- **Fix when red:** hire more, run overtime, extend the work week. Tuned by the **HC** sidebar control.
-
-**Throughput utilization** — *"Do I have enough stations/fixtures/bays?"*
-- `thru_util = units_per_day ÷ thru_capacity`
-- `thru_capacity = Stations/Cells × (shift ÷ avg_cycle) × efficiency × safety` (units/day the station can physically push through).
-- **Fix when red:** add more cells, shorten cycle time, extend working days. **Adding people only helps if the step is labor-paced** (more crew lowers `p-min ÷ Crew`, so each cell clears units faster); for **machine/process-paced** steps like Battery, crew size can't change the per-cell time — you need more cells. Tuned by the **Stations/Cells** sidebar control.
-
-**The classic example: Battery Assembly.** Each battery cell takes ~170 calendar minutes to build, regardless of how many people you put around it. If you have 4 cells but the plan needs 50 batteries/day, throughput maxes out at ~11/day — hiring more people does nothing. You need more cells.
-
-The Overview's **🎯 Recommended actions** splits these two cases so you don't waste a hiring request on a throughput bottleneck.
-
-**Takt time** (the demand beat = available productive time ÷ units needed/day) isn't shown directly — the **Need/day vs. cell capacity** check is the equivalent: a station keeps up when its processing time per unit ÷ parallel cells stays at or below takt.
-
-| If this is red | What's pinching | Where to look |
-|---|---|---|
-| Labor util | Headcount | Sidebar → **People (HC)** |
-| Throughput util | Physical capacity | Sidebar → **Stations/Cells** |
-| Both | Both — fix the cells first, hire to fill them | Both controls |
-                """
-            )
-
-        with _help_catalog:
-            st.markdown(
-                """
-### Unit classes
-- **STD** — Standard trailer (full assembly with marry)
-- **HS** — Head Skid only (no trailer)
-- **HT** — Head + Trailer (mount only, no marry)
-
-### SKU naming
-- **FG SKU** — finished-good SKU from `machine_clean.csv` (e.g. `BOSS25-006`).
-- **Accessory SKU** — accessory kit from `acc_clean.csv` (e.g. `BOSS25-A016`).
-- **Bat** — battery count for that FG SKU. PDS/SDG = 0.
-- **Last Modified** — date the row was last edited through the app (blank = never).
-
-### Placeholders
-- **`XXX` in a SKU** — estimation placeholder. Labor is an estimate, not measured. E.g. `BOSS220PM XXX`, `BOSS25 AXXX`. The Data Quality view flags any `XXX` row automatically.
-- Older `-A999` style placeholders may still appear in a few legacy catalog rows; they've been superseded by `XXX` for any new entries.
-
-### Stations (key → display name)
-- `Warehouse` = Warehouse (Pick) — pull parts
-- `Wire` = Wire Assembly — pre-wiring sub-assembly
-- `Battery` = Battery Assembly — battery cells (BOSS only)
-- `PMAcc` = PM Acc (Headunit) — PM/Head-unit accessories
-- `GenAcc` = Gen Accessories — generator-side accessories
-- `ComAcc` = Com Accessories — compressor-side accessories
-- `Trailer` = Trailer Assembly — trailer sub-assembly (STD/HT only)
-- `AccKIT` = Accessories KIT — kit prep
-- `ETO` = Engineering To Order — special engineering (BOSS220/BOSS400)
-- `Final` = Final Assembly — mount + marry (where used)
-- `PDI / QC / Ship` — Pre-Delivery Inspection · Quality Check · Shipping
-                """
-            )
-
-        with _help_save:
-            st.markdown(
-                """
-Answers the question planners ask once they care: *"will the team see what I just did?"*
-
-### Save / load scenarios (manual mode)
-When you're in **✏️ Paste or type SKUs** mode, the sidebar's **📂 Save / load scenarios** expander lets you name and save your manual SKU list. Saved per facility to `data/scenarios.json` on GitHub — anyone planning for the same facility can reload them.
-
-### Save / load uploaded schedules (upload mode)
-When you're in **📤 Upload schedule file** mode, the sidebar's **📂 Save / load uploaded schedules** expander lets you save your uploaded CSV under a name. Saved per facility to `data/uploaded_schedules.json` on GitHub. The **raw CSV** is preserved, so any columns the app currently ignores still survive the round-trip for future use.
-
-### Catalog edits
-Every **💾 Save** button in **📁 Data & Setup** (Machine catalog, Accessory catalog, Items, Item packages, Reconciliation, Process flow) pushes to GitHub. Other users see the new values after the next ~1 minute Streamlit Cloud redeploy.
-
-### Confirmation pill
-After every successful schedule load, the sidebar shows a green ✅ confirmation like *"Loaded 193 rows from HENDERSON · month May-26"* so you can verify the loader understood your file correctly.
-
-### Unknown-SKU warning banner
-If your schedule references FG or accessory SKUs that aren't in the catalogs, a yellow banner appears at the **top of the page** listing them. Add the missing SKUs via **📁 Data & Setup → 🏭 Machine catalog → ➕ Add a new machine SKU** (or the equivalent for accessories) and they'll be picked up on the next reload.
-
-### Privacy
-Uploaded CSVs stay **only in your browser** unless you explicitly click **💾 Save schedule**. They aren't written to disk on the server or pushed to GitHub by default.
-                """
-            )
-
-        with _help_admin:
-            st.markdown(
-                """
-### GitHub token
-The 💾 Save buttons require a **GitHub Personal Access Token** with the `repo` scope. Add it to **Streamlit Cloud → Settings → Secrets**:
-
-```toml
-github_token = "ghp_xxxxxxxxxxxxxxxxxxxxxxxx"
-```
-
-If a planner sees *"GitHub token not configured"* when saving, the token is missing or expired. Read-only browsing works without it.
-
-### Wild-CSV upload behavior
-The loader auto-matches column names so the team can upload their normal Excel export without reformatting:
-- **Required columns** (any of these naming patterns will match): `LOCATION` / `Facility` / `Site`; `FG SKU ID` / `FG SKU` / `Finished Good`; `FG ACCRY SKU ID` / `Accessory SKU` / `Acc SKU`; `BUILD QTY` / `Qty` / `Quantity`; `PRODUCTION MONTH` / `Prod Month` / `Production Date` / `Month`.
-- **Optional:** `CUSTOMER NAME` / `Customer` / `Cust`; `PRODUCTION DAY` / `Prod Day` / `Build Date` / `Date`.
-- **Extra columns are ignored** — pandas reads them all but the loader only uses the ones it recognises.
-- **UTF-8 BOM is stripped** automatically — Excel's default save format on Windows just works.
-- **Date formats:** `Mon-YY` (e.g. `May-26`), `YY-Mon` carryover (e.g. `26-Apr`), US slash (`5/8/2026`), and ISO (`2026-05-08`) all parse correctly.
-- **Zero-qty rows** are dropped automatically.
-
-If a required column truly isn't there, the planner sees a yellow banner naming the missing column and listing the aliases the loader tried.
-
-### Auto-spread (level-loading dates)
-When a planner uploads a schedule without `PRODUCTION DAY` values (or with some rows dated and others blank), the tool **auto-assigns dates** to the blanks so the weekly heatmap has a meaningful baseline.
-
-The algorithm — Longest Processing Time (LPT) — sorts the blank rows by labor weight (sum of per-station p-min × `BUILD QTY`), largest first, then drops each onto the working day with the currently lightest running total. Result: weekly labor is roughly even, no week takes a disproportionate share of heavy units. Existing dated rows are preserved and their load seeds the day totals so the level-loading respects them.
-
-A yellow banner at the top of the page tells the planner when auto-spread fired and how many rows it touched. The pill in the sidebar gets a `📅 Auto-leveled …` suffix.
-
-**To override:** add real dates to your CSV's `PRODUCTION DAY` column and re-upload. Auto-spread won't touch rows that already have a date.
-
-### Sequencer (Suggest + manual reshape)
-The Sequencer turns the static schedule into something you can *re-balance* interactively.
-
-**💡 Suggest a level-loaded schedule** — top-of-page expander. Click *Generate proposal* and the tool runs a constraint-aware LPT scheduler:
-- Per-row labor weight = sum of per-station p-min × `BUILD QTY` (same path the rest of the analysis uses).
-- For each blank row, sorted largest-first, walk candidate days from lightest to heaviest. For each day, check that placing the unit wouldn't tip *any* station above 100% weekly utilization (computed against your current HC, shift, safety, efficiency). Take the first day that passes.
-- If no day satisfies the constraints, the row lands on the least-loaded day anyway and is flagged in an *overload diagnosis* showing which stations would be tipped over.
-
-The proposal appears as a side-by-side preview heatmap on the Overview (Current vs Proposed). **✅ Accept** swaps the analysis to use the proposed sequence; **🚫 Discard** drops it.
-
-**🗓 Sequence sub-section** (📁 Data & Setup) — manual reshape:
-- *Editable table* — every row's `PRODUCTION DAY` is a date-picker cell. Edit, then click **🔄 Apply edits** to push the changes into the analysis.
-- *🔀 Bulk move* form — shift N units of a chosen FG SKU from one week to another in one click. Useful when you want to flatten a single problem week without per-row edits.
-- *📥 Download* — reshaped schedule as CSV. Re-upload to save, or push it through the **📂 Save uploaded schedule** panel.
-
-Reshape edits live in your browser session only — they don't persist to GitHub unless you save through the existing 📂 Save panel.
-
-### 📆 Calendar (week & day rollups)
-Top-level tab (sits between **🏠 Overview** and **📊 Capacity**). Bucketed view of *what gets built each week and each day* — one expandable card per week of the month showing total units, total labor (p-min), and the top FG SKUs. Open a card to see:
-- **Daily breakdown** — one row per working day in that week: units built, labor p-min.
-- **Per-station labor mix** — horizontal bar chart showing how the week's labor splits across Warehouse / Wire / Battery / … / Ship. Quick read on where the week's heat goes.
-- **SKU detail** — collapsed table with every unit in the week (day, FG, accessory, qty, customer, location).
-
-Use Calendar when you want the *what's being built when* answer; use Sequence when you want to *reshape* the dates.
-
-### 🧹 Customer suffix cleanup
-Lives under **📁 Data & Setup → 🧹 Customer suffix cleanup**. ERP exports often label SKUs with a customer-decal tail like `BOSS70-001HRC`, `BOSS25-006ES`, `BOSS70-012UR`. The labor analysis already collapses these to their canonical base internally, but the suffixed text shows in the Sequence editor, the Calendar's "Top SKUs" line, and the downloaded / saved CSV.
-
-This sub-section detects every suffixed FG / Accessory SKU in your loaded schedule, lists them with their base (after stripping) and a ✓ / ✗ for whether the base exists in the catalog, and gives you two actions:
-- **🔄 Strip suffixes in loaded schedule** — rewrites your active schedule's SKU columns to the canonical base form. The analysis numbers don't change; only the *displayed* SKUs do. Catalogs are not touched.
-- **📥 Download cleaned schedule** — exports the cleaned CSV without committing the change.
-
-Rows whose base isn't in the catalog (orphan suffixes) are left untouched so analysis doesn't silently lose them.
-
-### Blank template
-The **📥 Download blank template** button under the file uploader hands the planner an empty CSV with the 5 required headers + 2 example rows. Quickest way to ensure formatting is right.
-
-### Usage analytics
-At the very bottom of the sidebar, the **⚙️ Admin** expander shows session counts, top actions, save events, and recent activity pulled from `data/usage_log.jsonl`. Anonymous UUID per browser — no PII collected.
-
-### Redeploy timing
-Every catalog / scenario / schedule / flow save triggers a Streamlit Cloud rebuild (~1 minute). Other users see the new values when their browsers reload after that. The 🔄 Refresh banner at the top of the relevant tab tells you when there's an updated copy to pull in mid-session.
-                """
-            )
+        _render_help_glossary()
 
     # ----------------------------------------------------------------
     # Hidden admin analytics — discoverable but visually unobtrusive.
     # Sits at the very bottom of the sidebar; regular users won't notice.
     # ----------------------------------------------------------------
     with st.sidebar.expander("⚙️ Admin", expanded=False):
-        _render_admin_dashboard()
+        _render_admin_panel()
 
     return {
         "uploaded": uploaded,
@@ -4905,6 +4984,46 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
     if not out:
         return None
     return pd.DataFrame(out).fillna(0)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def _compute_weekly_utilization_cached(schedule_df_full, machine_df, acc_df,
+                                       crew_config, shift_minutes, safety_factor,
+                                       efficiency_factor, new_hire_pct,
+                                       new_hire_productivity, absenteeism,
+                                       overtime):
+    """Content-keyed cache around _compute_weekly_utilization.
+
+    The helper expands the schedule once per week and prices each slice, so
+    even with every inner call a cache hit it hashed the three frames five
+    times over (~0.3 s per rerun, for an Overview chart whose inputs rarely
+    change). Hashing them once here turns a rerun into a single lookup. The
+    scalars are passed positionally (same shape as _build_capacity_table_cached)
+    so every distinct sidebar setting is its own key."""
+    return _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, {
+        "crew_config": crew_config,
+        "shift": shift_minutes,
+        "safety": safety_factor,
+        "efficiency": efficiency_factor,
+        "new_hire_pct": new_hire_pct,
+        "new_hire_productivity": new_hire_productivity,
+        "absenteeism": absenteeism,
+        "overtime": overtime,
+    })
+
+
+def _weekly_utilization_for(schedule_df_full, machine_df, acc_df, inputs):
+    """Unpack the sidebar dict into hashable scalars and go through the cache.
+    (``inputs`` itself carries the upload handle and the manual-entry frame,
+    which must not be part of the key.)"""
+    return _compute_weekly_utilization_cached(
+        schedule_df_full, machine_df, acc_df,
+        inputs["crew_config"], inputs["shift"], inputs["safety"], inputs["efficiency"],
+        inputs.get("new_hire_pct", 0.0),
+        inputs.get("new_hire_productivity", 1.0),
+        inputs.get("absenteeism", 0.0),
+        inputs.get("overtime", 0.0),
+    )
 
 
 def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
@@ -5232,7 +5351,13 @@ def _style_exec_table(row):
     return ["" for _ in row]
 
 
+@st.fragment
 def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
+    # @st.fragment: the side-by-side pickers (one selectbox per facility) and
+    # the saved-scenario picker only change what THIS tab shows, so a change
+    # reruns the tab, not main(). The 📥 Re-apply button writes the sidebar's
+    # reapply key and calls st.rerun() — which from inside a fragment still
+    # reruns the whole app (scope defaults to "app"), exactly what it needs.
     """Monthly executive labor summary (mirrors the legacy planning sheet),
     with per-facility save/reload and a side-by-side multi-facility table."""
     location = inputs.get("location", "Henderson")
@@ -5810,7 +5935,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
                 inputs.get("location", "Henderson"),
             )
             _acc = _load_acc_df(_csv_mtime("acc_clean.csv"))
-            proposed_util = _compute_weekly_utilization(
+            proposed_util = _weekly_utilization_for(
                 _proposed, _machine, _acc, inputs,
             )
         except Exception:
@@ -6702,6 +6827,13 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     )
 
 
+def _remember_data_setup_view() -> None:
+    """Mirror the Data & Setup view picker into a non-widget key so the choice
+    survives a trip to another tab (a widget that isn't rendered loses its
+    widget-backed state at the end of the run)."""
+    st.session_state["_data_setup_view_last"] = st.session_state.get("_data_setup_view")
+
+
 def tab_data_setup(
     machine_df, acc_df, schedule_df, item_master_df, item_packages_df,
     units=None, schedule_df_full=None, location: str = "Henderson",
@@ -6725,21 +6857,30 @@ def tab_data_setup(
         "edit the catalogs, manage items / packages, reconcile, or run data quality checks."
     )
 
+    _views = [
+        "📋 Schedule",
+        "🗓 Sequence",
+        "🧹 Customer suffix cleanup",
+        "🏭 Machine catalog",
+        "🔌 Accessory catalog",
+        "🔩 Items",
+        "📦 Item packages",
+        "🔬 Reconciliation & Apply",
+        "🔍 Data Quality",
+    ]
+    # Only the tab in front is built (see _render_tab_strip), so this radio is
+    # torn down whenever the planner visits another tab and would snap back to
+    # "Schedule". The on_change mirror keeps the last choice in a plain
+    # session key and feeds it back as the initial index.
+    _remembered = st.session_state.get("_data_setup_view_last")
     sub = st.radio(
         "View",
-        [
-            "📋 Schedule",
-            "🗓 Sequence",
-            "🧹 Customer suffix cleanup",
-            "🏭 Machine catalog",
-            "🔌 Accessory catalog",
-            "🔩 Items",
-            "📦 Item packages",
-            "🔬 Reconciliation & Apply",
-            "🔍 Data Quality",
-        ],
+        _views,
+        index=_views.index(_remembered) if _remembered in _views else 0,
         horizontal=True,
         label_visibility="collapsed",
+        key="_data_setup_view",
+        on_change=_remember_data_setup_view,
     )
 
     # Used-in-schedule maps (shared by some sub-views)
@@ -7318,7 +7459,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
         commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
         commit_url = (response or {}).get("commit", {}).get("html_url", "")
         try:
-            st.cache_data.clear()
+            _clear_catalog_cache(file_path)
         except Exception:
             pass
         _track_and_flush("catalog_add_placeholder", file=file_path, sku=new_sku)
@@ -7472,7 +7613,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
         commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
         commit_url = (response or {}).get("commit", {}).get("html_url", "")
         try:
-            st.cache_data.clear()
+            _clear_catalog_cache(file_path)
         except Exception:
             pass
         _track_and_flush("catalog_add_sku", file=file_path, label=label, sku=new_sku)
@@ -7517,7 +7658,7 @@ def _render_stale_data_banner(file_path: str) -> None:
         with c2:
             if st.button("🔄 Refresh", key=f"stale_refresh_{file_path}"):
                 try:
-                    st.cache_data.clear()
+                    _clear_catalog_cache(file_path)
                 except Exception:
                     pass
                 st.session_state[state_key] = latest
@@ -7995,7 +8136,7 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
     commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
     commit_url = (response or {}).get("commit", {}).get("html_url", "")
     try:
-        st.cache_data.clear()
+        _clear_catalog_cache(file_path)
     except Exception:
         pass
 
@@ -8333,7 +8474,12 @@ def _compute_station_depths(nodes, edges):
     return depth
 
 
+@st.fragment
 def tab_process_flow(units_df, machine_df, acc_df, inputs):
+    # @st.fragment: the FG / Accessory selectboxes only change which unit's
+    # route is drawn, so picking another SKU reruns this tab alone. The editor
+    # panel's Save / Reset call a plain st.rerun() (app scope) after writing
+    # process_flow.json, so the reloaded edges reach every reader.
     """Visual flow chart of a single unit's path through the workstations.
 
     The graph is built from edges in `data/process_flow.json`, which the user
@@ -8649,7 +8795,7 @@ def _flow_save(edited_df) -> None:
         commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
         commit_url = (response or {}).get("commit", {}).get("html_url", "")
         try:
-            st.cache_data.clear()
+            _load_process_flow_edges.clear()
         except Exception:
             pass
         _track_and_flush("flow_save")
@@ -8687,7 +8833,7 @@ def _flow_reset(current_count: int | None = None, default_count: int | None = No
         with st.spinner("Resetting process flow to default..."):
             reset_process_flow_to_default(token)
         try:
-            st.cache_data.clear()
+            _load_process_flow_edges.clear()
         except Exception:
             pass
         _track_and_flush("flow_reset")
@@ -9232,7 +9378,7 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
     commit_sha = (response or {}).get("commit", {}).get("sha", "")[:7]
     commit_url = (response or {}).get("commit", {}).get("html_url", "")
     try:
-        st.cache_data.clear()
+        _clear_catalog_cache(file_path)
     except Exception:
         pass
     _track_and_flush("recon_apply", file=file_path, cells=n_diffs)
@@ -9459,6 +9605,49 @@ def _save_simple_csv(df, file_path, label):
 # =============================================================
 # Main
 # =============================================================
+# ---------------------------------------------------------------------------
+# Top-level tab strip.
+#
+# Labels are module constants so the dispatcher in main(), the tests and the
+# AppTest timing harness all spell them the same way.
+# ---------------------------------------------------------------------------
+TAB_OVERVIEW = "🏠 Overview"
+TAB_EXEC_SUMMARY = "📋 Executive Summary"
+TAB_CALENDAR = "📆 Calendar"
+TAB_CAPACITY = "📊 Capacity"
+TAB_RECOMMENDATIONS = "🔧 Recommendations"
+TAB_BUILD_TIME = "⏱ Build Time"
+TAB_PROCESS_FLOW = "🔀 Process Flow"
+TAB_DATA_SETUP = "📁 Data & Setup"
+TAB_LABELS = (
+    TAB_OVERVIEW, TAB_EXEC_SUMMARY, TAB_CALENDAR, TAB_CAPACITY,
+    TAB_RECOMMENDATIONS, TAB_BUILD_TIME, TAB_PROCESS_FLOW, TAB_DATA_SETUP,
+)
+ACTIVE_TAB_KEY = "_active_tab"
+
+
+def _render_tab_strip() -> str:
+    """Draw the top-level tab strip and return the label of the tab in front.
+
+    ``st.tabs`` never tells the server which tab is showing, so main() used to
+    build every panel on every rerun. A ``required`` single-select segmented
+    control keeps the choice in ``st.session_state[ACTIVE_TAB_KEY]`` and lets
+    main() build just that body. The key is seeded before the widget exists
+    (the supported way to pick the initial tab; passing ``default`` as well
+    would make Streamlit warn that the value was set twice). Widgets inside a
+    tab that isn't showing are not instantiated, so their state resets when
+    the planner comes back — the Data & Setup view picker remembers itself via
+    ``_remember_data_setup_view`` for exactly that reason.
+    """
+    if st.session_state.get(ACTIVE_TAB_KEY) not in TAB_LABELS:
+        st.session_state[ACTIVE_TAB_KEY] = TAB_OVERVIEW
+    choice = st.segmented_control(
+        "Section", TAB_LABELS, selection_mode="single", required=True,
+        key=ACTIVE_TAB_KEY, label_visibility="collapsed", width="stretch",
+    )
+    return choice if choice in TAB_LABELS else TAB_OVERVIEW
+
+
 def main():
     st.title("🏭 Labor Capacity Planner")
     st.caption(
@@ -9687,7 +9876,7 @@ def main():
     # the time-window slice) so the planner can spot weekly hotspots even
     # while looking at a sub-window. Returns None when there's no
     # PRODUCTION DAY data, in which case the Overview just skips the chart.
-    weekly_util = _compute_weekly_utilization(
+    weekly_util = _weekly_utilization_for(
         schedule_df_full, machine_df, acc_df, inputs,
     )
 
@@ -9908,7 +10097,7 @@ def main():
                 st.error(f"❌ Import failed: {e}")
             if not _failed:
                 try:
-                    st.cache_data.clear()
+                    _clear_catalog_cache("data/machine_clean.csv", "data/acc_clean.csv")
                 except Exception:
                     pass
                 _track_and_flush(
@@ -9936,16 +10125,12 @@ def main():
     # Top-level tabs, ordered from executive summary → planner detail → admin.
     # Batteries content folded into Capacity. Update Labor + Data Quality + Source Data
     # consolidated into the single 📁 Data & Setup tab.
-    tabs = st.tabs([
-        "🏠 Overview",
-        "📋 Executive Summary",
-        "📆 Calendar",
-        "📊 Capacity",
-        "🔧 Recommendations",
-        "⏱ Build Time",
-        "🔀 Process Flow",
-        "📁 Data & Setup",
-    ])
+    #
+    # Drawn as a segmented control, not st.tabs: st.tabs can't tell the server
+    # which panel is in front, so every rerun built all eight bodies and each
+    # click cost their sum. The control keeps its selection in session state
+    # and main() builds only the body the planner is looking at.
+    active_tab = _render_tab_strip()
 
     # Helper — show an "empty state" message inside analysis tabs when there's no schedule
     def _empty_state(tab_name: str):
@@ -9956,16 +10141,16 @@ def main():
             "**📁 Data & Setup** tab without a schedule."
         )
 
-    with tabs[0]:
+    if active_tab == TAB_OVERVIEW:
         if units.empty:
             _empty_state("Overview")
         else:
             tab_overview(units, capacity, batt_type, inputs, schedule_month, weekly_util=weekly_util)
-    with tabs[1]:
+    elif active_tab == TAB_EXEC_SUMMARY:
         # Executive Summary — renders its own info banner when there's no
         # live schedule, and still shows saved cross-facility scenarios.
         tab_exec_summary(units, capacity, inputs, total_units=len(units))
-    with tabs[2]:
+    elif active_tab == TAB_CALENDAR:
         # Calendar — week & day rollups. ALWAYS use the full (unfiltered)
         # schedule here so the planner sees the entire month's per-week
         # rollup regardless of the sidebar Time-window setting. The helper
@@ -9976,25 +10161,25 @@ def main():
             plan_month=inputs.get("plan_month"),
             plan_month_label=inputs.get("plan_month_label", ""),
         )
-    with tabs[3]:
+    elif active_tab == TAB_CAPACITY:
         if units.empty:
             _empty_state("Capacity")
         else:
             tab_capacity_vs_demand(capacity, inputs, batt_sku=batt_sku, batt_type=batt_type, total_units=len(units), units=units)
-    with tabs[4]:
+    elif active_tab == TAB_RECOMMENDATIONS:
         if units.empty:
             _empty_state("Recommendations")
         else:
             tab_mitigation(capacity, batt_sku, units, inputs)
-    with tabs[5]:
+    elif active_tab == TAB_BUILD_TIME:
         if units.empty:
             _empty_state("Build Time")
         else:
             tab_cycle_time(units, inputs, machine_df, acc_df)
-    with tabs[6]:
+    elif active_tab == TAB_PROCESS_FLOW:
         # Process Flow can show the editable flow even without a schedule
         tab_process_flow(units, machine_df, acc_df, inputs)
-    with tabs[7]:
+    elif active_tab == TAB_DATA_SETUP:
         tab_data_setup(
             machine_df=machine_df, acc_df=acc_df, schedule_df=schedule_df,
             item_master_df=item_master_df, item_packages_df=item_packages_df,

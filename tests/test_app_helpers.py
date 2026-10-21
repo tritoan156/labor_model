@@ -220,3 +220,38 @@ class TestWeeklyUtilizationPartialWeeks:
             correct = float(cap5.loc[station, "labor_util_safe"])
             assert correct > 0
             assert abs(fixed - correct) < 1e-6
+
+
+class TestGithubToken:
+    """Every save handler reads the PAT through `_github_token()`. Without a
+    secrets file `st.secrets.get` raises instead of returning its default, so
+    the helper has to swallow that and hand back None — the "GitHub token not
+    configured" path — rather than take the catalog editors down."""
+
+    class _NoSecretsFile:
+        def get(self, *_a, **_k):
+            raise RuntimeError("No secrets found")
+
+    def test_missing_secrets_file_means_no_token(self, monkeypatch):
+        monkeypatch.setattr(app.st, "secrets", self._NoSecretsFile())
+        assert app._github_token() is None
+        assert app._usage_token() is None
+
+    def test_token_comes_from_secrets(self, monkeypatch):
+        monkeypatch.setattr(app.st, "secrets", {"github_token": "github_pat_x"})
+        assert app._github_token() == "github_pat_x"
+
+    def test_blank_token_counts_as_missing(self, monkeypatch):
+        monkeypatch.setattr(app.st, "secrets", {"github_token": ""})
+        assert app._github_token() is None
+
+    def test_stale_banner_survives_a_missing_secrets_file(self, monkeypatch):
+        monkeypatch.setattr(app.st, "secrets", self._NoSecretsFile())
+        app._render_stale_data_banner("data/machine_clean.csv")  # must not raise
+
+    def test_no_call_site_reads_the_token_directly(self):
+        # Only the helper itself may touch st.secrets for the token; a new
+        # save handler that copies the old one-liner reintroduces the crash.
+        from pathlib import Path
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        assert source.count('st.secrets.get("github_token"') == 1

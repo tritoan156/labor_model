@@ -175,6 +175,22 @@ class TestOnlyActiveTabRenders:
             _no_errors(at)
             assert _strip(at).value == label
 
+    @pytest.mark.parametrize("view, subheader", [
+        ("📤 Export & Excel link", "📤 Export & Excel link"),
+        ("📥 Import from Excel", "📥 Import from Excel"),
+    ])
+    def test_excel_views_are_reachable_inside_data_setup(self, at, view, subheader):
+        # The Excel views landed (PRs #10 and #12) while the tab strip was being
+        # built; they must stay reachable through the remembered view picker.
+        _strip(at).set_value(app.TAB_DATA_SETUP)
+        _run(at)
+        picker = next(r for r in at.main.radio if r.label == "View")
+        assert view in list(picker.options)
+        picker.set_value(view)
+        _run(at)
+        _no_errors(at)
+        assert subheader in _headers(at)
+
 
 class TestSidebarGates:
     def test_help_pages_render_only_when_toggled(self):

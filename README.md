@@ -14,6 +14,7 @@ Built so planners and execs can answer:
 - **Multi-location** — per-facility headcount, station setup, scenarios, and saved schedules.
 - **Three ways to enter a plan** — upload your normal schedule as CSV **or as the Excel workbook itself** (any column naming works, header can sit below a title row or on a later tab), **paste a SKU list straight out of a spreadsheet**, or type a handful of SKUs for a quick what-if.
 - **Export & Excel link** — download the whole database (catalogs, crew, settings, scenarios, saved schedules, process flow) or the current analysis as one `.xlsx`, or point Excel at the live CSV catalogs with Power Query so a sheet refreshes itself.
+- **Import from Excel** — edit labor minutes (or add a SKU row) on the exported catalog sheet, upload it back, preview exactly which cells change, and save through the same SHA-locked merge the in-app editors use.
 - **Eight interactive tabs:**
   - 🏠 **Overview** — executive dashboard with status banner, KPIs, recommended actions
   - 📋 **Executive Summary** — monthly executive labor roll-up (new-hire ramp, absenteeism, overtime) saved per facility as reloadable snapshots, with a side-by-side multi-facility table
@@ -139,9 +140,20 @@ That holds however the row arrived — pasted through the panel, pasted straight
 
 1. **Database workbook** — one `.xlsx` with a sheet per data file: the four CSV catalogs exactly as stored, plus `facility_crew.json`, `facility_settings.json`, `scenarios.json`, `exec_scenarios.json`, `uploaded_schedules.json` and `process_flow.json` flattened into plain tables (long key/value format for the executive scenarios, one row per SKU line for scenarios, one row per facility × station for crew). A **README** sheet lists what each sheet is and which file it came from. Tick *Include every row of every saved schedule* to add the big sheet (every saved schedule's rows, union of their columns) — it's slower to build and several MB.
 2. **Analysis workbook** — this session's schedule as loaded, one row per unit with its per-station labor, the capacity-by-station table behind the Capacity tab, and the crew + sidebar settings that produced them.
-3. **Live link** — the CSV catalogs are plain files on GitHub, so Excel can read them with **Data → Get Data → From Web** and **Refresh All** on demand. The panel lists each file's raw URL (`https://raw.githubusercontent.com/<repo>/<branch>/data/<file>`) and a ready-to-paste Power Query script. Read-only: edits still go through the in-app editors so the SHA-locked merge keeps protecting concurrent saves. The JSON files aren't one-click links (they need transform steps); use the database workbook for those. If the repo is ever made private the URLs need a token.
+3. **Live link** — the CSV catalogs are plain files on GitHub, so Excel can read them with **Data → Get Data → From Web** and **Refresh All** on demand. The panel lists each file's raw URL (`https://raw.githubusercontent.com/<repo>/<branch>/data/<file>`) and a ready-to-paste Power Query script. Read-only: edits go back through the in-app editors or **📥 Import from Excel** (below), so the SHA-locked merge keeps protecting concurrent saves. The JSON files aren't one-click links (they need transform steps); use the database workbook for those. If the repo is ever made private the URLs need a token.
 
 The workbook is built from the data files as deployed, so a save shows up in the export after the usual ~1 minute Streamlit Cloud rebuild.
+
+### Import from Excel (write-back)
+
+**📁 Data & Setup → 📥 Import from Excel** closes the loop. Export the database workbook, edit the **Machine catalog** / **Accessory catalog** sheet in Excel — change labor minutes, a description, a routing cell, or add a SKU row at the bottom — save, and upload the file (`.xlsx` / `.xlsm`; the whole export or a single sheet both work, and a sheet that isn't named is recognised by its header row).
+
+- **Preview first.** The view lists every cell that would change (SKU, column, old → new), every new SKU with the values it will carry, and every catalog SKU that is *not* on the sheet. Nothing is written until you click **💾 Save**.
+- **Never deletes.** SKUs missing from the sheet are left exactly as they are; columns missing from the sheet are left alone on every row; extra columns are ignored. A blank cell never changes anything — type `0` to zero a value.
+- **Validated like the editor.** Labor cells must be numbers ≥ 0, routing cells (`Final Station HND` …) must be one of the options the in-app dropdown offers (case is corrected for you), a SKU may not start with `=`, `+`, `-` or `@`, and a SKU may appear only once. Any of those blocks the save until the file is fixed.
+- **Same SHA-locked merge.** Save fetches the latest CSV from GitHub, applies only the previewed cells, appends the new rows (a SKU someone added in the meantime is skipped, not overwritten), and pushes with the file's SHA as an optimistic lock, retrying once on a conflict. A colleague's edit of another cell survives. The commit reads like `Update machine catalog via Excel import (3 cells, 1 new SKU(s))`, and `Last Modified` is stamped on every changed row.
+
+The reader and the diff live in `core/excel_io.py` (`read_catalog_workbook`, `diff_catalog_sheet`); `tests/test_excel_catalog_import.py` covers header validation, numeric coercion, the untouched-row rules and the save.
 
 ---
 

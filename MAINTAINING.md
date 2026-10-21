@@ -53,7 +53,8 @@ How to rotate:
 
 ## When you change a CSV column
 
-`app.py:_LOADER_SCHEMA_VERSION` (currently `9`) is a cache-buster. The four
+`app.py:_LOADER_SCHEMA_VERSION` (see `app.py` for the current value — it is
+deliberately not repeated here) is a cache-buster. The four
 CSV loaders in `app.py` (`_load_machine_df`, `_load_acc_df`,
 `_load_item_master_df`, `_load_item_packages_df`) are cached on the file's
 mtime **plus** this constant, so bumping it invalidates the cached frames the
@@ -77,6 +78,39 @@ parameter's default value is never part of the key either. The loaders used to
 be declared `(_mtime, _schema_ver=_LOADER_SCHEMA_VERSION)` and were therefore
 cached on nothing — that's why older notes said a bump "may require a Cloud
 reboot". `tests/test_cache_keys.py` fails the suite if that comes back.
+
+---
+
+## The stale-module sentinel at the top of `app.py`
+
+Streamlit Cloud sometimes reruns a freshly deployed `app.py` inside a warm
+process that still holds the PREVIOUS deploy's `core.*` modules in
+`sys.modules`. A name you just added to a core module then "doesn't exist"
+(`ImportError` on `from core.X import new_name`), or a new keyword argument
+dies with a bare `TypeError: unexpected keyword argument`. The block at the
+very top of `app.py` — it must stay above every `from core.X import …` —
+guards against that in three parts:
+
+1. A bare `import core.X` for every core module `app.py` pulls names from
+   (a bare import of a stale module is safe; it binds the cached object).
+2. `_stale = (...)` — one sentinel per module that probes for the *newest*
+   name or parameter: `not hasattr(core.X, "name")`, or
+   `"param" not in _inspect.signature(core.X.func).parameters`.
+3. A reload list in dependency order (`core.constants` first, since every
+   other module imports from it) that `importlib.reload`s each module when
+   `_stale` is true.
+
+Rules when you touch `core/`:
+- **Add a module** → add it to the bare-import list *and* the reload list.
+- **Remove a module** → remove it from both. `tests/test_core_modules_used.py`
+  fails if a module under `core/` is imported by neither `app.py` nor another
+  core module, and if the reload list names a module that no longer exists.
+- **Add a name or keyword parameter that `app.py` uses** → point that
+  module's sentinel at the NEW name, *replacing* the module's previous
+  sentinel rather than piling another one on (the newest addition implies
+  every older one). Miss this and a warm process pairs the new `app.py` with
+  the old module. `tests/test_module_reload_sentinel.py` checks that the
+  `load_schedule` sentinel tracks that function's newest parameter.
 
 ---
 
@@ -256,16 +290,16 @@ Sidebar → very bottom → **⚙️ Admin** expander. Shows:
 - Last 20 events (table)
 
 The events come from `data/usage_log.jsonl`, which is **local to the
-Streamlit Cloud container** (not committed to the repo as of the
-pre-publish hygiene round). Implications:
-- Events accumulate within one deploy (~1 min container lifetime
-  between redeploys).
-- Every redeploy resets the log to the empty seed.
+Streamlit Cloud container**: git-ignored, not tracked in the repo, and
+created by the running app on its first flush. Implications:
+- Events accumulate within one deploy.
+- Every redeploy starts from no log at all (the admin view shows "No usage
+  events yet" until the first event is written).
 - Anonymous UUIDs only — no PII, no IPs.
 
-If you need persistent cross-redeploy analytics, point
-`core/usage_tracker.flush_to_github` at a **private** repo or a private
-gist. Currently it's local-only by design.
+If you ever need persistent cross-redeploy analytics, add a push step to
+`core/usage_tracker.flush_buffer` that targets a **private** repo or gist —
+never this public repo. Currently it's local-only by design.
 
 ---
 
@@ -331,11 +365,14 @@ update the matching expected value in `tests/` in the same commit.
 | `core/data_loader.py` | CSV/JSON readers, fuzzy schedule column matching |
 | `core/labor_calculator.py` | Per-unit labor, capacity table, status flags |
 | `core/constants.py` | Stations, defaults, utilization thresholds, families, `FACILITY_CODE` (per-facility routing suffixes) |
-| `core/catalog_storage.py` | GitHub PUT/GET (shared by all storage modules) |
+| `core/catalog_storage.py` | GitHub PUT/GET + branch resolution (shared by all storage modules) |
 | `core/scenario_storage.py` | Save/load manual scenarios |
+| `core/exec_scenario_storage.py` | Save/load Executive Summary snapshots |
 | `core/uploaded_schedule_storage.py` | Save/load uploaded CSVs |
 | `core/facility_storage.py` | Per-facility crew config |
+| `core/facility_settings_storage.py` | Per-facility planning assumptions (new-hire / absenteeism / overtime / efficiency / safety / excluded stations) |
 | `core/process_flow_storage.py` | Manufacturing flow graph |
+| `core/excel_io.py` | Excel schedule upload → CSV, database / analysis workbook export, Power Query links |
 | `core/usage_tracker.py` | Anonymous telemetry (local-only) |
 | `core/data_validator.py` | Catalog quality checks |
 | `data/*.csv`, `data/*.json` | All persisted data |

@@ -72,6 +72,7 @@ _stale = (
     or "efficiency" not in getattr(
         core.facility_settings_storage, "DEFAULT_SETTINGS", {})
     or "Undercarriage" not in getattr(core.constants, "STATION_KEYS", [])
+    or not hasattr(core.usage_tracker, "flush_buffer")
     or not hasattr(core.excel_io, "read_catalog_workbook")
 )
 if _stale:
@@ -106,7 +107,7 @@ from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
     build_placeholder_map,
     load_item_master, load_item_packages,
-    resolve_item_time, unique_abbrs,
+    resolve_item_time,
     ScheduleColumnError,
 )
 from core.excel_io import (
@@ -128,11 +129,11 @@ from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
     compute_unit_labor, unit_labor_split,
-    classify_fg_category, buildable_by_line,
-    executive_summary, adjusted_efficiency, labor_availability_factor,
+    buildable_by_line,
+    executive_summary, adjusted_efficiency,
 )
 from core.constants import (
-    LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES, DEFAULT_WORKING_DAYS,
+    LOCATIONS, STATION_DEFAULTS, DEFAULT_SHIFT_MINUTES,
     DEFAULT_SAFETY_FACTOR, DEFAULT_EFFICIENCY_FACTOR,
     STATION_KEYS, SUPPORT_ROLES, CUSTOMER_SUFFIXES,
     now_local, today_local_str, week_of_month, week_of_month_series,
@@ -155,18 +156,15 @@ from core.catalog_storage import (
 )
 from core.scenario_storage import (
     load_all_scenarios,
-    list_scenarios,
     get_scenario,
     save_scenario_to_github,
     delete_scenario_on_github,
 )
 from core.uploaded_schedule_storage import (
     load_all_uploaded_schedules,
-    list_uploaded_schedules,
     get_uploaded_schedule,
     save_uploaded_schedule_to_github,
     delete_uploaded_schedule_on_github,
-    SCHEDULES_PATH as _UPLOADED_SCHEDULES_PATH,
 )
 from core.process_flow_storage import (
     load_process_flow,
@@ -178,9 +176,8 @@ from core.process_flow_storage import (
 from core.data_validator import validate_all
 from core.usage_tracker import (
     track_event,
-    flush_to_github as _flush_usage_to_github,
+    flush_buffer as _flush_usage_buffer,
     load_usage_log,
-    refresh_from_github as _refresh_usage_from_github,
     get_buffer_snapshot as _usage_buffer_snapshot,
     USAGE_LOG_PATH as _USAGE_LOG_PATH,
 )
@@ -473,22 +470,17 @@ def _github_token() -> "str | None":
     return token or None
 
 
-def _usage_token() -> "str | None":
-    """Token lookup mirroring the catalog save handlers."""
-    return _github_token()
-
-
 def _track_and_flush(event_type: str, *, force_flush: bool = True, **payload) -> None:
-    """Convenience wrapper: queue an event, then flush if we have a token.
+    """Convenience wrapper: queue an event, then append the buffer to the
+    on-container usage log (``data/usage_log.jsonl``; never pushed to GitHub).
 
     Most callers use ``force_flush=True`` because they're already in a save
-    context (cheap to piggyback the GitHub round-trip). The session_start
-    and schedule_load callers also force-flush so the very first event in a
-    session always lands in the log within seconds.
+    context. The session_start and schedule_load callers also force-flush so
+    the very first event in a session always lands in the log within seconds.
     """
     try:
         track_event(event_type, **payload)
-        _flush_usage_to_github(_usage_token(), force=force_flush)
+        _flush_usage_buffer(force=force_flush)
     except Exception:
         # Tracking must never break the user's actual save flow.
         pass
@@ -1748,7 +1740,7 @@ def _render_sequencer_controls(
                         "Or hit ✅ Accept to live with the overload."
                     )
             c1, c2, _ = st.columns([1, 1, 4])
-            if c1.button("✅ Accept proposal", use_container_width=True, type="primary"):
+            if c1.button("✅ Accept proposal", width="stretch", type="primary"):
                 # Replace the working schedule and clear proposal state.
                 accepted = st.session_state.pop("_proposed_schedule")
                 st.session_state.pop("_proposed_schedule_overloads", None)
@@ -1766,7 +1758,7 @@ def _render_sequencer_controls(
                 )
                 st.success("Proposal accepted — refreshing the analysis…")
                 st.rerun()
-            if c2.button("🚫 Discard", use_container_width=True):
+            if c2.button("🚫 Discard", width="stretch"):
                 st.session_state.pop("_proposed_schedule", None)
                 st.session_state.pop("_proposed_schedule_overloads", None)
                 _track_and_flush("sequencer_discard", facility=inputs.get("location"))
@@ -1786,7 +1778,7 @@ def _render_sequencer_controls(
         )
         if st.button(
             "💡 Generate proposal",
-            use_container_width=True,
+            width="stretch",
             help=(
                 "Runs the constraint-aware LPT scheduler on your current "
                 "schedule. Result shows on the Overview tab as a side-by-side "
@@ -1936,7 +1928,7 @@ def _render_sequencer_view(
 
     edited = st.data_editor(
         work,
-        use_container_width=True,
+        width="stretch",
         num_rows="fixed",
         column_config=col_cfg,
         key=_seq_key,
@@ -1947,7 +1939,7 @@ def _render_sequencer_view(
     ca, cb = st.columns([1, 1])
     if ca.button(
         "🔄 Apply edits",
-        use_container_width=True,
+        width="stretch",
         type="primary",
         help=(
             "Writes the edited rows back into the session schedule so all "
@@ -1965,7 +1957,7 @@ def _render_sequencer_view(
             download_df.to_csv(index=False).encode("utf-8"),
             file_name=f"schedule_reshaped_{today_local_str()}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
             help=(
                 "Saves the current view (including unsaved edits) as a CSV "
                 "you can re-upload later."
@@ -1984,7 +1976,7 @@ def _render_sequencer_view(
             schedule_df.to_csv(index=False).encode("utf-8"),
             file_name=f"schedule_{today_local_str()}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
     st.markdown("---")
@@ -2160,7 +2152,7 @@ def _render_bulk_move_form(
         )
         submitted = st.form_submit_button(
             "🔀 Move",
-            use_container_width=True,
+            width="stretch",
         )
 
     if not submitted:
@@ -2384,7 +2376,7 @@ def _render_suffix_cleanup_view(
 
     # Show the detection panel.
     st.markdown("**Detected customer-suffixed SKUs:**")
-    st.dataframe(findings, use_container_width=True, hide_index=True)
+    st.dataframe(findings, width="stretch", hide_index=True)
 
     in_catalog_count = int((findings["In catalog"] == "✓").sum())
     orphan_count = int((findings["In catalog"] == "✗").sum())
@@ -2405,7 +2397,7 @@ def _render_suffix_cleanup_view(
     if c1.button(
         f"🔄 Strip suffixes in loaded schedule "
         f"({n_fg_preview} FG, {n_acc_preview} accessory cells)",
-        use_container_width=True, type="primary",
+        width="stretch", type="primary",
         disabled=(in_catalog_count == 0),
         help=(
             "Rewrites FG / Accessory SKU columns in your active schedule "
@@ -2437,7 +2429,7 @@ def _render_suffix_cleanup_view(
             cleaned.to_csv(index=False).encode("utf-8"),
             file_name=f"schedule_cleaned_{today_local_str()}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
             on_click=lambda: _track_and_flush(
                 "suffix_cleanup_download",
                 n_fg=n_fg_preview, n_acc=n_acc_preview,
@@ -2459,7 +2451,7 @@ def _render_suffix_cleanup_view(
             cleaned.to_csv(index=False).encode("utf-8"),
             file_name=f"schedule_cleaned_{today_local_str()}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -2652,7 +2644,7 @@ def _render_calendar_view(
                 "labor": "Labor (p-min)",
             })
             st.dataframe(
-                daily, use_container_width=True, hide_index=True,
+                daily, width="stretch", hide_index=True,
             )
 
             # ---- Per-station labor mix ----
@@ -2690,7 +2682,7 @@ def _render_calendar_view(
                 # Unique key per week so Streamlit doesn't collide IDs
                 # when multiple weeks' bars have similar shapes.
                 st.plotly_chart(
-                    _bar, use_container_width=True,
+                    _bar, width="stretch",
                     key=f"calendar_week_{week_num}_mix",
                 )
 
@@ -2714,7 +2706,7 @@ def _render_calendar_view(
                 }
                 st.dataframe(
                     detail[cols].rename(columns=renames),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -2760,7 +2752,7 @@ def _render_scenarios_panel(location: str, seed_key: str, rev_key: str) -> None:
         if st.button(
             "💾 Save scenario",
             key=f"scenario_save_btn_{location}",
-            use_container_width=True,
+            width="stretch",
         ):
             _scenario_save(location, save_name, seed_key, scenario_names)
 
@@ -2788,11 +2780,11 @@ def _render_scenarios_panel(location: str, seed_key: str, rev_key: str) -> None:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("📥 Load", key=f"scenario_load_btn_{location}",
-                         use_container_width=True):
+                         width="stretch"):
                 _scenario_load(location, chosen, seed_key, rev_key)
         with c2:
             if st.button("🗑 Delete", key=f"scenario_del_btn_{location}",
-                         use_container_width=True):
+                         width="stretch"):
                 _scenario_delete(location, chosen)
 
 
@@ -3054,7 +3046,7 @@ def _render_uploaded_schedules_panel(location: str, uploaded_file) -> None:
         if st.button(
             "💾 Save schedule",
             key=f"uploaded_schedule_save_btn_{location}",
-            use_container_width=True,
+            width="stretch",
             disabled=not _can_save,
             help=(
                 "Nothing to save yet — upload a schedule file, or load one "
@@ -3088,12 +3080,12 @@ def _render_uploaded_schedules_panel(location: str, uploaded_file) -> None:
             c1, c2 = st.columns([3, 1])
             if c1.button(
                 "📥 Load", key=f"uploaded_schedule_load_btn_{location}",
-                use_container_width=True,
+                width="stretch",
             ):
                 _uploaded_schedule_load(location, chosen)
             if c2.button(
                 "🗑 Delete", key=f"uploaded_schedule_del_btn_{location}",
-                use_container_width=True,
+                width="stretch",
             ):
                 _uploaded_schedule_delete(location, chosen)
 
@@ -3796,7 +3788,7 @@ def _render_paste_import(machine_df, acc_df, location: str,
         # Short headers so all three columns fit the sidebar's width
         st.dataframe(
             parsed.head(25).rename(columns={"FG SKU": "FG", "Accessory SKU": "Acc"}),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         if len(parsed) > 25:
@@ -3832,13 +3824,13 @@ def _render_paste_import(machine_df, acc_df, location: str,
         c1, c2 = st.columns(2)
         with c1:
             add_clicked = st.button(
-                "➕ Add", use_container_width=True,
+                "➕ Add", width="stretch",
                 key=f"paste_add_{location}",
                 help="Append these rows to whatever is already in the table below.",
             )
         with c2:
             replace_clicked = st.button(
-                "🔁 Replace", use_container_width=True,
+                "🔁 Replace", width="stretch",
                 key=f"paste_replace_{location}",
                 help="Clear the table below and use only these rows.",
             )
@@ -3977,7 +3969,7 @@ def _render_fg_first(work, acc_df, location, fg_label_for_row, acc_label, commit
         "Qty", min_value=1, max_value=999, value=1, step=1,
         key=f"browse_qty_{location}",
     )
-    if st.button("➕ Add to manual entries", use_container_width=True,
+    if st.button("➕ Add to manual entries", width="stretch",
                  key=f"browse_add_{location}"):
         commit_add(fg_choice, acc_choice, qty)
 
@@ -4068,7 +4060,7 @@ def _render_acc_first(work, acc_df, location, fg_label_for_row, acc_label, commi
         "Qty", min_value=1, max_value=999, value=1, step=1,
         key=f"browse_acc_qty_{location}",
     )
-    if st.button("➕ Add to manual entries", use_container_width=True,
+    if st.button("➕ Add to manual entries", width="stretch",
                  key=f"browse_acc_add_{location}"):
         commit_add(fg_choice, acc_choice, qty)
 
@@ -4095,7 +4087,6 @@ def _render_admin_dashboard() -> None:
     if not events:
         st.caption("No usage events yet. Once people start using the tool, you'll see KPIs here.")
         if st.button("🔄 Refresh", key="_admin_refresh_empty"):
-            _refresh_usage_from_github(_usage_token())
             try:
                 st.cache_data.clear()
             except Exception:
@@ -4162,7 +4153,7 @@ def _render_admin_dashboard() -> None:
             height=160, margin=dict(l=4, r=4, t=8, b=4),
             showlegend=False,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.caption("_No session events yet._")
 
@@ -4182,9 +4173,13 @@ def _render_admin_dashboard() -> None:
 
     # ---- Saves (last 14 days) -----------------------------------------
     st.markdown("**💾 Saves (last 14 days)**")
+    # Every event that writes to GitHub (or applies a plan-level change). Keep
+    # in step with the _track_and_flush("...") calls across app.py.
     save_types = {
         "catalog_save", "catalog_add_sku", "catalog_add_placeholder",
         "recon_apply", "scenario_save", "scenario_delete",
+        "schedule_save", "schedule_delete", "exec_scenario_save",
+        "assumptions_save", "missing_sku_import", "plan_month_transfer",
         "flow_save", "flow_reset", "simple_save", "crew_save",
     }
     saves = df[(df["type"].isin(save_types)) & (df["date"] >= fortnight_ago)].copy()
@@ -4198,7 +4193,7 @@ def _render_admin_dashboard() -> None:
             .reset_index(name="count").sort_values("count", ascending=False)
         )
         agg.columns = ["File / target", "Event", "Count"]
-        st.dataframe(agg, use_container_width=True, hide_index=True)
+        st.dataframe(agg, width="stretch", hide_index=True)
 
     # ---- Top actions ---------------------------------------------------
     st.markdown("**🎯 Top actions (last 14 days)**")
@@ -4211,7 +4206,7 @@ def _render_admin_dashboard() -> None:
                   .sort_values("count", ascending=False).head(10)
         )
         top.columns = ["Event type", "Count"]
-        st.dataframe(top, use_container_width=True, hide_index=True)
+        st.dataframe(top, width="stretch", hide_index=True)
 
     # ---- Recent activity table ----------------------------------------
     st.markdown("**📋 Recent activity (last 20 events)**")
@@ -4224,7 +4219,7 @@ def _render_admin_dashboard() -> None:
         last20[cols_to_show].rename(
             columns={"type": "Event", "facility": "Facility", "file": "File"}
         ),
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
     )
 
     # ---- Refresh button ------------------------------------------------
@@ -4233,8 +4228,7 @@ def _render_admin_dashboard() -> None:
     cc1.caption(
         f"Buffered (un-flushed) this session: {len(_usage_buffer_snapshot())} event(s)"
     )
-    if cc2.button("🔄 Refresh", key="_admin_refresh", use_container_width=True):
-        _refresh_usage_from_github(_usage_token())
+    if cc2.button("🔄 Refresh", key="_admin_refresh", width="stretch"):
         try:
             st.cache_data.clear()
         except Exception:
@@ -4311,7 +4305,7 @@ def render_sidebar() -> dict:
             _template_csv.encode("utf-8"),
             file_name="schedule_template.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
             help=(
                 "Empty CSV with the columns the app needs. Fill in your "
                 "schedule and re-upload. **PRODUCTION DAY** is optional — "
@@ -4525,7 +4519,7 @@ def render_sidebar() -> dict:
         shown_entries = _manual_add_row_numbers(st.session_state[seed_key])
         manual_entries = st.sidebar.data_editor(
             shown_entries,
-            use_container_width=True,
+            width="stretch",
             num_rows="dynamic",
             key=f"manual_entries_{location}_v{st.session_state[rev_key]}",
             column_config={
@@ -4814,7 +4808,7 @@ def render_sidebar() -> dict:
             )
 
         if st.button(f"💾 Save planning assumptions for {location}",
-                     use_container_width=True, key=f"save_assump_{location}"):
+                     width="stretch", key=f"save_assump_{location}"):
             token = _github_token()
             if not token:
                 st.error(
@@ -4864,7 +4858,7 @@ def render_sidebar() -> dict:
 
         edited_display = st.data_editor(
             display_crew,
-            use_container_width=True,
+            width="stretch",
             num_rows="fixed",
             key=f"crew_editor_{location}",
             column_config={
@@ -4899,7 +4893,7 @@ def render_sidebar() -> dict:
             )
 
         # Save button
-        if st.button(f"💾 Save crew for {location}", use_container_width=True):
+        if st.button(f"💾 Save crew for {location}", width="stretch"):
             token = _github_token()
             if not token:
                 st.error(
@@ -5061,6 +5055,7 @@ The Overview's **🎯 Recommended actions** splits these two cases so you don't 
 - `Battery` = Battery Assembly — battery cells (BOSS only)
 - `PMAcc` = PM Acc (Headunit) — PM/Head-unit accessories
 - `GenAcc` = Gen Accessories — generator-side accessories
+- `Undercarriage` = Undercarriage Assembly — PDS (compressor) chassis step, runs before Com Accessories
 - `ComAcc` = Com Accessories — compressor-side accessories
 - `Trailer` = Trailer Assembly — trailer sub-assembly (STD/HT only)
 - `AccKIT` = Accessories KIT — kit prep
@@ -5105,10 +5100,10 @@ Uploaded CSVs stay **only in your browser** unless you explicitly click **💾 S
             st.markdown(
                 """
 ### GitHub token
-The 💾 Save buttons require a **GitHub Personal Access Token** with the `repo` scope. Add it to **Streamlit Cloud → Settings → Secrets**:
+The 💾 Save buttons require a **fine-grained GitHub Personal Access Token** scoped to just this repo, with **Contents: Read and write** permission (see `MAINTAINING.md` → "Rotating the GitHub PAT"). Add it to **Streamlit Cloud → Settings → Secrets**:
 
 ```toml
-github_token = "ghp_xxxxxxxxxxxxxxxxxxxxxxxx"
+github_token = "github_pat_xxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
 If a planner sees *"GitHub token not configured"* when saving, the token is missing or expired. Read-only browsing works without it.
@@ -5478,7 +5473,7 @@ def _render_buildable_by_line(bl: dict, total: int) -> None:
             "over-subscribe a station."
         )
         st.dataframe(
-            df, use_container_width=True, hide_index=True,
+            df, width="stretch", hide_index=True,
             column_config={
                 "Line": st.column_config.TextColumn(
                     "Line", help="Compressor=PDS · Generator=SDG · EBOSS=full BOSS unit · PM=head/skid-only."),
@@ -5681,9 +5676,9 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 _exec_rows_with_headers(metrics), columns=["Metric", location])
             try:
                 st.dataframe(_live_df.style.apply(_style_exec_table, axis=1),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             except Exception:
-                st.dataframe(_live_df, use_container_width=True, hide_index=True)
+                st.dataframe(_live_df, width="stretch", hide_index=True)
             hc_need = metrics["headcount_needed_aggregate"]
             if metrics["verdict"] == "Good":
                 st.success(
@@ -5745,7 +5740,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 placeholder=_placeholder or "e.g. Cypress May",
             )
             if st.button("💾 Save executive scenario",
-                         key=f"exec_save_btn_{location}", use_container_width=True):
+                         key=f"exec_save_btn_{location}", width="stretch"):
                 token = _github_token()
                 name = (_save_name or "").strip()
                 if not name:
@@ -5793,7 +5788,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 pick = st.selectbox("Saved scenarios", saved, key=f"exec_pick_{location}")
                 c1, c2 = st.columns(2)
                 if c1.button("📥 Re-apply", key=f"exec_load_{location}",
-                             use_container_width=True):
+                             width="stretch"):
                     a = (get_exec_scenario(location, pick) or {}).get("assumptions", {})
                     # Stash under a NON-widget key; the sidebar applies it to the
                     # slider widgets on the next run, before they're instantiated
@@ -5807,7 +5802,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                     st.session_state[f"_exec_reapply_toast_{location}"] = pick
                     st.rerun()
                 if c2.button("🗑 Delete", key=f"exec_del_{location}",
-                             use_container_width=True) and _confirm_destructive(
+                             width="stretch") and _confirm_destructive(
                         f"_exec_delete_pending_{location}", pick,
                         f"⚠️ Delete executive scenario **{pick}** for everyone? "
                         "This can't be undone — click **🗑 Delete** again to confirm.",
@@ -5887,9 +5882,9 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
         _cmp_df = pd.DataFrame(_disp, columns=["Metric"] + _cols)
         try:
             st.dataframe(_cmp_df.style.apply(_style_exec_table, axis=1),
-                         use_container_width=True, hide_index=True)
+                         width="stretch", hide_index=True)
         except Exception:
-            st.dataframe(_cmp_df, use_container_width=True, hide_index=True)
+            st.dataframe(_cmp_df, width="stretch", hide_index=True)
 
         # Per-station headcount side-by-side (only stations staffed somewhere).
         _station_order = list(STATION_DEFAULTS.keys()) + list(SUPPORT_ROLES)
@@ -5909,9 +5904,9 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                 return ["" for _ in row]
             try:
                 st.dataframe(_hc_df.style.apply(_style_total, axis=1),
-                             use_container_width=True, hide_index=True)
+                             width="stretch", hide_index=True)
             except Exception:
-                st.dataframe(_hc_df, use_container_width=True, hide_index=True)
+                st.dataframe(_hc_df, width="stretch", hide_index=True)
 
         # CSV carries the Section grouping in its own column (no divider rows).
         _csv_records = []
@@ -6227,13 +6222,13 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             with cL:
                 st.plotly_chart(
                     _make_heatmap(weekly_util, "Current"),
-                    use_container_width=True,
+                    width="stretch",
                     key="overview_heatmap_current",
                 )
             with cR:
                 st.plotly_chart(
                     _make_heatmap(proposed_util, "Proposed"),
-                    use_container_width=True,
+                    width="stretch",
                     key="overview_heatmap_proposed",
                 )
             st.markdown("---")
@@ -6273,7 +6268,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             coloraxis_showscale=False,
         )
         st.plotly_chart(
-            _hm, use_container_width=True,
+            _hm, width="stretch",
             key="overview_weekly_heatmap_full",
         )
         st.markdown("---")
@@ -6435,7 +6430,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     )
     fig.update_traces(textposition="outside")
     fig.update_layout(showlegend=False, height=340, margin=dict(t=20, b=20))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, total_units: int = 0, units=None):
@@ -6581,7 +6576,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                         "relieved later by adding HC there."
                     )
                     st.dataframe(
-                        area_df, use_container_width=True, hide_index=True,
+                        area_df, width="stretch", hide_index=True,
                         column_config={
                             "Area": st.column_config.TextColumn(
                                 "Area", help="Production area (grouped stations)."),
@@ -6663,7 +6658,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                         .reset_index(drop=True)
                     )
                     st.dataframe(
-                        stn_df, use_container_width=True, hide_index=True,
+                        stn_df, width="stretch", hide_index=True,
                         column_config={
                             "Station": st.column_config.TextColumn(
                                 "Station", help="🔋 Battery is measured in batteries/day, not units/day."),
@@ -6706,7 +6701,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                             .reset_index(drop=True)
                         )
                         st.dataframe(
-                            sp_area_df, use_container_width=True, hide_index=True,
+                            sp_area_df, width="stretch", hide_index=True,
                             column_config={
                                 "Area": st.column_config.TextColumn(
                                     "Area", help="Production area (grouped stations)."),
@@ -6752,7 +6747,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
         margin=dict(t=20, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # =============================================================
     # Simple, executive-friendly table
@@ -6775,7 +6770,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
         )
 
     st.dataframe(
-        simple, use_container_width=True, height=480,
+        simple, width="stretch", height=480,
         column_config={
             "Status":  st.column_config.TextColumn("Status", help="Color-coded overall health: 🟢 OK · 🟡 Tight · 🟠 Near cap · 🔴 Over · ⚪ Not at this facility."),
             "People":  st.column_config.NumberColumn("People", help="Headcount you have at this station."),
@@ -6827,7 +6822,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
         disp["Throughput cap (raw)"] = capacity["thru_cap_raw"].round(2)
         disp["Throughput util (raw)"] = (capacity["thru_util_raw"] * 100).round(1).astype(str) + "%"
         disp["Overall"] = capacity["overall_status"]
-        st.dataframe(disp, use_container_width=True, height=480)
+        st.dataframe(disp, width="stretch", height=480)
         st.caption(
             "**With buffer** = capacity multiplied by your safety + efficiency factors. "
             "**Raw** = theoretical maximum, no buffers applied. "
@@ -6901,7 +6896,7 @@ def tab_battery_throughput(batt_sku, batt_type, capacity, inputs):
 
     st.markdown("---")
     st.markdown("#### 📋 Battery demand by FG SKU")
-    st.dataframe(batt_sku, use_container_width=True, height=360)
+    st.dataframe(batt_sku, width="stretch", height=360)
 
     st.markdown("#### 📊 Battery demand by type")
     cc1, cc2 = st.columns([2, 1])
@@ -6909,9 +6904,9 @@ def tab_battery_throughput(batt_sku, batt_type, capacity, inputs):
         fig = px.pie(batt_type, values="total_batteries", names="batt_type",
                      hole=0.45, title="Type mix")
         fig.update_layout(height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     with cc2:
-        st.dataframe(batt_type, use_container_width=True)
+        st.dataframe(batt_type, width="stretch")
 
     # Comparison view
     # =============================================================
@@ -6935,7 +6930,7 @@ def tab_battery_throughput(batt_sku, batt_type, capacity, inputs):
             "Verdict": "✅ Fits" if (days_needed_raw <= inputs["days"]) else "❌ Over target",
         },
     ])
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.dataframe(summary, width="stretch", hide_index=True)
     st.caption(
         f"Your target window is **{inputs['days']} working days**. "
         "The realistic scenario uses your safety + efficiency factors; "
@@ -7009,7 +7004,7 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     else:
         idle_df = pd.DataFrame(idle_rows).sort_values("_sort", ascending=False).drop(columns="_sort")
         st.dataframe(
-            idle_df, use_container_width=True, height=420, hide_index=True,
+            idle_df, width="stretch", height=420, hide_index=True,
             column_config={
                 "Used %": st.column_config.NumberColumn("Used %", format="%d%%"),
                 "Idle %": st.column_config.NumberColumn("Idle %", format="%d%%"),
@@ -7071,7 +7066,7 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
             "When to use": "🟢 If demand is sustained beyond this period",
         },
     ]).set_index("#")
-    st.dataframe(playbook, use_container_width=True, height=260)
+    st.dataframe(playbook, width="stretch", height=260)
 
     st.info(
         "**Tip for planners:** Combine a short-term move (rotation or overtime) "
@@ -7161,7 +7156,7 @@ def _render_export_view(schedule_df, units, capacity, inputs, location: str) -> 
         for s, f, d in EXCEL_DATABASE_TABLES
         if include_rows or s != EXCEL_SAVED_ROWS_SHEET
     ]
-    st.dataframe(pd.DataFrame(sheet_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(sheet_rows), width="stretch", hide_index=True)
     try:
         with st.spinner("Building workbook…"):
             db_bytes = _build_database_workbook_cached(
@@ -7175,7 +7170,7 @@ def _render_export_view(schedule_df, units, capacity, inputs, location: str) -> 
         db_bytes,
         file_name=f"labor_model_database_{today_local_str()}.xlsx",
         mime=_XLSX_MIME,
-        use_container_width=True,
+        width="stretch",
         disabled=not db_bytes,
     )
     if db_bytes:
@@ -7212,7 +7207,7 @@ def _render_export_view(schedule_df, units, capacity, inputs, location: str) -> 
                 f"labor_model_analysis_{location.lower()}_{today_local_str()}.xlsx"
             ),
             mime=_XLSX_MIME,
-            use_container_width=True,
+            width="stretch",
             disabled=not analysis_bytes,
             help=(
                 "Schedule as loaded (after suffix cleanup / auto-spread), one row "
@@ -7236,7 +7231,7 @@ def _render_export_view(schedule_df, units, capacity, inputs, location: str) -> 
     ]
     st.dataframe(
         pd.DataFrame(link_rows),
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
         column_config={"URL": st.column_config.LinkColumn("URL")},
     )
     pick = st.selectbox(
@@ -7418,17 +7413,17 @@ def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
             f"❌ {len(diff.problems)} cell(s) didn't validate. Fix them in Excel "
             "and re-upload — nothing from this sheet is saved until the file is clean."
         )
-        st.dataframe(diff.problems_frame(), use_container_width=True, hide_index=True)
+        st.dataframe(diff.problems_frame(), width="stretch", hide_index=True)
 
     if diff.cells:
         with st.expander(
             f"📝 {len(diff.cells)} cell change(s) across {len(diff.changed_skus)} SKU(s)",
             expanded=True,
         ):
-            st.dataframe(diff.cells_frame(), use_container_width=True, hide_index=True)
+            st.dataframe(diff.cells_frame(), width="stretch", hide_index=True)
     if diff.new_rows:
         with st.expander(f"➕ {len(diff.new_rows)} new SKU(s)", expanded=True):
-            st.dataframe(diff.new_rows_frame(), use_container_width=True, hide_index=True)
+            st.dataframe(diff.new_rows_frame(), width="stretch", hide_index=True)
             st.caption(
                 "Blank labor cells are saved blank (the app reads them as 0); blank "
                 "routing cells use the station's default."
@@ -7463,12 +7458,12 @@ def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
         bits.append(f"{len(diff.new_rows)} new SKU(s)")
     label = f"💾 Save {' + '.join(bits)} to `{spec.file_path}` on GitHub"
     if diff.blocked:
-        st.button(label, key=f"catalog_import_save_{spec.key}", use_container_width=True,
+        st.button(label, key=f"catalog_import_save_{spec.key}", width="stretch",
                   disabled=True, help="Fix the problems listed above and re-upload.")
         return
 
     numeric_cols, text_cols = catalog_editable_columns(spec, sheet.live_columns)
-    if st.button(label, key=f"catalog_import_save_{spec.key}", use_container_width=True,
+    if st.button(label, key=f"catalog_import_save_{spec.key}", width="stretch",
                  type="primary"):
         result = _save_catalog_csv(
             edited=None, source_df=source_df, editable_cols=numeric_cols,
@@ -7490,6 +7485,10 @@ def tab_data_setup(
     Data) with a single tab containing radio sub-views. Sub-views in order:
 
       📋 Schedule              — read-only schedule view
+      🗓 Sequence              — manual reshape: edit PRODUCTION DAY inline, bulk-move
+                                 units between weeks
+      🧹 Customer suffix cleanup — strip customer-decal tails (HRC / ES / UR …) from the
+                                 loaded schedule's SKUs
       🏭 Machine catalog       — editable catalog + add-new-SKU form
       🔌 Accessory catalog     — editable catalog + add-new + XXX placeholder forms
       🔩 Items                 — unified items table editor
@@ -7536,7 +7535,7 @@ def tab_data_setup(
         if schedule_df.empty:
             st.info("No schedule rows. Upload a CSV in the sidebar or switch to manual entry.")
         else:
-            st.dataframe(schedule_df, use_container_width=True, height=600)
+            st.dataframe(schedule_df, width="stretch", height=600)
 
     elif sub == "🗓 Sequence":
         # Sequence reshape needs the FULL schedule (not the time-window
@@ -7750,7 +7749,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
 
     edited = st.data_editor(
         display_df,
-        use_container_width=True, num_rows="fixed",
+        width="stretch", num_rows="fixed",
         key=f"fv_machine_editor_{int(only_used)}", height=600,
         column_config=col_cfg, hide_index=True,
     )
@@ -7767,7 +7766,7 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
         text_cols=["Description", fs_col, ak_col, pd_col, ws_col, uc_col],
     )
 
-    if st.button("💾 Save updated Machine catalog to GitHub", use_container_width=True):
+    if st.button("💾 Save updated Machine catalog to GitHub", width="stretch"):
         _save_catalog_csv(
             edited=edited_cells, source_df=machine_df,
             editable_cols=editable_cols,
@@ -7879,7 +7878,7 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
 
     edited = st.data_editor(
         display_df,
-        use_container_width=True, num_rows="fixed",
+        width="stretch", num_rows="fixed",
         key=f"fv_acc_editor_{int(only_used)}", height=600,
         column_config=col_cfg, hide_index=True,
     )
@@ -7897,7 +7896,7 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     )
     _render_pending_changes(edited_cells, acc_df, editable_cols, text_cols=["Description"])
 
-    if st.button("💾 Save updated Accessory catalog to GitHub", use_container_width=True):
+    if st.button("💾 Save updated Accessory catalog to GitHub", width="stretch"):
         _save_catalog_csv(
             edited=edited_cells, source_df=acc_df,
             editable_cols=editable_cols,
@@ -7971,7 +7970,7 @@ def _render_pending_changes(edited, source_df, editable_cols, text_cols=None):
 
     n = len(diffs)
     with st.expander(f"📝 {n} pending change(s) — preview before saving", expanded=False):
-        st.dataframe(pd.DataFrame(diffs), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(diffs), width="stretch", hide_index=True)
 
 
 def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
@@ -8036,7 +8035,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
 
             submitted = st.form_submit_button(
                 f"💾 Add `{new_sku}` & save to GitHub",
-                use_container_width=True,
+                width="stretch",
             )
 
         if not submitted:
@@ -8171,7 +8170,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
                     )
 
             submitted = st.form_submit_button(
-                f"💾 Add {label} SKU and save to GitHub", use_container_width=True,
+                f"💾 Add {label} SKU and save to GitHub", width="stretch",
             )
 
         if not submitted:
@@ -8898,7 +8897,7 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         except Exception as e:
             st.error(
                 f"❌ Save failed: {e}\n\n"
-                "Common causes: GitHub token missing the `repo` scope, token expired, "
+                "Common causes: GitHub token lacking **Contents: write** on the repo, token expired, "
                 "or the repo path in `core/catalog_storage.py` is wrong."
             )
             return
@@ -9091,7 +9090,7 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
     st.caption("Sorted by Total Labor descending. Each row = one unique FG + Accessory pairing in the current schedule.")
     st.dataframe(
         summary_df,
-        use_container_width=True,
+        width="stretch",
         height=380,
         hide_index=True,
         column_config={
@@ -9203,7 +9202,7 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
         )
 
         st.dataframe(
-            breakdown_df, use_container_width=True, hide_index=True, height=460,
+            breakdown_df, width="stretch", hide_index=True, height=460,
             column_config={
                 "Total Labor (p-min)": st.column_config.NumberColumn(format="%d"),
                 "Total Labor (p-hr)": st.column_config.NumberColumn(format="%.2f"),
@@ -9431,13 +9430,13 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
     c4.metric("Stations visited", len(station_visits))
 
     if filtered_edges:
-        st.graphviz_chart(dot, use_container_width=True)
+        st.graphviz_chart(dot, width="stretch")
     else:
         st.info(
             "No edges connect the stations this unit visits — diagram shows nodes "
             "only. Open **🔧 Edit process flow** below to add precedence edges."
         )
-        st.graphviz_chart(dot, use_container_width=True)
+        st.graphviz_chart(dot, width="stretch")
 
     # ---- Per-station breakdown table ------------------------------------
     st.markdown("#### 🔎 Per-station breakdown")
@@ -9474,7 +9473,7 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
     for _c in ("Stage / depth", "Crew (parallel)"):
         breakdown_df[_c] = breakdown_df[_c].astype(str)
     st.dataframe(
-        breakdown_df, use_container_width=True, hide_index=True, height=420,
+        breakdown_df, width="stretch", hide_index=True, height=420,
     )
 
     # ---- Editor panel ----------------------------------------------------
@@ -9512,7 +9511,7 @@ def _render_flow_editor(edges: list) -> None:
         edited = st.data_editor(
             seed,
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             key="flow_editor",
             height=420,
             column_config={
@@ -9551,13 +9550,13 @@ def _render_flow_editor(edges: list) -> None:
         with c1:
             if st.button(
                 "💾 Save process flow to GitHub",
-                key="flow_save_btn", use_container_width=True,
+                key="flow_save_btn", width="stretch",
             ):
                 _flow_save(edited)
         with c2:
             if st.button(
                 "🔄 Reset to default",
-                key="flow_reset_btn", use_container_width=True,
+                key="flow_reset_btn", width="stretch",
             ):
                 _flow_reset(current_count=len(edited),
                             default_count=len(PROCESS_FLOW_DEFAULTS))
@@ -9703,7 +9702,7 @@ def tab_data_validation(machine_df, acc_df, units=None):
     filtered = issues_df[
         issues_df["Severity"].isin(sev_filter) & issues_df["Category"].isin(cat_filter)
     ]
-    st.dataframe(filtered, use_container_width=True, height=600, hide_index=True)
+    st.dataframe(filtered, width="stretch", height=600, hide_index=True)
 
     # Download
     csv = filtered.to_csv(index=False).encode("utf-8")
@@ -9817,13 +9816,6 @@ def _accessory_sides(family_hint: str, sku: str) -> list:
     return sides
 
 
-def _is_compressor_family(fg_family_hint: str) -> bool:
-    """A FG family is a Compressor if it starts with PDS (portable diesel
-    compressor). Generators (SDG) and BOSS are not."""
-    s = str(fg_family_hint).upper().strip()
-    return s.startswith("PDS")
-
-
 def _accessory_family_hint(sku: str) -> str:
     """Strip the trailing -A### / -AXXX from an accessory SKU to get the FG family.
 
@@ -9881,9 +9873,8 @@ def _family_battery_count(machine_df, family_prefix: str) -> int:
     Returns 0 when nothing matches (e.g. PDS / SDG / unknown family) — those
     accessories simply skip the battery multiplier in the Total column.
 
-    The machine catalog is the authoritative source for battery counts;
-    `BATTERY_COUNT_OVERRIDES` from `core/constants.py` is already baked into
-    the loaded `machine_df["Bat"]` by `load_machine_labor()`.
+    The machine catalog's `Bat` column (as loaded by `load_machine_labor()`)
+    is the single source of truth for battery counts.
     """
     if not family_prefix or machine_df is None or len(machine_df) == 0:
         return 0
@@ -10018,7 +10009,7 @@ def _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_a
 
     edited = st.data_editor(
         rec_df,
-        use_container_width=True, height=520, hide_index=True,
+        width="stretch", height=520, hide_index=True,
         num_rows="fixed",
         key=f"recon_editor_{int(only_used)}_{'-'.join(sorted(side_filter))}",
         column_config={
@@ -10055,7 +10046,7 @@ def _render_reconciliation_view(acc_df, item_master_df, item_packages_df, used_a
     n_sel = len(selected)
     btn_label = f"💾 Apply {n_sel} selected update(s) to SKU aggregate" if n_sel \
                 else "💾 Apply selected updates to SKU aggregate"
-    if st.button(btn_label, use_container_width=True, disabled=(n_sel == 0)):
+    if st.button(btn_label, width="stretch", disabled=(n_sel == 0)):
         _apply_recon_to_acc_csv(selected, acc_df)
 
     # Download for offline review
@@ -10199,7 +10190,7 @@ def _render_item_master_view(item_master_df):
 
     edited = st.data_editor(
         seed,
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         key="item_master_editor",
         height=560,
@@ -10238,7 +10229,7 @@ def _render_item_master_view(item_master_df):
         },
     )
 
-    if st.button("💾 Save items to GitHub", use_container_width=True):
+    if st.button("💾 Save items to GitHub", width="stretch"):
         _save_simple_csv(edited, "data/item_master.csv", "items")
 
 
@@ -10273,7 +10264,7 @@ def _render_item_packages_view(packages_df, item_master_df):
 
     edited = st.data_editor(
         seed,
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         key="item_packages_editor",
         height=400,
@@ -10293,7 +10284,7 @@ def _render_item_packages_view(packages_df, item_master_df):
         },
     )
 
-    if st.button("💾 Save item packages to GitHub", use_container_width=True):
+    if st.button("💾 Save item packages to GitHub", width="stretch"):
         _save_simple_csv(edited, "data/item_packages.csv", "item packages")
 
 
@@ -10796,7 +10787,7 @@ def main():
         with _ic1:
             _do_import = st.button(
                 f"➕ Import {_n_missing} missing SKU(s) into the catalogs",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
                 disabled=not _token,
                 help=(

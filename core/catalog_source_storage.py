@@ -1,26 +1,34 @@
-"""Where the labor standards come from — import provenance and the Excel lock.
+"""Where the labor standards come from — provenance, the Excel-first flag,
+and the in-app changes that haven't made it back to Excel yet.
 
-``data/catalog_source.json`` records, per catalog, the last workbook import
-(which file and sheet, when, how many cells and new SKUs it wrote) and one
-team-wide flag, ``labor_locked``, that makes the in-app catalog editors stop
-accepting labor-minute edits once the standards are maintained in Excel.
+``data/catalog_source.json`` holds:
 
-Routing, descriptions and the add-SKU / placeholder forms are *not* covered by
-the lock: those are the app's own overlay on the IE's standards, and the
-workbook never carries them.
+* ``excel_source_of_truth`` — the team has decided the IE's workbook owns the
+  labor minutes. The in-app editors still accept a minute edit (a planner
+  often needs a number *now*), but every such edit is recorded as **pending**
+  until a later import shows the workbook agrees.
+* ``imports`` — per catalog, the last workbook import: file, sheet, when, how
+  many cells and new SKUs it wrote.
+* ``pending`` — per catalog, per SKU, per column: the value set in the app,
+  the Excel value it replaced, and when. Reconciled by the import (see
+  ``excel_io.reconcile_pending``): cleared once Excel carries the app value,
+  kept — and the in-app value protected — while Excel still has the old one.
+
+Routing, descriptions and the add-SKU / placeholder forms are never pending:
+those are the app's own overlay, and the workbook never carries them.
 
 Same persistence model as the other small stores (see process_flow_storage):
 every write fetches the file fresh from GitHub, applies one change on top,
 pushes with the SHA as a lock (retrying once on a conflict) and mirrors the
-result locally so this container sees it immediately. Writes compose: a
-machine import recorded while someone else flips the lock keeps both.
+result locally. Writes compose: a pending record and a lock flip from two
+sessions both land.
 """
 from __future__ import annotations
 
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from .catalog_storage import (
     GitHubConflict,
@@ -32,19 +40,41 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CATALOG_SOURCE_PATH = DATA_DIR / "catalog_source.json"
 GITHUB_FILE_PATH = "data/catalog_source.json"
 
-#: Keys an import may be recorded under — matches ``excel_io.CATALOG_SPECS``.
+#: Keys an import / pending change may be recorded under — matches
+#: ``excel_io.CATALOG_SPECS``.
 CATALOG_KEYS = ("machine", "accessory")
 
-_IMPORT_FIELDS = ("file", "sheet", "at", "cells", "new_skus")
+
+def _as_int(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_num(value) -> Optional[float]:
+    """A pending value as a float, or ``None`` for blank / unparseable (an
+    override on a cell that was blank in Excel has no Excel value)."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _now() -> str:
+    return datetime.now().isoformat(timespec="minutes")
 
 
 def _clean(data) -> dict:
     """Coerce whatever was on disk / in the repo into the known shape, dropping
     anything unrecognised so a hand-edited or truncated file can't crash a load."""
-    out: dict = {"labor_locked": False, "imports": {}}
+    out: dict = {"excel_source_of_truth": False, "imports": {}, "pending": {}}
     if not isinstance(data, dict):
         return out
-    out["labor_locked"] = bool(data.get("labor_locked", False))
+    out["excel_source_of_truth"] = bool(data.get("excel_source_of_truth", False))
+
     imports = data.get("imports")
     if isinstance(imports, dict):
         for key in CATALOG_KEYS:
@@ -58,18 +88,41 @@ def _clean(data) -> dict:
                 "cells": _as_int(rec.get("cells")),
                 "new_skus": _as_int(rec.get("new_skus")),
             }
+
+    pending = data.get("pending")
+    if isinstance(pending, dict):
+        for key in CATALOG_KEYS:
+            by_sku = pending.get(key)
+            if not isinstance(by_sku, dict):
+                continue
+            cleaned_skus: dict = {}
+            for sku, by_col in by_sku.items():
+                sku = str(sku).strip()
+                if not sku or not isinstance(by_col, dict):
+                    continue
+                cleaned_cols: dict = {}
+                for col, rec in by_col.items():
+                    col = str(col).strip()
+                    if not col or not isinstance(rec, dict):
+                        continue
+                    app_value = _as_num(rec.get("app_value"))
+                    if app_value is None:
+                        continue  # a pending change with no value is noise
+                    cleaned_cols[col] = {
+                        "app_value": app_value,
+                        "excel_value": _as_num(rec.get("excel_value")),
+                        "at": str(rec.get("at", "")).strip(),
+                    }
+                if cleaned_cols:
+                    cleaned_skus[sku] = cleaned_cols
+            if cleaned_skus:
+                out["pending"][key] = cleaned_skus
     return out
 
 
-def _as_int(value) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
 def load_catalog_source() -> dict:
-    """Read the local JSON. Missing or unparseable → the unlocked default."""
+    """Read the local JSON. Missing or unparseable → the default (Excel not
+    the source of truth, nothing imported, nothing pending)."""
     if not CATALOG_SOURCE_PATH.exists():
         return _clean(None)
     try:
@@ -79,13 +132,22 @@ def load_catalog_source() -> dict:
         return _clean(None)
 
 
-def is_labor_locked() -> bool:
-    return bool(load_catalog_source().get("labor_locked", False))
+def is_excel_source_of_truth() -> bool:
+    return bool(load_catalog_source().get("excel_source_of_truth", False))
 
 
 def last_import(catalog: str) -> Optional[dict]:
     """The recorded import for ``catalog``, or ``None`` if there has never been one."""
     return load_catalog_source().get("imports", {}).get(catalog)
+
+
+def pending_for(catalog: str) -> dict:
+    """``{sku: {column: {app_value, excel_value, at}}}`` for ``catalog``."""
+    return dict(load_catalog_source().get("pending", {}).get(catalog, {}))
+
+
+def pending_count(catalog: str) -> int:
+    return sum(len(cols) for cols in pending_for(catalog).values())
 
 
 def _write_local(content: str) -> None:
@@ -133,15 +195,19 @@ def _push(mutate: Callable[[dict], None], token: str, message: str) -> dict:
     return {}  # unreachable — the loop returns or raises
 
 
+def _check_catalog(catalog: str) -> None:
+    if catalog not in CATALOG_KEYS:
+        raise ValueError(f"unknown catalog {catalog!r}; expected one of {CATALOG_KEYS}")
+
+
 def record_import_to_github(
     catalog: str, file: str, sheet: str, cells: int, new_skus: int,
     token: str, at: Optional[str] = None,
 ) -> dict:
     """Note that ``catalog``'s labor standards were just imported from
     ``file`` › ``sheet``. ``at`` defaults to now (ISO, minute precision)."""
-    if catalog not in CATALOG_KEYS:
-        raise ValueError(f"unknown catalog {catalog!r}; expected one of {CATALOG_KEYS}")
-    stamp = at or datetime.now().isoformat(timespec="minutes")
+    _check_catalog(catalog)
+    stamp = at or _now()
 
     def _mutate(state: dict) -> None:
         state.setdefault("imports", {})[catalog] = {
@@ -159,10 +225,71 @@ def record_import_to_github(
     )
 
 
-def set_labor_locked_to_github(locked: bool, token: str) -> dict:
-    """Flip the team-wide lock on labor-minute editing in the app."""
+def set_excel_source_to_github(on: bool, token: str) -> dict:
+    """Flip the team-wide 'Excel is the source of truth for labor minutes' flag."""
     def _mutate(state: dict) -> None:
-        state["labor_locked"] = bool(locked)
+        state["excel_source_of_truth"] = bool(on)
 
-    verb = "Lock" if locked else "Unlock"
-    return _push(_mutate, token, message=f"{verb} in-app labor-minute editing (standards in Excel)")
+    verb = "Make Excel" if on else "Stop treating Excel as"
+    return _push(_mutate, token, message=f"{verb} the source of truth for labor minutes")
+
+
+def record_pending_to_github(
+    catalog: str, changes: Iterable[tuple], token: str, at: Optional[str] = None,
+) -> dict:
+    """Record in-app minute edits that Excel doesn't have yet.
+
+    ``changes`` is ``(sku, column, app_value, excel_value)`` tuples —
+    ``excel_value`` being the catalog value the edit replaced (what Excel is
+    presumed to still say). Re-editing a cell that's already pending keeps the
+    *original* Excel value: the thing to reconcile against is what the
+    workbook had before the first override, not the previous override.
+    """
+    _check_catalog(catalog)
+    stamp = at or _now()
+    rows = [(str(s).strip(), str(c).strip(), _as_num(v), _as_num(x))
+            for s, c, v, x in changes]
+    rows = [r for r in rows if r[0] and r[1] and r[2] is not None]
+    if not rows:
+        return {}
+
+    def _mutate(state: dict) -> None:
+        by_sku = state.setdefault("pending", {}).setdefault(catalog, {})
+        for sku, col, app_value, excel_value in rows:
+            prior = by_sku.get(sku, {}).get(col)
+            by_sku.setdefault(sku, {})[col] = {
+                "app_value": app_value,
+                "excel_value": prior["excel_value"] if prior else excel_value,
+                "at": stamp,
+            }
+
+    return _push(
+        _mutate, token,
+        message=f"Record {len(rows)} temporary {catalog} minute change(s) pending in Excel",
+    )
+
+
+def clear_pending_to_github(
+    catalog: str, keys: Iterable[tuple], token: str, reason: str = "reconciled",
+) -> dict:
+    """Drop ``(sku, column)`` pending records — Excel caught up, or the planner
+    chose Excel's value."""
+    _check_catalog(catalog)
+    wanted = {(str(s).strip(), str(c).strip()) for s, c in keys}
+    wanted = {k for k in wanted if k[0] and k[1]}
+    if not wanted:
+        return {}
+
+    def _mutate(state: dict) -> None:
+        by_sku = state.get("pending", {}).get(catalog, {})
+        for sku, col in wanted:
+            cols = by_sku.get(sku)
+            if cols and col in cols:
+                del cols[col]
+                if not cols:
+                    del by_sku[sku]
+
+    return _push(
+        _mutate, token,
+        message=f"Clear {len(wanted)} pending {catalog} minute change(s) ({reason})",
+    )

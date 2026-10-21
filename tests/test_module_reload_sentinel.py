@@ -93,6 +93,7 @@ class TestNewCoreNamesAreProbed:
     @pytest.mark.parametrize("probe", [
         'hasattr(core.data_loader, "canonical_catalog_column")',  # excel_io imports it
         'hasattr(core.excel_io, "_is_sku_header")',                # app reads sheet.aliased
+        'hasattr(core.excel_io, "reconcile_pending")',             # app imports it
     ])
     def test_probed_in_stale_block(self, probe):
         assert STALE_BLOCK, "couldn't find the `_stale = (...)` block in app.py"

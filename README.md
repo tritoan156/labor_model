@@ -12,7 +12,8 @@ Built so planners and execs can answer:
 ## Features
 
 - **Multi-location** — per-facility headcount, station setup, scenarios, and saved schedules.
-- **Three ways to enter a plan** — upload your normal Excel schedule (any column naming works), **paste a SKU list straight out of a spreadsheet**, or type a handful of SKUs for a quick what-if.
+- **Three ways to enter a plan** — upload your normal schedule as CSV **or as the Excel workbook itself** (any column naming works, header can sit below a title row or on a later tab), **paste a SKU list straight out of a spreadsheet**, or type a handful of SKUs for a quick what-if.
+- **Export & Excel link** — download the whole database (catalogs, crew, settings, scenarios, saved schedules, process flow) or the current analysis as one `.xlsx`, or point Excel at the live CSV catalogs with Power Query so a sheet refreshes itself.
 - **Six interactive tabs:**
   - 🏠 **Overview** — executive dashboard with status banner, KPIs, recommended actions
   - 📊 **Capacity** — per-station utilization (labor + throughput), with 🔋 Battery throughput embedded
@@ -84,6 +85,10 @@ Extra columns are silently ignored. UTF-8 BOM (Excel default on Windows) is stri
 
 If a required column truly isn't there, the upload UI shows a yellow banner naming the missing field and listing the aliases it tried.
 
+### Excel workbooks
+
+Upload the `.xlsx` / `.xlsm` straight from the planner — no Save-As-CSV step. The app uses the first sheet whose header row carries the required columns, so a title row above the header or the plan living on a later tab both work. Date cells become `YYYY-MM-DD`, whole-number quantities stay whole, and what **💾 Save schedule** stores is the converted CSV. The sidebar confirmation pill names the sheet it read. (`.xls`, the pre-2007 format, isn't supported — save it as `.xlsx`.)
+
 ### Don't have a CSV yet?
 
 Click **📥 Download blank template** under the file uploader in the sidebar. You get an empty CSV with the right headers and two example rows.
@@ -123,6 +128,18 @@ Then **➕ Add** appends to the table below and **🔁 Replace** starts fresh. E
 The table numbers its own rows. A row takes the next number as soon as it has an **FG SKU or an Accessory SKU** in it; a row with neither stays blank and doesn't consume a number, so the count always matches the rows that will actually build.
 
 That holds however the row arrived — pasted through the panel, pasted straight into the table from Excel, or typed in by hand — and deleting a row closes the gap rather than leaving a hole. The column is display-only: it isn't part of the schedule and isn't saved with a scenario.
+
+---
+
+## Export & link to Excel
+
+**📁 Data & Setup → 📤 Export & Excel link** gives three ways to get the data out:
+
+1. **Database workbook** — one `.xlsx` with a sheet per data file: the four CSV catalogs exactly as stored, plus `facility_crew.json`, `facility_settings.json`, `scenarios.json`, `exec_scenarios.json`, `uploaded_schedules.json` and `process_flow.json` flattened into plain tables (long key/value format for the executive scenarios, one row per SKU line for scenarios, one row per facility × station for crew). A **README** sheet lists what each sheet is and which file it came from. Tick *Include every row of every saved schedule* to add the big sheet (every saved schedule's rows, union of their columns) — it's slower to build and several MB.
+2. **Analysis workbook** — this session's schedule as loaded, one row per unit with its per-station labor, the capacity-by-station table behind the Capacity tab, and the crew + sidebar settings that produced them.
+3. **Live link** — the CSV catalogs are plain files on GitHub, so Excel can read them with **Data → Get Data → From Web** and **Refresh All** on demand. The panel lists each file's raw URL (`https://raw.githubusercontent.com/<repo>/<branch>/data/<file>`) and a ready-to-paste Power Query script. Read-only: edits still go through the in-app editors so the SHA-locked merge keeps protecting concurrent saves. The JSON files aren't one-click links (they need transform steps); use the database workbook for those. If the repo is ever made private the URLs need a token.
+
+The workbook is built from the data files as deployed, so a save shows up in the export after the usual ~1 minute Streamlit Cloud rebuild.
 
 ---
 

@@ -49,6 +49,7 @@ import core.data_validator
 import core.data_loader
 import core.labor_calculator
 import core.excel_io
+import core.catalog_source_storage
 
 # Step 2: detect staleness via sentinels for names/params added in recent pushes.
 #
@@ -67,6 +68,12 @@ _stale = (
     or not hasattr(core.data_loader, "ScheduleColumnError")
     or not hasattr(core.data_loader, "build_placeholder_map")
     or not hasattr(core.data_loader, "_lookup_placeholder")
+    # Catalog column aliases — excel_io imports these from data_loader, so a
+    # stale data_loader would make the (reloaded) excel_io fail to import and
+    # the old one would hand back sheets with no `.aliased`.
+    or not hasattr(core.data_loader, "canonical_catalog_column")
+    or not hasattr(core.excel_io, "_is_sku_header")
+    or not hasattr(core.excel_io, "reconcile_pending")
     or "absorb_foreign_locations" not in _inspect.signature(
         core.data_loader.load_schedule).parameters
     or "efficiency" not in getattr(
@@ -94,6 +101,7 @@ if _stale:
         "core.data_loader",
         "core.labor_calculator",
         "core.excel_io",
+        "core.catalog_source_storage",
     ):
         _mod = _sys.modules.get(_modname)
         if _mod is not None:
@@ -122,6 +130,7 @@ from core.excel_io import (
     SAVED_SCHEDULE_ROWS_SHEET as EXCEL_SAVED_ROWS_SHEET,
     read_catalog_workbook,
     diff_catalog_sheet,
+    reconcile_pending,
     editable_columns as catalog_editable_columns,
     CatalogImportError,
 )
@@ -172,6 +181,13 @@ from core.process_flow_storage import (
     reset_process_flow_to_default,
     DEFAULT_EDGES as PROCESS_FLOW_DEFAULTS,
     VALID_CLASSES as PROCESS_FLOW_VALID_CLASSES,
+)
+from core.catalog_source_storage import (
+    load_catalog_source,
+    record_import_to_github,
+    set_excel_source_to_github,
+    record_pending_to_github,
+    clear_pending_to_github,
 )
 from core.data_validator import validate_all
 from core.usage_tracker import (
@@ -228,7 +244,7 @@ def _csv_mtime(filename: str) -> float:
 # renames, new columns, etc.) so the cache invalidates even if the underlying
 # CSV file's mtime hasn't changed. The bump takes effect on the next script run
 # (no Cloud reboot): every CSV loader below passes it as a hashed cache arg.
-_LOADER_SCHEMA_VERSION = 9
+_LOADER_SCHEMA_VERSION = 10
 
 
 def _fmt_min_hr(value, *, with_thousands: bool = True, hr_decimals: int = 1) -> str:
@@ -381,6 +397,82 @@ def _load_uploaded_schedules_dict(mtime: float):
 def _load_process_flow_edges(mtime: float):
     """Load data/process_flow.json. Cached per file mtime (hashed)."""
     return load_process_flow()
+
+
+@st.cache_data(show_spinner=False)
+def _load_catalog_source_cached(mtime: float):
+    """Load data/catalog_source.json — import provenance + the labor-minute
+    lock. Cached per file mtime (hashed)."""
+    return load_catalog_source()
+
+
+def _catalog_source() -> dict:
+    """The current provenance/lock state, via the mtime-keyed cache."""
+    return _load_catalog_source_cached(_csv_mtime("catalog_source.json"))
+
+
+def _excel_source() -> bool:
+    """True when the team has made the IE's workbook the source of truth for
+    labor minutes. The in-app editors still accept a minute edit — a planner
+    often needs a number *now* — but each one is saved as **pending** until a
+    later import shows the workbook agrees."""
+    return bool(_catalog_source().get("excel_source_of_truth", False))
+
+
+def _pending_for(catalog_key: str) -> dict:
+    """``{sku: {column: {app_value, excel_value, at}}}`` — the temporary
+    in-app minute edits for one catalog that Excel doesn't carry yet."""
+    return dict((_catalog_source().get("pending") or {}).get(catalog_key) or {})
+
+
+def _pending_frame(pending: dict) -> pd.DataFrame:
+    rows = []
+    for sku, by_col in pending.items():
+        for col, rec in by_col.items():
+            ev = rec.get("excel_value")
+            rows.append({
+                "SKU": sku, "Column": col,
+                "Excel": "" if ev is None else f"{ev:g}",
+                "In app": f"{rec.get('app_value', 0):g}",
+                "Since": rec.get("at", ""),
+            })
+    return pd.DataFrame(rows, columns=["SKU", "Column", "Excel", "In app", "Since"])
+
+
+def _render_pending_summary(catalog_key: str, pending: dict) -> None:
+    """The '⏳ N temporary change(s) not yet in Excel' expander shown above a
+    catalog editor and in the import view."""
+    n = sum(len(c) for c in pending.values())
+    if not n:
+        return
+    with st.expander(
+        f"⏳ {n} temporary minute change(s) on {len(pending)} SKU(s) not yet in Excel",
+        expanded=False,
+    ):
+        st.caption(
+            "These were changed here and are in use now. Update the workbook and "
+            "re-import to make them permanent — each one clears itself once Excel "
+            "carries the same value. Until then an import keeps your value rather "
+            "than reverting it."
+        )
+        st.dataframe(_pending_frame(pending), width="stretch", hide_index=True)
+
+
+def _provenance_line(catalog_key: str) -> str:
+    """One-line 'where these standards came from' for an editor caption, or
+    "" if that catalog has never been imported from a workbook."""
+    rec = (_catalog_source().get("imports") or {}).get(catalog_key)
+    if not rec:
+        return ""
+    where = f"`{rec['file']}`" + (f" › `{rec['sheet']}`" if rec.get("sheet") else "")
+    when = rec.get("at", "")
+    bits = []
+    if rec.get("cells"):
+        bits.append(f"{rec['cells']} cell(s)")
+    if rec.get("new_skus"):
+        bits.append(f"{rec['new_skus']} new SKU(s)")
+    tail = f" — {', '.join(bits)}" if bits else ""
+    return f"📘 Labor standards last imported from {where} on {when}{tail}."
 
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -7415,20 +7507,76 @@ def _render_import_view(machine_df, acc_df) -> None:
     the in-app editors. Nothing is written until save is clicked.
     """
     st.subheader("📥 Import from Excel")
+    for _p in (_provenance_line("machine"), _provenance_line("accessory")):
+        if _p:
+            st.caption(_p)
     st.caption(
-        "Edit labor minutes in Excel and push them back. Start from the database "
-        "workbook (**📤 Export & Excel link**), change cells on the **Machine "
-        "catalog** / **Accessory catalog** sheet or add a SKU row at the bottom, "
-        "save, and upload it here. You'll see exactly what would change before "
-        "anything is written; the save merges only those cells on top of whatever "
-        "the team has committed since."
+        "Bring labor standards in from Excel. Upload the IE's cycle-time workbook "
+        "**as it is** — its own headers (`SKU ID`, `Warehouse (PICK)`, "
+        "`Final Assy (FN-ASSY)` …) are recognised — or the database workbook from "
+        "**📤 Export & Excel link** after editing it. You'll see exactly what would "
+        "change before anything is written; the save merges only those cells on top "
+        "of whatever the team has committed since. Routing, descriptions and the "
+        "`XXX` estimation placeholders live in the app and are never touched by an "
+        "import."
     )
+
+    # Who owns the labor minutes. With Excel as the source, a minute edited in
+    # the app is still saved and used at once — but recorded as *pending* and
+    # protected from being reverted by the next import until the workbook
+    # carries it. A button rather than a checkbox bound to the persisted flag,
+    # so a stale widget in one session can never re-save over another user's
+    # change.
+    _excel_now = _excel_source()
+    _lc1, _lc2 = st.columns([3, 2])
+    with _lc1:
+        st.markdown(
+            "**Source of truth for labor minutes:** "
+            + ("📗 **Excel.** A minute changed in the app is used right away and "
+               "listed as ⏳ pending until the workbook is updated and re-imported."
+               if _excel_now else
+               "🔓 **either** — minutes edited in the app are simply saved; an "
+               "import overwrites them.")
+        )
+    with _lc2:
+        _src_label = (
+            "🔓 Stop treating Excel as the source" if _excel_now
+            else "📗 Make Excel the source of truth"
+        )
+        if st.button(
+            _src_label, key="catalog_excel_source_btn", width="stretch",
+            help=(
+                "Team-wide, saved to GitHub. With Excel as the source, each "
+                "in-app minute edit is tracked as pending and an import won't "
+                "revert it while the workbook still has the old number. Routing, "
+                "Description, SKU renames and the add-SKU / placeholder forms are "
+                "the app's own either way."
+            ),
+        ):
+            _tok = _github_token()
+            if not _tok:
+                st.error("GitHub token not configured — add `github_token` to Streamlit Secrets.")
+            else:
+                try:
+                    set_excel_source_to_github(not _excel_now, _tok)
+                    _load_catalog_source_cached.clear()
+                    st.rerun()
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"❌ Couldn't save the setting: {exc}")
+    if _excel_now:
+        for _k in ("machine", "accessory"):
+            _render_pending_summary(_k, _pending_for(_k))
+
     with st.expander("What the import does — and doesn't", expanded=False):
         st.markdown(
             """
 - **Which sheets:** `Machine catalog` and `Accessory catalog` (the exported
-  workbook's names). A single-sheet file that isn't named is recognised by its
-  header row — keep the exported header. Other sheets are ignored.
+  workbook's names), or `Machine` / `Acc` and a few other spellings. A sheet
+  that isn't named is recognised by its header row. **The IE workbook's own
+  headers work** — `SKU ID`, `Warehouse (PICK)`, `Wire Assy (PREP-WH)`,
+  `Final Assy (FN-ASSY)`, `Acc KIT (PREP-ACC)` and so on map onto the
+  catalog's columns, and the preview lists every mapping it made. Columns like
+  `Unit`, `Total`, `Lead`, `Flag` are ignored. Other sheets are ignored.
 - **Matching:** rows match catalog rows by **SKU** (case doesn't matter).
   A SKU that isn't in the catalog becomes a **new row**.
 - **Never deletes:** catalog SKUs that aren't on the sheet are left exactly
@@ -7483,10 +7631,13 @@ def _render_import_view(machine_df, acc_df) -> None:
 
     for key, sheet in book.sheets.items():
         source_df = machine_df if key == "machine" else acc_df
-        _render_catalog_import_section(sheet, source_df, sig)
+        _render_catalog_import_section(
+            sheet, source_df, sig, upload_name=getattr(uploaded, "name", ""),
+        )
 
 
-def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
+def _render_catalog_import_section(sheet, source_df, upload_sig: str,
+                                   upload_name: str = "") -> None:
     """Preview + save for one catalog sheet of an uploaded workbook."""
     spec = sheet.spec
     icon = "🏭" if spec.key == "machine" else "🔌"
@@ -7497,6 +7648,16 @@ def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
     if sheet.matched_by == "header":
         st.caption(
             f"Recognised by its header row (the sheet isn't called `{spec.sheet}`)."
+        )
+    if sheet.aliased:
+        # The IE workbook's spellings, and what each one landed on. Shown
+        # rather than silently applied: a planner about to overwrite standards
+        # should see that "Final Assy (FN-ASSY)" is FN_Assy, not guess.
+        _pairs = list(sheet.aliased.items())
+        st.caption(
+            "Recognised the workbook's own headers: "
+            + ", ".join(f"`{src}` → `{dst}`" for src, dst in _pairs[:12])
+            + (" …" if len(_pairs) > 12 else "")
         )
     if sheet.extra_columns:
         st.caption(
@@ -7516,6 +7677,62 @@ def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
     except Exception as exc:  # noqa: BLE001
         st.error(f"❌ Couldn't compare the sheet with the catalog: {exc}")
         return
+
+    # Temporary in-app minute edits: decide per cell whether this sheet has
+    # caught up, still has the old number (keep the planner's value), or was
+    # changed to something else (Excel wins). Done before the preview so what
+    # the planner sees is what the save will write.
+    pending_report = None
+    _pending = _pending_for(spec.key) if _excel_source() else {}
+    if _pending:
+        _revert = st.checkbox(
+            "Revert my temporary in-app changes to the workbook's values",
+            key=f"catalog_import_revert_{spec.key}_{upload_sig}", value=False,
+            help=(
+                "Unticked (default): where the sheet still has the number you "
+                "replaced in the app, your value is kept and stays pending. "
+                "Ticked: the sheet's value is applied and the pending mark cleared."
+            ),
+        )
+        diff, pending_report = reconcile_pending(diff, sheet, _pending, revert_to_excel=_revert)
+        _rp = pending_report
+        if _rp.caught_up:
+            st.success(
+                f"✅ The workbook now carries {len(_rp.caught_up)} of your temporary "
+                "change(s) — they stop being pending: "
+                + ", ".join(f"`{s}` {c} = {v:g}" for s, c, v, _ in _rp.caught_up[:8])
+                + (" …" if len(_rp.caught_up) > 8 else "")
+            )
+        if _rp.still_pending:
+            st.warning(
+                f"⏳ {len(_rp.still_pending)} temporary change(s) are still not in the "
+                "workbook — **your values are kept** and stay pending: "
+                + ", ".join(
+                    f"`{s}` {c} (app {a:g}, Excel {'blank' if e is None else f'{e:g}'})"
+                    for s, c, a, e in _rp.still_pending[:8]
+                )
+                + (" …" if len(_rp.still_pending) > 8 else "")
+                + " Tick the box above to take the workbook's values instead."
+            )
+        if _rp.reverted:
+            st.info(
+                f"↩️ Reverting {len(_rp.reverted)} temporary change(s) to the workbook's "
+                "values: " + ", ".join(f"`{s}` {c} → {e:g}" for s, c, _a, e in _rp.reverted[:8])
+                + (" …" if len(_rp.reverted) > 8 else "")
+            )
+        if _rp.excel_changed:
+            st.warning(
+                f"⚠️ For {len(_rp.excel_changed)} cell(s) the workbook has a *different* "
+                "value than your temporary change — Excel is the source, so its value "
+                "will be applied: "
+                + ", ".join(f"`{s}` {c} (app {a:g} → Excel {e:g})" for s, c, a, e in _rp.excel_changed[:8])
+                + (" …" if len(_rp.excel_changed) > 8 else "")
+            )
+        if _rp.not_on_sheet:
+            st.caption(
+                f"{len(_rp.not_on_sheet)} temporary change(s) aren't on this sheet "
+                "(SKU missing or cell blank) — left as they are."
+            )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rows on sheet", diff.n_rows)
@@ -7597,6 +7814,24 @@ def _render_catalog_import_section(sheet, source_df, upload_sig: str) -> None:
         )
         if result:
             st.session_state[done_key] = result
+            # Provenance + pending bookkeeping. Best effort — the catalog save
+            # already landed, so a hiccup here is reported, not fatal.
+            try:
+                _tok = _github_token()
+                if _tok:
+                    record_import_to_github(
+                        spec.key, file=upload_name or "workbook",
+                        sheet=sheet.sheet_name, cells=len(diff.cells),
+                        new_skus=len(diff.new_rows), token=_tok,
+                    )
+                    if pending_report is not None and pending_report.to_clear:
+                        clear_pending_to_github(
+                            spec.key, pending_report.to_clear, _tok,
+                            reason="Excel caught up / Excel's value taken",
+                        )
+                    _load_catalog_source_cached.clear()
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"Saved, but couldn't record where the standards came from: {exc}")
 
 
 def _remember_data_setup_view() -> None:
@@ -7748,6 +7983,20 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
 
     st.subheader("🏭 Machine catalog")
     _render_stale_data_banner("data/machine_clean.csv")
+    excel_src = _excel_source()
+    pending = _pending_for("machine") if excel_src else {}
+    if excel_src:
+        st.info(
+            "📗 **Excel is the source of truth for labor minutes.** You can still "
+            "change a minute here — it's saved and used right away — but it's "
+            "listed as ⏳ **pending** until the workbook is updated and re-imported "
+            "(**📥 Import from Excel**). Routing, Description, SKU renames and the "
+            "add-SKU form are the app's own."
+        )
+    _prov = _provenance_line("machine")
+    if _prov:
+        st.caption(_prov)
+    _render_pending_summary("machine", pending)
     st.caption(
         f"Edit labor times in the table below — **all labor columns are "
         f"person-minutes per unit** (not hours; `Bat` is a battery count). SKUs "
@@ -7886,12 +8135,26 @@ def tab_floor_verification_machine(machine_df, schedule_df, used_fg, location: s
         ),
     }
     for c in editable_cols:
-        col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
+        col_cfg[c] = st.column_config.NumberColumn(
+            c, min_value=0, step=1,
+            help=("Saved and used at once; listed as pending until the workbook "
+                  "carries the same value.") if excel_src else None,
+        )
+    if excel_src:
+        # Which of this row's minutes are temporary (not yet in Excel).
+        display_df.insert(
+            2, "⏳ Pending in Excel",
+            display_df["SKU"].map(lambda s: ", ".join(pending.get(s, {}).keys())),
+        )
+        col_cfg["⏳ Pending in Excel"] = st.column_config.TextColumn(
+            "⏳ Pending in Excel", disabled=True, width="small",
+            help="Minute columns changed in the app that the workbook doesn't carry yet.",
+        )
 
     edited = st.data_editor(
         display_df,
         width="stretch", num_rows="fixed",
-        key=f"fv_machine_editor_{int(only_used)}", height=600,
+        key=f"fv_machine_editor_{int(only_used)}_{int(excel_src)}", height=600,
         column_config=col_cfg, hide_index=True,
     )
 
@@ -7926,6 +8189,20 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
     """The Accessory-catalog editor — extracted from tab_floor_verification."""
     st.subheader("🔌 Accessory catalog")
     _render_stale_data_banner("data/acc_clean.csv")
+    excel_src = _excel_source()
+    pending = _pending_for("accessory") if excel_src else {}
+    if excel_src:
+        st.info(
+            "📗 **Excel is the source of truth for labor minutes.** You can still "
+            "change a minute here — it's saved and used right away — but it's "
+            "listed as ⏳ **pending** until the workbook is updated and re-imported "
+            "(**📥 Import from Excel**). Description, SKU renames and the add-SKU / "
+            "placeholder forms are the app's own."
+        )
+    _prov = _provenance_line("accessory")
+    if _prov:
+        st.caption(_prov)
+    _render_pending_summary("accessory", pending)
     st.caption(
         "Edit labor times in the table below. SKUs used in the current schedule "
         "are highlighted. Click **💾 Save** to push changes to GitHub."
@@ -8015,12 +8292,25 @@ def tab_floor_verification_accessory(acc_df, schedule_df, used_acc, machine_df):
         ),
     }
     for c in editable_cols:
-        col_cfg[c] = st.column_config.NumberColumn(c, min_value=0, step=1)
+        col_cfg[c] = st.column_config.NumberColumn(
+            c, min_value=0, step=1,
+            help=("Saved and used at once; listed as pending until the workbook "
+                  "carries the same value.") if excel_src else None,
+        )
+    if excel_src:
+        display_df.insert(
+            2, "⏳ Pending in Excel",
+            display_df["SKU"].map(lambda s: ", ".join(pending.get(s, {}).keys())),
+        )
+        col_cfg["⏳ Pending in Excel"] = st.column_config.TextColumn(
+            "⏳ Pending in Excel", disabled=True, width="small",
+            help="Minute columns changed in the app that the workbook doesn't carry yet.",
+        )
 
     edited = st.data_editor(
         display_df,
         width="stretch", num_rows="fixed",
-        key=f"fv_acc_editor_{int(only_used)}", height=600,
+        key=f"fv_acc_editor_{int(only_used)}_{int(excel_src)}", height=600,
         column_config=col_cfg, hide_index=True,
     )
     st.caption(
@@ -9056,6 +9346,49 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         merges=n_merged, added=n_added, via=via,
     )
 
+    # Excel-as-source: a minute edited in the app is saved (above) and used at
+    # once, but recorded as *pending* so the next workbook import can tell
+    # "Excel caught up" from "Excel still has the old number" — and won't
+    # revert the planner in the second case. Editor saves only; the import
+    # path reconciles pending itself. Numeric columns only (routing and
+    # Description are the app's own). A SKU renamed or merged in this same
+    # save is skipped: its pending key would point at a name that no longer
+    # exists. Best effort — the catalog save already landed.
+    n_pending = 0
+    if (via == "app" and label in ("machine", "accessory") and diffs
+            and _excel_source()):
+        _moved = {str(o).strip() for o, _ in applied_renames} | {
+            str(o).strip() for o, _ in applied_merges}
+        _numeric = set(editable_cols)
+        _pending_rows = []
+        for _sku, _col, _new in diffs:
+            if _col not in _numeric or str(_sku).strip() in _moved:
+                continue
+            try:
+                _new_f = float(_new)
+            except (TypeError, ValueError):
+                continue
+            _old = None
+            if _sku in source_df.index and _col in source_df.columns:
+                _ov = source_df.loc[_sku, _col]
+                if isinstance(_ov, pd.Series):
+                    _ov = _ov.iloc[0]
+                try:
+                    _old = None if pd.isna(_ov) else float(_ov)
+                except (TypeError, ValueError):
+                    _old = None
+            _pending_rows.append((_sku, _col, _new_f, _old))
+        if _pending_rows:
+            try:
+                record_pending_to_github(label, _pending_rows, token)
+                _load_catalog_source_cached.clear()
+                n_pending = len(_pending_rows)
+            except Exception as exc:  # noqa: BLE001
+                st.warning(
+                    f"Saved, but couldn't mark {len(_pending_rows)} minute change(s) "
+                    f"as pending in Excel: {exc}"
+                )
+
     _saved_bits = []
     if n_diffs:
         _saved_bits.append(f"{n_diffs} cell change(s)")
@@ -9069,6 +9402,12 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
         f"✅ Saved {' + '.join(_saved_bits)} to `{file_path}` "
         + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
     )
+    if n_pending:
+        st.info(
+            f"⏳ {n_pending} minute change(s) are in use now and marked **pending in "
+            "Excel**. Update the workbook and re-import to make them permanent — "
+            "until then an import keeps your values."
+        )
     if n_ren:
         _ren_list = ", ".join(f"`{o}` → `{n}`" for o, n in applied_renames[:8])
         st.warning(

@@ -96,6 +96,81 @@ def _safe_get(df: pd.DataFrame, possible_columns: list, default=0):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Catalog column aliases — the one place the IE workbook's headers are known
+# ---------------------------------------------------------------------------
+# The labor-standard catalogs started life as the industrial engineers' Excel
+# sheets, whose headers read "Warehouse (PICK)", "Final Assy (FN-ASSY)",
+# "Acc KIT (PREP-ACC)" and so on; the app writes its own short names back
+# ("Warehouse", "FN_Assy", "AccKIT"). Both catalog loaders below and the Excel
+# import (core/excel_io.py) resolve headers through these tables, so the IE's
+# own workbook imports directly — not only the sheet the app exported.
+#
+# Values are substring patterns, matched case-insensitively, and the order
+# inside a tuple is the match precedence: the specific spelling goes first, so
+# "FN-ASSY" is tried before a bare "Final" that also sits inside "Final
+# Station HND". The loaders match "SKU", "Description" and "Bat" by exact
+# name (see _safe_get) and the rest by substring; the import treats every
+# entry as a substring, so "SKU ID" and "🔋Bat" resolve either way.
+CATALOG_COLUMN_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
+    "machine": {
+        "SKU":         ("SKU ID", "SKU", "FG SKU"),
+        "Description": ("Description",),
+        "Warehouse":   ("PICK", "Warehouse"),
+        "Wire":        ("PREP-WH", "Wire"),
+        "Trailer":     ("SUB-TRL", "Trl", "Trailer"),
+        "FN_Assy":     ("FN-ASSY", "Final", "FN_Assy", "FNAssy", "FN_Assy_old"),
+        "PDI":         ("TEST-PDI", "PDI"),
+        "QC":          ("FN-QC", "QC"),
+        "Ship":        ("SHIP",),
+        "ETO":         ("ETO",),
+        "Bat":         ("🔋Bat", "Bat", "Battery"),
+    },
+    "accessory": {
+        "SKU":            ("SKU ID", "SKU"),
+        "Description":    ("Description",),
+        "Warehouse":      ("PICK", "Warehouse"),
+        "AccKIT":         ("PREP-ACC", "Acc KIT", "AccKIT"),
+        "Nameplate Prep": ("PREP-NP", "Battery Assy", "Nameplate Prep", "Nameplate"),
+        "BattSubRaw":     ("SUB-BTR raw", "SUB-BTR)", "Battery Sub raw", "BattSubRaw", "SubRaw"),
+        "PMAcc":          ("SUB-PM", "PMAcc", "PM Acc", "PM "),
+        "GenAcc":         ("SUB-GEN", "Gen Sub", "GenAcc", "Gen Acc"),
+        "ComAcc":         ("SUB-COM", "Compressor", "ComAcc"),
+    },
+}
+
+_ROUTING_HEADER_RE = re.compile(r"^(FINAL|ACCKIT|PDI|WIRE|UNDERCARRIAGE) STATION\b")
+
+
+def canonical_catalog_column(header, catalog: str) -> str | None:
+    """Resolve one header cell to the app's column name for ``catalog``
+    (``"machine"`` / ``"accessory"``), or ``None`` when it isn't one.
+
+    An exact match on the app's own name (case and whitespace aside) wins;
+    otherwise the first canonical whose alias pattern occurs inside the
+    header, in table order. The per-facility routing headers (``Final Station
+    HND`` …) are never aliased — they'd land in ``FN_Assy`` via "Final" — the
+    caller matches those exactly against the live CSV header instead.
+    """
+    aliases = CATALOG_COLUMN_ALIASES.get(catalog)
+    if not aliases:
+        return None
+    text = str(header or "").strip().replace("\n", " ")
+    if not text:
+        return None
+    upper = text.upper()
+    for canonical in aliases:
+        if upper == canonical.upper():
+            return canonical
+    if _ROUTING_HEADER_RE.match(upper):
+        return None
+    for canonical, patterns in aliases.items():
+        for pattern in patterns:
+            if pattern.strip().upper() in upper:
+                return canonical
+    return None
+
+
 def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     """Load Machine_Clean CSV → DataFrame indexed by SKU.
 
@@ -120,12 +195,15 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
     # 🟡, Unit, SKU ID, Description, Warehouse (PICK), Wire Assy (PREP-WH),
     # Sub Trl (SUB-TRL), Final Assy (FN-ASSY), PDI (TEST-PDI), QC (TEST-FN-QC),
     # Ship (MAT-REIC-SHIP), Total, 🔋Bat, Lead, Flag
-    sku_col = _safe_get(df, ["SKU ID", "SKU", "FG SKU"])
-    desc_col = _safe_get(df, ["Description"])
-    bat_col = _safe_get(df, ["🔋Bat", "Bat", "Battery"])
+    _alias = CATALOG_COLUMN_ALIASES["machine"]
+    sku_col = _safe_get(df, list(_alias["SKU"]))
+    desc_col = _safe_get(df, list(_alias["Description"]))
+    bat_col = _safe_get(df, list(_alias["Bat"]))
 
     # Robust detection — match original verbose headers OR friendly names
     # written back by the catalog save (e.g. "Wire", "Trailer", "FN_Assy").
+    # The patterns live in CATALOG_COLUMN_ALIASES so the Excel import
+    # recognises exactly the same headers this loader does.
     def _find(df_cols, *patterns):
         for c in df_cols:
             s = str(c).upper()
@@ -134,14 +212,14 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
                     return c
         return None
 
-    pick_col = _find(df.columns, "PICK", "Warehouse")
-    wire_col = _find(df.columns, "PREP-WH", "Wire")
-    trl_col  = _find(df.columns, "SUB-TRL", "Trl", "Trailer")
-    fn_col   = _find(df.columns, "FN-ASSY", "Final", "FN_Assy", "FNAssy", "FN_Assy_old")
-    pdi_col  = _find(df.columns, "TEST-PDI", "PDI")
-    qc_col   = _find(df.columns, "FN-QC", "QC")
-    ship_col = _find(df.columns, "SHIP")
-    eto_col  = _find(df.columns, "ETO")
+    pick_col = _find(df.columns, *_alias["Warehouse"])
+    wire_col = _find(df.columns, *_alias["Wire"])
+    trl_col  = _find(df.columns, *_alias["Trailer"])
+    fn_col   = _find(df.columns, *_alias["FN_Assy"])
+    pdi_col  = _find(df.columns, *_alias["PDI"])
+    qc_col   = _find(df.columns, *_alias["QC"])
+    ship_col = _find(df.columns, *_alias["Ship"])
+    eto_col  = _find(df.columns, *_alias["ETO"])
     # Per-facility routing — each station has 3 columns (HND/SPB/CYP) so the
     # same SKU can route to different teams at different plants (e.g. PDI is
     # done by the PDI team in Henderson but by the AccKIT team in Cypress).
@@ -400,13 +478,15 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     rename_map = {c: str(c).replace("\n", " ") for c in df.columns}
     df = df.rename(columns=rename_map)
 
-    sku_col = _safe_get(df, ["SKU ID", "SKU"])
-    desc_col = _safe_get(df, ["Description"])
+    _alias = CATALOG_COLUMN_ALIASES["accessory"]
+    sku_col = _safe_get(df, list(_alias["SKU"]))
+    desc_col = _safe_get(df, list(_alias["Description"]))
 
     # Column detection recognises BOTH the original CSV header format
     # (e.g. "Acc KIT (PREP-ACC)") AND the friendly internal name written
     # back by the catalog save (e.g. "AccKIT", "Nameplate Prep"). This keeps
-    # the loader robust whether the CSV was hand-authored or app-saved.
+    # the loader robust whether the CSV was hand-authored or app-saved. The
+    # patterns live in CATALOG_COLUMN_ALIASES, shared with the Excel import.
     def _find(df_cols, *patterns):
         for c in df_cols:
             s = str(c).upper()
@@ -415,12 +495,12 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
                     return c
         return None
 
-    pick_col = _find(df.columns, "PICK", "Warehouse")
-    kit_col  = _find(df.columns, "PREP-ACC", "Acc KIT", "AccKIT")
-    prep_col = _find(df.columns, "PREP-NP", "Battery Assy", "Nameplate Prep", "Nameplate")
-    btr_col  = _find(df.columns, "SUB-BTR raw", "SUB-BTR)", "Battery Sub raw", "BattSubRaw", "SubRaw")
-    pm_col   = _find(df.columns, "SUB-PM", "PMAcc", "PM Acc", "PM ")
-    gen_col  = _find(df.columns, "SUB-GEN", "Gen Sub", "GenAcc", "Gen Acc")
+    pick_col = _find(df.columns, *_alias["Warehouse"])
+    kit_col  = _find(df.columns, *_alias["AccKIT"])
+    prep_col = _find(df.columns, *_alias["Nameplate Prep"])
+    btr_col  = _find(df.columns, *_alias["BattSubRaw"])
+    pm_col   = _find(df.columns, *_alias["PMAcc"])
+    gen_col  = _find(df.columns, *_alias["GenAcc"])
     # Prefer an exact "ComAcc" column when present. The catalog editor save AND
     # the reconciliation Apply both write the Compressor-side aggregate to a
     # column named "ComAcc". A leftover legacy "Compressor" column must NOT
@@ -428,7 +508,7 @@ def load_acc_labor(path: Path | str | None = None) -> pd.DataFrame:
     # sits before "ComAcc" used to win, which meant saved Compressor-side
     # values silently never took effect on reload.
     com_col  = "ComAcc" if "ComAcc" in df.columns else _find(
-        df.columns, "SUB-COM", "Compressor", "ComAcc",
+        df.columns, *_alias["ComAcc"],
     )
 
     out = pd.DataFrame()

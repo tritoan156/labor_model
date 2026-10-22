@@ -61,6 +61,11 @@ against per-station headcount + throughput capacity.
    list → `_stale` sentinels → reload list) must be kept in step whenever you
    add/remove a `core/` module or add a name `app.py` imports. See
    `MAINTAINING.md` → "The stale-module sentinel".
+6. **No `st.rerun()` inside the sidebar** — handlers call `_defer_rerun()` and
+   `render_sidebar()` fires it last. An early rerun wipes every sidebar widget
+   built after it (the working-day count fell to 1 and every capacity number
+   was ~20× off). See `MAINTAINING.md` → "Sidebar buttons never call
+   `st.rerun()` directly".
 
 ## Key architecture you'll hit
 

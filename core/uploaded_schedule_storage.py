@@ -25,10 +25,18 @@ Top-level schema (``data/uploaded_schedules.json`` on GitHub):
       "Spartanburg": {...},
       "Cypress":     {...}
     }
+
+``rows`` is the CSV's parsed data-row count (:func:`count_csv_data_rows`).
+Blocks saved before 2026-10 counted line breaks instead, so a quoted
+multi-line cell inflated them — the app recounts from ``csv_content`` when it
+lists a saved schedule rather than trusting the stored number.
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -63,12 +71,37 @@ def load_all_uploaded_schedules() -> dict:
         return {}
 
 
-def list_uploaded_schedules(location: str) -> list[str]:
-    """Sorted schedule names for the given facility, or ``[]`` if none."""
-    by_loc = load_all_uploaded_schedules().get(location, {})
+def _saved_at_key(block) -> tuple:
+    """Sort key that puts the most recently saved block first.
+
+    ``saved_at`` is an ISO-8601 string with an explicit offset; parse it so a
+    block saved under a different offset still lands in the right place, and
+    fall back to the raw text when it doesn't parse. A block with no
+    ``saved_at`` (or a malformed one) sorts after every dated block.
+    """
+    raw = block.get("saved_at") if isinstance(block, dict) else None
+    if not raw:
+        return (2, 0.0, "")
+    try:
+        return (0, -datetime.fromisoformat(str(raw)).timestamp(), "")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return (1, 0.0, str(raw))
+
+
+def names_newest_first(by_loc: dict) -> list[str]:
+    """Schedule names of one facility's ``{name: block}`` dict, most recently
+    saved first; ties (and blocks with no usable ``saved_at``) fall back to
+    alphabetical order so the result is stable."""
     if not isinstance(by_loc, dict):
         return []
-    return sorted(by_loc.keys())
+    return sorted(by_loc.keys(), key=lambda n: (_saved_at_key(by_loc[n]), str(n)))
+
+
+def list_uploaded_schedules(location: str) -> list[str]:
+    """Schedule names for the given facility, newest save first, or ``[]``
+    if none."""
+    by_loc = load_all_uploaded_schedules().get(location, {})
+    return names_newest_first(by_loc)
 
 
 def get_uploaded_schedule(location: str, name: str) -> Optional[dict]:
@@ -117,15 +150,28 @@ def _write_local(content: str) -> None:
         pass
 
 
-def _count_csv_data_rows(csv_text: str) -> int:
-    """Best-effort count of data rows (lines minus header). Robust to trailing
-    blank line and a multi-line header — we just subtract 1 for the header row
-    and clamp at zero."""
-    if not csv_text:
+def count_csv_data_rows(csv_text: str) -> int:
+    """Number of data rows in a CSV: parsed records after the header row.
+
+    Parses with the ``csv`` module rather than counting line breaks, so a
+    quoted cell that spans several lines (an Excel comment with a hard return)
+    counts as the one row it is. Blank and whitespace-only lines are skipped,
+    which is what ``pandas.read_csv`` does too — so this is the same total the
+    loader starts from, and the "of N rows" on the sidebar pill and the
+    picker's row count agree. ``0`` for empty text or a header-only file.
+    """
+    if not csv_text or not csv_text.strip():
         return 0
-    # Count non-empty lines minus 1 for header
-    non_empty = sum(1 for line in csv_text.splitlines() if line.strip())
-    return max(non_empty - 1, 0)
+    records = 0
+    for rec in csv.reader(io.StringIO(csv_text)):
+        if not rec or (len(rec) == 1 and not rec[0].strip()):
+            continue  # a blank line (csv.reader yields [] or [" "])
+        records += 1
+    return max(records - 1, 0)
+
+
+# Older name, kept for anything that imported it.
+_count_csv_data_rows = count_csv_data_rows
 
 
 def save_uploaded_schedule_to_github(
@@ -153,7 +199,7 @@ def save_uploaded_schedule_to_github(
         # Las Vegas wall-clock with explicit offset so "Last saved: ..." in
         # the Load dropdown matches the planner's clock.
         "saved_at": now_local().isoformat(timespec="seconds"),
-        "rows": _count_csv_data_rows(csv_text),
+        "rows": count_csv_data_rows(csv_text),
         "csv_content": csv_text,
     }
 

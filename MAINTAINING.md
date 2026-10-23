@@ -114,6 +114,55 @@ Rules when you touch `core/`:
 
 ---
 
+## Sidebar buttons never call `st.rerun()` directly
+
+Streamlit drops the state of every widget a script run did **not** build, and
+a run that ends in `st.rerun()` counts as a finished run. A rerun raised by a
+sidebar button (📥 Load, 💾 Save, 🗑 Delete, ➕ Add, the manual grid's
+renumber) therefore used to end the script *before* the Plan month, Time
+window, working-day count, sliders and crew editor below it were built — and
+all of them reset on the next run. The worst case was **Working days in the
+period**: it has no default of its own, so it fell to its minimum of 1 while
+the browser still displayed the old number, and every capacity figure came out
+~20× too high (ETO at 3145 %, "People you need 1084") until the planner
+happened to touch the month or the window.
+
+The rule, pinned by `tests/test_sidebar_state_survives_actions.py`:
+
+- A handler that runs inside `render_sidebar()` calls **`_defer_rerun()`**,
+  never `st.rerun()`. `render_sidebar()` fires the requested rerun last, after
+  the Admin expander, so every sidebar widget has been built and keeps its
+  state. (A confirmation the handler wants the planner to see goes in the
+  panel's one-shot toast key — a message drawn in the run that asked for the
+  rerun is thrown away with it.)
+- `_sync_working_days` re-seeds `work_days_input` whenever its state is
+  missing, not only when the (month, window) signature changes.
+- The top-level tab strip mirrors its choice into `ACTIVE_TAB_MIRROR_KEY`, so
+  a rerun raised before the strip is built (Sequencer ✅ Accept, 📅 Move into
+  plan month, ➕ Import) no longer bounces the planner to Overview.
+- The "✅ Loaded N rows" pill and its dropped-unit warnings are drawn by
+  `main()` *after* the schedule loads, into a container the sidebar reserves
+  (`_render_upload_summary`). Drawn in the sidebar they described the previous
+  run's schedule for one more click.
+- A main-body button that needs to change a sidebar widget cannot write that
+  widget's key (the sidebar built it already this run). It writes a
+  non-widget seed and reruns, and the sidebar consumes the seed into the
+  widget's state right before building it. **📆 Plan <month> instead** →
+  `PLAN_MONTH_SEED_KEY` → `render_sidebar` → `PLAN_MONTH_KEY` is the
+  worked example; the picker therefore takes no `index=` (its state is
+  always seeded, like `work_days_input`), and its option list always
+  includes the current value and the loaded schedule's months
+  (`SCHEDULE_MONTHS_KEY`) so a seeded value is never off the list.
+  `tests/test_schedule_load_moment.py` pins it.
+
+Reruns raised from a tab body are fine: the sidebar has already been built by
+then. A widget inside `render_sidebar` is built before the deferred rerun
+fires, so it needs nothing extra; a widget outside it that must survive a
+rerun raised before it is built (the strip, a tab body's own picker) needs a
+non-widget mirror like `_remember_data_setup_view`.
+
+---
+
 ## Per-facility station routing + frozen catalog columns
 
 Two pieces of behavior that aren't obvious from the UI:

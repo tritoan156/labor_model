@@ -85,6 +85,8 @@ _stale = (
     # Routing seeds for new SKUs (also where _machine_family / _machine_class
     # now live) — app.py imports these names directly.
     or not hasattr(core.sku_routing, "seed_facility_routing")
+    # Saved-schedule picker: parsed row count + newest-first ordering.
+    or not hasattr(core.uploaded_schedule_storage, "names_newest_first")
 )
 if _stale:
     # Reload in DEPENDENCY ORDER: constants first (every other module imports
@@ -188,6 +190,8 @@ from core.uploaded_schedule_storage import (
     get_uploaded_schedule,
     save_uploaded_schedule_to_github,
     delete_uploaded_schedule_on_github,
+    count_csv_data_rows,
+    names_newest_first,
 )
 from core.process_flow_storage import (
     load_process_flow,
@@ -647,6 +651,97 @@ def _track_and_flush(event_type: str, *, force_flush: bool = True, **payload) ->
         pass
 
 
+# ---------------------------------------------------------------------------
+# Deferred reruns for sidebar actions
+# ---------------------------------------------------------------------------
+# Streamlit drops the state of every widget a script run did NOT build, and a
+# run that ends in ``st.rerun()`` counts as a finished run. A rerun raised by a
+# sidebar button (📥 Load, 💾 Save, ➕ Add, the manual grid's renumber …)
+# therefore ended the script before the Plan month, Time window, working-day
+# count, sliders and crew editor below it were built — and all of them reset
+# on the very next run. The worst case was "Working days in the period": it
+# has no default of its own, so it fell to its minimum of 1 while the browser
+# still displayed the old number, and every capacity figure came out ~20× too
+# high until the planner happened to touch the month or the window.
+#
+# Sidebar handlers therefore never call ``st.rerun()`` directly: they ask for
+# one here, and render_sidebar() fires it once the whole sidebar has been
+# built. Nothing is lost, and the main body (which hasn't started yet) costs
+# nothing extra. tests/test_sidebar_state_survives_actions.py pins both the
+# rule and the behaviour.
+_DEFERRED_RERUN_KEY = "_rerun_after_sidebar"
+
+
+def _defer_rerun() -> None:
+    """Request a rerun that fires at the end of the sidebar, not right now."""
+    st.session_state[_DEFERRED_RERUN_KEY] = True
+
+
+def _flush_deferred_rerun() -> None:
+    """Fire the rerun a sidebar handler asked for (no-op when none did)."""
+    if st.session_state.pop(_DEFERRED_RERUN_KEY, False):
+        st.rerun()
+
+
+# The Plan-month picker's widget key, and the non-widget seed a main-body
+# button writes to switch it. render_sidebar() builds the picker before main()
+# runs, and Streamlit forbids writing a widget's state once the widget exists
+# in that run — so "📆 Plan August 2026 instead" can't set the picker directly.
+# It writes PLAN_MONTH_SEED_KEY and reruns; the sidebar consumes the seed into
+# the widget's state right before the selectbox is built, the one moment a
+# keyed widget's value may be set from code (the same way `_sync_working_days`
+# seeds the working-day count). tests/test_schedule_load_moment.py pins it.
+PLAN_MONTH_KEY = "plan_month_select"
+PLAN_MONTH_SEED_KEY = "_plan_month_seed"
+# (year, month) tuples the loaded schedule says it is for (PRODUCTION MONTH),
+# written by _stash_upload_summary and read by the picker, so those months are
+# always on its list even when they fall outside the rolling default window.
+SCHEDULE_MONTHS_KEY = "_schedule_months"
+
+
+def _month_label(ym) -> str:
+    """``(2026, 8)`` → ``"August 2026"`` — the one spelling of a plan month."""
+    return f"{calendar.month_name[int(ym[1])]} {int(ym[0])}"
+
+
+def _plan_month_options(now, extra=()) -> "list[tuple[int, int]]":
+    """Options for the Plan-month picker, chronological.
+
+    The default list is a rolling window of 2 months back to 12 months
+    forward from ``now``. Every valid ``(year, month)`` in ``extra`` — the
+    loaded schedule's own months and whatever is selected right now — is
+    added to it, so a schedule older than the window can still be planned as
+    its own month, and a selection never silently drops off the list.
+    """
+    opts: set = set()
+    for delta in range(-2, 13):
+        m0 = now.month - 1 + delta
+        opts.add((now.year + m0 // 12, m0 % 12 + 1))
+    for ym in extra or ():
+        try:
+            y, m = int(ym[0]), int(ym[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 1 <= m <= 12 and 1 <= y <= 9999:
+            opts.add((y, m))
+    return sorted(opts)
+
+
+def _sync_working_days(target_days: int, sig: tuple) -> None:
+    """Seed the sidebar's "Working days in the period" input.
+
+    Re-seeded on a new ``sig`` — (plan month, time window, today-in-month) —
+    so the day count follows the period the demand is sliced to, and whenever
+    the widget's state is simply gone. The input has no default of its own,
+    so a wiped state fell to ``min_value=1`` while the browser still displayed
+    the old number, and every capacity figure came out ~20× too high.
+    :func:`_defer_rerun` stops the wipe at its source; this keeps the number
+    honest regardless. A manual edit sticks until ``sig`` changes.
+    """
+    if (st.session_state.get("_work_days_synced_sig") != sig
+            or "work_days_input" not in st.session_state):
+        st.session_state["work_days_input"] = int(target_days)
+        st.session_state["_work_days_synced_sig"] = sig
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +974,41 @@ def _auto_spread_dates(
         "working_days": len(working),
     }
     return df
+
+
+def _schedule_month_units(df: pd.DataFrame) -> "dict[tuple[int, int], int]":
+    """Units per calendar month the schedule says it is for, from PRODUCTION
+    MONTH (``May-26`` or carryover ``26-Apr``), weighted by BUILD QTY.
+
+    Deliberately not from PRODUCTION DAY: right after a load, auto-spread has
+    filled every blank day with a date in the *Plan* month, so the dates say
+    whatever the picker says. PRODUCTION MONTH is the file's own statement.
+    Rows whose month doesn't parse ("Manual", blank) are ignored.
+    """
+    out: dict = {}
+    if df is None or df.empty or "PRODUCTION MONTH" not in df.columns:
+        return out
+    if "BUILD QTY" in df.columns:
+        qty = pd.to_numeric(df["BUILD QTY"], errors="coerce").fillna(0)
+    else:
+        qty = pd.Series(1, index=df.index)
+    for month_value, units in zip(df["PRODUCTION MONTH"], qty):
+        ym = _parse_target_month(month_value)
+        if ym is None:
+            continue
+        out[ym] = out.get(ym, 0) + int(units)
+    return out
+
+
+def _schedule_dominant_month(df: pd.DataFrame) -> "tuple[int, int] | None":
+    """The (year, month) carrying the most units in
+    :func:`_schedule_month_units` — the month the schedule is *for*. A tie
+    goes to the later month (a file with 20 carryover units and 20 new ones
+    is for the new month). None when no PRODUCTION MONTH parses."""
+    by_month = _schedule_month_units(df)
+    if not by_month:
+        return None
+    return max(by_month, key=lambda ym: (by_month[ym], ym))
 
 
 def _row_is_carryover(month_value, plan_month) -> bool:
@@ -1336,6 +1466,7 @@ SCHEDULE_MODE_MANUAL = "✏️ Paste or type SKUs"
 _CROSS_MODE_SCHEDULE_KEYS = (
     "_loaded_schedule_buffer",
     "_loaded_schedule_source",
+    "_loaded_schedule_name",
     "_proposed_schedule",
     "_proposed_schedule_overloads",
 )
@@ -1393,6 +1524,7 @@ def _resolve_manual_schedule(base_df, location, machine_df, acc_df, plan_month=N
     sig = _manual_schedule_signature(base_df)
     buf = st.session_state.pop("_loaded_schedule_buffer", None)
     st.session_state.pop("_loaded_schedule_source", None)
+    st.session_state.pop("_loaded_schedule_name", None)
     if buf is not None and sig:
         st.session_state["_manual_schedule_override"] = {
             "sig": sig, "csv": buf.getvalue(),
@@ -1538,8 +1670,9 @@ def _load_schedule_df(
     uploaded_file=None, location: str = "HENDERSON",
     target_month_hint: "tuple[int, int] | None" = None,
 ) -> pd.DataFrame:
-    """Schedule loader — accepts an uploaded CSV, a saved-schedule buffer, or
-    falls back to the bundled May 2026 sample.
+    """Schedule loader — accepts an uploaded CSV, a saved-schedule buffer, the
+    facility's newest saved schedule, or falls back to the bundled May 2026
+    sample.
 
     Resolution order:
       1. A one-shot ``st.session_state['_loaded_schedule_buffer']`` — produced
@@ -1553,7 +1686,15 @@ def _load_schedule_df(
       3. The persistent ``st.session_state['_active_schedule_csv']`` — whatever
          was loaded last. This is what lets the schedule survive reruns from
          unrelated widgets (e.g. the efficiency slider) instead of resetting.
-      4. The bundled ``data/may_schedule.csv``.
+         An *automatic* pick (step 3c) is bound to the facility it was picked
+         for: a facility switch drops it and re-resolves for the new facility,
+         while anything the planner chose (upload, 📥 Load, a reshape) stays.
+      3c. First load for a facility — nothing uploaded, nothing active: the
+         facility's newest saved schedule (``saved_at``, the 📂 picker's own
+         order), promoted to the active schedule exactly like a 📥 Load, so a
+         fresh session opens on the team's real plan instead of the sample.
+      4. The bundled ``data/may_schedule.csv`` — only for a facility with no
+         saved schedules.
 
     Passes file-like content as ``io.BytesIO`` so no temp file is written to
     disk — protects against race conditions when multiple users upload
@@ -1624,6 +1765,12 @@ def _load_schedule_df(
             df.attrs.get("foreign_location_recovered")
             if df is not None and hasattr(df, "attrs") else None
         )
+        # Row accounting for the "Loaded N of M rows" pill (see load_schedule).
+        _row_counts = (
+            {k: df.attrs.get(k)
+             for k in ("source_rows", "no_qty_rows", "other_location_rows")}
+            if df is not None and hasattr(df, "attrs") else None
+        )
         if df is not None and not df.empty:
             # Auto-clean customer-decal suffixes (e.g. BOSS70-001HRC →
             # BOSS70-001) on every load so the suffixed text never leaks into
@@ -1641,7 +1788,11 @@ def _load_schedule_df(
                               plan_month_label=_plan_label, recovered=_recovered,
                               unscheduled=_unscheduled, location_recovered=_location,
                               foreign_location=_foreign,
-                              sheet=st.session_state.get("_active_schedule_sheet"))
+                              sheet=st.session_state.get("_active_schedule_sheet"),
+                              row_counts=_row_counts,
+                              name=st.session_state.get("_active_schedule_name"),
+                              auto_loaded=bool(
+                                  st.session_state.get("_active_schedule_auto_for")))
         return df
 
     # Resolution order. NOTE: the previously-loaded schedule must survive
@@ -1661,6 +1812,13 @@ def _load_schedule_df(
         st.session_state["_active_schedule_source"] = st.session_state.pop(
             "_loaded_schedule_source", "saved"
         )
+        # A 📥 Load names the saved schedule; a reshape keeps the name of the
+        # schedule it reshaped. Either way the planner chose it, so it is no
+        # longer the facility-bound automatic first pick (step 3c).
+        st.session_state["_active_schedule_name"] = st.session_state.pop(
+            "_loaded_schedule_name", st.session_state.get("_active_schedule_name"),
+        )
+        st.session_state.pop("_active_schedule_auto_for", None)
         # A programmatic load is always CSV — no workbook sheet to report,
         # and any earlier failed-workbook banner is superseded.
         st.session_state["_active_schedule_sheet"] = None
@@ -1699,6 +1857,8 @@ def _load_schedule_df(
                 # silently reviving the previous schedule — the persistence a
                 # malformed CSV already gets by living in _active_schedule_csv.
                 st.session_state.pop("_active_schedule_csv", None)
+                st.session_state.pop("_active_schedule_name", None)
+                st.session_state.pop("_active_schedule_auto_for", None)
                 st.session_state["_active_schedule_sheet"] = None
                 st.session_state["_active_schedule_error"] = str(exc)
                 raise
@@ -1706,6 +1866,10 @@ def _load_schedule_df(
             st.session_state["_active_schedule_csv"] = csv_bytes
             st.session_state["_active_schedule_source"] = "upload"
             st.session_state["_active_schedule_sheet"] = sheet
+            st.session_state["_active_schedule_name"] = (
+                getattr(uploaded_file, "name", None) or None
+            )
+            st.session_state.pop("_active_schedule_auto_for", None)
             df = load_schedule(
                 io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
                 placeholder_map=placeholder_map, acc_skus=acc_skus,
@@ -1715,7 +1879,17 @@ def _load_schedule_df(
         # Same file as before → fall through to the persisted active schedule.
 
     # 3) Persisted active schedule — survives reruns from slider/widget changes.
+    #    An automatic first pick (3c) belongs to the facility it was picked
+    #    for: switching facility drops it so the new facility gets its own
+    #    newest save (or the sample). A schedule the planner chose stays put
+    #    across a facility switch, as it always has.
     active = st.session_state.get("_active_schedule_csv")
+    _auto_for = st.session_state.get("_active_schedule_auto_for")
+    if active is not None and _auto_for and _auto_for != location:
+        for _k in ("_active_schedule_csv", "_active_schedule_source",
+                   "_active_schedule_name", "_active_schedule_auto_for"):
+            st.session_state.pop(_k, None)
+        active = None
     if active is not None:
         df = load_schedule(
             io.BytesIO(active), location=location, machine_skus=machine_skus,
@@ -1731,7 +1905,47 @@ def _load_schedule_df(
     if _pending_error:
         raise ScheduleColumnError(_pending_error)
 
-    # 4) Bundled sample
+    # 3c) First load for this facility — nothing uploaded, nothing loaded yet.
+    #     Start from the facility's newest saved schedule (the 📂 picker's
+    #     default) rather than the bundled sample, promoted to the active
+    #     schedule exactly as a 📥 Load would be, and tagged as this
+    #     facility's automatic pick. Happens once: from here on step 3 serves
+    #     it, so a mode switch never re-triggers it, and an upload / 📥 Load /
+    #     reshape replaces it for good. The Plan month is NOT touched — an
+    #     August file opened in October gets the off-month note and the
+    #     "📆 Plan August 2026 instead" button, never a silent switch.
+    if uploaded_file is None:
+        _newest = _newest_saved_schedule(location)
+        if _newest is not None:
+            _name, _csv_text = _newest
+            csv_bytes = _csv_text.encode("utf-8")
+            st.session_state["_active_schedule_csv"] = csv_bytes
+            st.session_state["_active_schedule_source"] = "saved"
+            st.session_state["_active_schedule_sheet"] = None
+            st.session_state["_active_schedule_name"] = _name
+            st.session_state["_active_schedule_auto_for"] = location
+            st.session_state.pop("_active_schedule_error", None)
+            try:
+                df = load_schedule(
+                    io.BytesIO(csv_bytes), location=location,
+                    machine_skus=machine_skus, placeholder_map=placeholder_map,
+                    acc_skus=acc_skus, absorb_foreign_locations=_absorb_foreign,
+                )
+            except ScheduleColumnError:
+                # A saved file the loader can't read must not poison the
+                # session the way a malformed upload deliberately does — the
+                # planner never chose it. Fall back to the sample.
+                for _k in ("_active_schedule_csv", "_active_schedule_source",
+                           "_active_schedule_sheet", "_active_schedule_name",
+                           "_active_schedule_auto_for"):
+                    st.session_state.pop(_k, None)
+            else:
+                _track_and_flush(
+                    "schedule_autoload_saved", facility=location, name=_name,
+                )
+                return _finalize(df, "saved")
+
+    # 4) Bundled sample — a facility with no saved schedules.
     df = load_schedule(
         location=location, machine_skus=machine_skus,
         placeholder_map=placeholder_map, acc_skus=acc_skus,
@@ -1740,12 +1954,28 @@ def _load_schedule_df(
     return _finalize(df, "bundled")
 
 
+def _newest_saved_schedule(location: str) -> "tuple[str, str] | None":
+    """``(name, csv_text)`` of the facility's most recently saved schedule —
+    the 📂 picker's default — or None when there is none worth loading."""
+    all_schedules = _load_uploaded_schedules_dict(_csv_mtime("uploaded_schedules.json"))
+    by_loc = all_schedules.get(location, {}) if isinstance(all_schedules, dict) else {}
+    for name in names_newest_first(by_loc):
+        block = by_loc.get(name)
+        csv_text = block.get("csv_content", "") if isinstance(block, dict) else ""
+        if isinstance(csv_text, str) and csv_text.strip():
+            return name, csv_text
+    return None
+
+
 def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
                           plan_month_label: str = "", recovered: dict | None = None,
                           unscheduled: dict | None = None,
                           location_recovered: dict | None = None,
                           foreign_location: dict | None = None,
-                          sheet: str | None = None) -> None:
+                          sheet: str | None = None,
+                          row_counts: dict | None = None,
+                          name: str | None = None,
+                          auto_loaded: bool = False) -> None:
     """Save a one-line description of the just-loaded schedule into session
     state so the sidebar can echo it back to the planner as a green
     confirmation pill. No-op when the DataFrame is empty (caller already
@@ -1754,28 +1984,48 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
     ``plan_month_label`` is the authoritative Plan-month chosen in the sidebar
     (e.g. "June 2026"). When set it's what the pill shows, since that month
     drives the Calendar + auto-spread — even if the CSV's own PRODUCTION MONTH
-    column says something else (which we keep as ``csv_month`` for context)."""
+    column says something else (which we keep as ``csv_month`` for context).
+
+    ``row_counts`` carries the loader's ``source_rows`` / ``no_qty_rows`` /
+    ``other_location_rows`` so the pill can say "Loaded 277 of 288 rows" and
+    account for the gap. Also records the schedule's own months under
+    :data:`SCHEDULE_MONTHS_KEY` for the Plan-month picker. ``name`` is the
+    saved schedule's name or the uploaded file's name, shown on the pill;
+    ``auto_loaded`` marks the facility's newest save picked automatically on
+    first load (step 3c of :func:`_load_schedule_df`)."""
     try:
         if df is None or df.empty:
             st.session_state.pop("_last_upload_summary", None)
+            st.session_state.pop(SCHEDULE_MONTHS_KEY, None)
             return
-        # Only treat a canonical Mon-YY token as the current CSV month — undated
-        # rows the loader now keeps (carryover-only slice, no anchor) are
-        # CARRYOVER=False but carry a blank/note PRODUCTION MONTH that must not
-        # be surfaced as the month label.
-        months = (
-            [m for m in df.loc[~df["CARRYOVER"], "PRODUCTION MONTH"].unique().tolist()
-             if re.match(r"^[A-Za-z]{3}-\d{2}$", str(m))]
-            if "CARRYOVER" in df.columns else []
-        )
-        csv_month = months[0] if months else (
-            df["PRODUCTION MONTH"].iloc[0] if "PRODUCTION MONTH" in df.columns else ""
-        )
+        # The schedule's own month(s): PRODUCTION MONTH weighted by units, not
+        # PRODUCTION DAY (auto-spread has just filled that with the Plan
+        # month). The dominant one is the pill's "CSV says …" and what the
+        # "📆 Plan <month> instead" button offers; every month the file is
+        # dated in stays selectable in the picker.
+        by_month = _schedule_month_units(df)
+        dominant = _schedule_dominant_month(df)
+        st.session_state[SCHEDULE_MONTHS_KEY] = sorted(by_month)
+        if dominant is not None:
+            csv_month = _month_label(dominant)
+        else:
+            # Nothing parsed as a month — show the first raw value so the
+            # planner still sees what the file says.
+            csv_month = (
+                str(df["PRODUCTION MONTH"].iloc[0])
+                if "PRODUCTION MONTH" in df.columns else ""
+            )
+        _rc = row_counts if isinstance(row_counts, dict) else {}
+        _src_rows = _rc.get("source_rows")
         st.session_state["_last_upload_summary"] = {
             "rows": int(len(df)),
+            "source_rows": int(_src_rows) if _src_rows is not None else None,
+            "no_qty_rows": int(_rc.get("no_qty_rows") or 0),
+            "other_location_rows": int(_rc.get("other_location_rows") or 0),
             "location": str(location),
             "month": str(plan_month_label or csv_month or "—"),
             "csv_month": str(csv_month or ""),
+            "schedule_month": dominant,
             "source": source,
             "auto_spread": (df.attrs.get("auto_spread")
                             if hasattr(df, "attrs") else None),
@@ -1786,6 +2036,8 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
             # Workbook sheet the upload was read from (None for a CSV) — shown
             # on the confirmation pill so the planner can spot a wrong tab.
             "sheet": sheet,
+            "name": str(name) if name else None,
+            "auto_loaded": bool(auto_loaded),
         }
     except Exception:
         st.session_state.pop("_last_upload_summary", None)
@@ -3027,7 +3279,7 @@ def _scenario_save(location: str, name: str, seed_key: str, existing_names: list
             f"✅ Saved scenario **{name}** for {location}"
             + (f" (commit [`{commit_sha}`]({commit_url}))." if commit_url else "."),
         )
-        st.rerun()
+        _defer_rerun()
     except Exception as e:
         _show_github_error(e, "Save")
 
@@ -3051,8 +3303,12 @@ def _scenario_load(location: str, name: str, seed_key: str, rev_key: str) -> Non
     st.session_state[f"_last_loaded_scenario_name_{location}"] = name
     # Don't force-flush here — load is a read; let buffer accumulate.
     track_event("scenario_load", facility=location, name=name)
-    st.success(f"Loaded scenario **{name}** — {len(seed)} row(s).")
-    st.rerun()
+    # Shown at the top of the panel on the rerun — a message drawn here would
+    # be thrown away with the rest of this run.
+    st.session_state[f"_scenario_toast_{location}"] = (
+        "success", f"📥 Loaded scenario **{name}** — {len(seed)} row(s).",
+    )
+    _defer_rerun()
 
 
 def _show_github_error(e, action: str = "Save") -> None:
@@ -3145,7 +3401,7 @@ def _scenario_delete(location: str, name: str) -> None:
         st.session_state[f"_scenario_toast_{location}"] = (
             "success", f"🗑 Deleted scenario **{name}** for {location}.",
         )
-        st.rerun()
+        _defer_rerun()
     except Exception as e:
         _show_github_error(e, "Delete")
 
@@ -3166,7 +3422,9 @@ def _render_uploaded_schedules_panel(location: str, uploaded_file) -> None:
     """
     all_schedules = _load_uploaded_schedules_dict(_csv_mtime("uploaded_schedules.json"))
     by_loc = all_schedules.get(location, {}) if isinstance(all_schedules, dict) else {}
-    schedule_names = sorted(by_loc.keys()) if isinstance(by_loc, dict) else []
+    # Newest save first, so the default pick is the schedule a teammate saved
+    # most recently — not whichever name happens to sort first.
+    schedule_names = names_newest_first(by_loc)
 
     with st.sidebar.expander("📂 Save / load uploaded schedules", expanded=False):
         # Replay any one-shot toast stashed before rerun
@@ -3236,7 +3494,14 @@ def _render_uploaded_schedules_panel(location: str, uploaded_file) -> None:
             )
             block = by_loc.get(chosen) or {}
             saved_at = block.get("saved_at", "?")
-            rows = block.get("rows", "?")
+            # Recount from the CSV itself (~2 ms): blocks saved before 2026-10
+            # stored a line-break count, which a quoted multi-line cell
+            # inflates ("296 rows" for a 288-row file), so it never matched
+            # the "Loaded N of M rows" pill after a 📥 Load.
+            try:
+                rows = count_csv_data_rows(block.get("csv_content", ""))
+            except Exception:
+                rows = block.get("rows", "?")
             st.caption(f"Last saved: **{saved_at}** · **{rows}** rows")
             c1, c2 = st.columns([3, 1])
             if c1.button(
@@ -3322,7 +3587,7 @@ def _uploaded_schedule_save(
             pass
         _track_and_flush(
             "schedule_save", facility=location, name=name,
-            rows=len(csv_text.splitlines()) - 1,
+            rows=count_csv_data_rows(csv_text),
         )
         st.session_state.pop(confirm_key, None)
         st.session_state[f"_uploaded_schedule_toast_{location}"] = (
@@ -3330,7 +3595,7 @@ def _uploaded_schedule_save(
             f"✅ Saved schedule **{name}** for {location}"
             + (f" (commit [`{commit_sha}`]({commit_url}))." if commit_url else "."),
         )
-        st.rerun()
+        _defer_rerun()
     except Exception as e:
         _show_github_error(e, "Save")
 
@@ -3349,9 +3614,14 @@ def _uploaded_schedule_load(location: str, name: str) -> None:
         st.warning(f"Saved schedule '{name}' is empty.")
         return
     st.session_state["_loaded_schedule_buffer"] = io.BytesIO(csv_text.encode("utf-8"))
+    st.session_state["_loaded_schedule_name"] = name
     _track_and_flush("schedule_load_saved", facility=location, name=name)
-    st.success(f"Loaded saved schedule **{name}** for {location}.")
-    st.rerun()
+    # Shown at the top of the panel on the rerun — a message drawn here would
+    # be thrown away with the rest of this run.
+    st.session_state[f"_uploaded_schedule_toast_{location}"] = (
+        "success", f"📥 Loaded saved schedule **{name}** for {location}.",
+    )
+    _defer_rerun()
 
 
 def _uploaded_schedule_delete(location: str, name: str) -> None:
@@ -3377,7 +3647,7 @@ def _uploaded_schedule_delete(location: str, name: str) -> None:
         st.session_state[f"_uploaded_schedule_toast_{location}"] = (
             "success", f"🗑 Deleted saved schedule **{name}** for {location}.",
         )
-        st.rerun()
+        _defer_rerun()
     except Exception as e:
         _show_github_error(e, "Delete")
 
@@ -3848,7 +4118,7 @@ def _paste_commit(parsed: pd.DataFrame, location: str, seed_key: str,
         f"✅ {verb} **{len(parsed)}** row(s) · "
         f"**{int(parsed['Qty'].sum())}** unit(s).",
     )
-    st.rerun()
+    _defer_rerun()
 
 
 def _render_paste_import(machine_df, acc_df, location: str,
@@ -4047,10 +4317,15 @@ def _render_sku_browser(machine_df, acc_df, location: str, seed_key: str, rev_ke
         )
         st.session_state[seed_key] = current
         st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
-        st.success(f"Added {fg_choice} × {int(qty)} to manual entries.")
-        st.rerun()
+        st.session_state[f"_browse_toast_{location}"] = (
+            f"✅ Added {fg_choice} × {int(qty)} to manual entries."
+        )
+        _defer_rerun()
 
     with st.sidebar.expander("📚 Browse catalog & add SKU", expanded=False):
+        _toast = st.session_state.pop(f"_browse_toast_{location}", None)
+        if _toast:
+            st.success(_toast)
         direction = st.radio(
             "Start from",
             options=["FG SKU first", "Accessory SKU first"],
@@ -4687,6 +4962,211 @@ def _render_admin_panel() -> None:
     _render_admin_dashboard()
 
 
+def _render_upload_summary(slot, location: str, uploaded) -> None:
+    """Draw the sidebar's "✅ Loaded N rows …" pill and the warnings about
+    units the loader rescued or dropped, from ``_last_upload_summary``.
+
+    Called by main() right after the schedule has loaded, into the container
+    the sidebar reserved for it (``inputs["upload_summary_slot"]``) — so what
+    the pill says is always the schedule the tabs are showing. ``uploaded`` is
+    the live uploader value: with no summary and no upload, the bundled-sample
+    note is shown instead. No-op in ✏️ manual mode (no slot).
+    """
+    if slot is None:
+        return
+    with slot:
+        _summary = st.session_state.get("_last_upload_summary")
+        if _summary and isinstance(_summary, dict):
+            _src_label = {
+                "upload":  "uploaded CSV",
+                "saved":   "saved schedule",
+                "bundled": "bundled sample",
+            }.get(_summary.get("source", ""), "schedule")
+            if _summary.get("source") == "upload" and _summary.get("sheet"):
+                _src_label = f"uploaded Excel · sheet `{_summary['sheet']}`"
+            _auto = _summary.get("auto_spread")
+            _auto_suffix = ""
+            if isinstance(_auto, dict) and _auto.get("count"):
+                _auto_month = _auto.get("target_month_label", "")
+                _across = f"across **{_auto_month}** " if _auto_month else ""
+                _auto_suffix = (
+                    f"  \n📅 _Auto-leveled {_auto['count']} of "
+                    f"{_auto['total_rows']} undated rows {_across}"
+                    f"({_auto['working_days']} working days)._"
+                )
+            # Note the CSV's own month when it differs from the Plan month, so
+            # the planner understands why (e.g. a May export planned for June).
+            _csv_month = _summary.get("csv_month", "")
+            _shown_month = _summary.get("month", "—")
+            _csv_note = ""
+            if _csv_month and _csv_month not in ("—", _shown_month):
+                _csv_note = f" _(CSV says {_csv_month})_"
+            # "Loaded 277 of 288 rows", then one line per reason a row the
+            # file had isn't in the plan, so the two numbers reconcile without
+            # opening the CSV. (Rows with a quantity but no SKU are covered by
+            # the placeholder warnings below, in units.)
+            _rows = _summary.get("rows", "?")
+            _src_rows = _summary.get("source_rows")
+            _of = (
+                f" of **{_src_rows}**"
+                if isinstance(_src_rows, int) and _src_rows != _rows else ""
+            )
+            _dropped = ""
+            _no_qty = int(_summary.get("no_qty_rows") or 0)
+            if _no_qty:
+                _dropped += (
+                    f"  \n⏭️ _{_no_qty} row(s) had no BUILD QTY and were skipped; "
+                    f"0 units lost._"
+                )
+            _other = int(_summary.get("other_location_rows") or 0)
+            if _other:
+                _dropped += (
+                    f"  \n🏭 _{_other} row(s) tagged for another plant were left "
+                    f"out — tick **Count rows tagged for another plant** above "
+                    f"to include them._"
+                )
+            # Which file this is. A fresh session opens on the facility's
+            # newest saved schedule, so say that it was picked automatically
+            # and how to change it; a facility with no saved schedules gets
+            # the sample, and says so.
+            _name = _summary.get("name")
+            _which = ""
+            if _summary.get("source") == "saved" and _name:
+                if _summary.get("auto_loaded"):
+                    _which = (
+                        f"  \n📂 _**{_name}** — the newest schedule saved for "
+                        f"{_summary.get('location', 'this facility')}, loaded "
+                        f"automatically. Upload a file, or pick another in "
+                        f"**📂 Save / load uploaded schedules**._"
+                    )
+                else:
+                    _which = f"  \n📂 _Saved schedule **{_name}**._"
+            elif _summary.get("source") == "upload" and _name:
+                _which = f"  \n📄 _**{_name}**_"
+            elif _summary.get("source") == "bundled":
+                _which = (
+                    f"  \nℹ️ _No saved schedules for "
+                    f"{_summary.get('location', 'this facility')} yet, so this is "
+                    f"the bundled May 2026 sample schedule. Upload a file, or save "
+                    f"one in **📂 Save / load uploaded schedules**._"
+                )
+            st.success(
+                f"✅ Loaded **{_rows}**{_of} rows from "
+                f"**{_summary.get('location', '?')}** "
+                f"· month **{_shown_month}**{_csv_note} "
+                f"({_src_label})"
+                + _which
+                + _auto_suffix
+                + _dropped
+            )
+            # Placeholder recovery — rows that had a BUILD QTY but no FG SKU ID
+            # were auto-mapped to a catalog estimation placeholder (so they're
+            # counted), or — if no placeholder matched their MODEL TYPE — still
+            # dropped. Warn the planner about both so the count is never a
+            # silent surprise.
+            _rec = _summary.get("recovered")
+            if isinstance(_rec, dict):
+                _by = _rec.get("by_model") or {}
+                if _rec.get("count") and _by:
+                    _accm = _rec.get("acc_by_model") or {}
+                    _parts = []
+                    for _m, (_sku, _n) in _by.items():
+                        _acc = _accm.get(_m)
+                        _acc_txt = f" + `{_acc[0]}`" if _acc else ""
+                        _parts.append(f"{_n}× **{_m}** → `{_sku}`{_acc_txt}")
+                    _lines = "; ".join(_parts)
+                    _acc_note = (
+                        " Accessory-side labor was estimated too."
+                        if _rec.get("acc_count") else ""
+                    )
+                    st.warning(
+                        f"⚠️ {_rec['count']} unit(s) had no FG SKU ID — "
+                        f"auto-assigned the catalog **estimation placeholder(s)** so "
+                        f"they're still counted ({_lines}).{_acc_note} Their labor is "
+                        f"an **estimate**; replace with real SKUs when available."
+                    )
+                _unm = _rec.get("unmatched") or {}
+                if _unm:
+                    _ulines = "; ".join(f"{_n}× **{_m}**" for _m, _n in _unm.items())
+                    st.warning(
+                        f"⚠️ {sum(_unm.values())} unit(s) had no FG SKU ID **and** no "
+                        f"matching placeholder, so they were dropped ({_ulines}). "
+                        f"Add an `XXX` placeholder for these models (Data & Setup → "
+                        f"Machine catalog) or fill in real SKUs, then re-upload."
+                    )
+                # Rows with neither an FG SKU ID nor a MODEL TYPE can't be
+                # matched to anything, so they're dropped too. Warn separately —
+                # there's no model to add a placeholder for, so the only fix is
+                # to fill the row in — but never silently, or the plan total
+                # comes up short against the source file with no explanation.
+                _nomodel = int(_rec.get("no_model") or 0)
+                if _nomodel:
+                    st.warning(
+                        f"⚠️ {_nomodel} unit(s) had no **FG SKU ID** and no "
+                        f"**MODEL TYPE**, so there was nothing to identify them by "
+                        f"and they were dropped. Fill in either column and "
+                        f"re-upload to include them."
+                    )
+            # Undated units — rows with a valid SKU/qty but a blank or
+            # unrecognized PRODUCTION MONTH (e.g. "NEED SN/QA") were folded into
+            # the current plan month so they're counted, not silently dropped.
+            _uns = _summary.get("unscheduled")
+            if isinstance(_uns, dict) and _uns.get("count"):
+                _rlist = "; ".join(
+                    f"{_n}× {_r}" for _r, _n in (_uns.get("by_reason") or {}).items()
+                )
+                _rnote = f" ({_rlist})" if _rlist else ""
+                _amonth = _uns.get("assigned_month")
+                if _amonth:
+                    st.warning(
+                        f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION "
+                        f"MONTH** and were counted in **{_amonth}**{_rnote}. Fill "
+                        f"in their PRODUCTION MONTH to date them precisely."
+                    )
+                else:
+                    # No current-format plan month to anchor them to — they're
+                    # kept and counted, but stay undated on the calendar.
+                    st.warning(
+                        f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION "
+                        f"MONTH** and no current plan month to date them to"
+                        f"{_rnote}. They're still counted in the totals but remain "
+                        f"undated — fill in their PRODUCTION MONTH to place them."
+                    )
+            # Untagged location — rows with a valid SKU/qty but a blank LOCATION
+            # cell were folded into the active facility so they're counted, not
+            # silently dropped by the location filter.
+            # Rows tagged for a different plant that were folded into this one
+            # (the "Count rows tagged for another plant" checkbox). Always
+            # reported — this one moves units the LOCATION column explicitly
+            # assigned elsewhere, so it must never happen quietly.
+            _fgn = _summary.get("foreign_location")
+            if isinstance(_fgn, dict) and _fgn.get("count"):
+                _plist = "; ".join(
+                    f"{_n} tagged **{_p.title()}**"
+                    for _p, _n in (_fgn.get("by_location") or {}).items()
+                )
+                st.warning(
+                    f"🏭 {_fgn['count']} unit(s) tagged for another plant were "
+                    f"counted as **{_fgn.get('assigned_location') or location}** "
+                    f"({_plist}). Untick **Count rows tagged for another plant** "
+                    f"above if they should be excluded instead."
+                )
+
+            _loc = _summary.get("location_recovered")
+            if isinstance(_loc, dict) and _loc.get("count"):
+                _flist = "; ".join(
+                    f"{_n}× {_fg}" for _fg, _n in (_loc.get("by_fg") or {}).items()
+                )
+                _fnote = f" ({_flist})" if _flist else ""
+                st.warning(
+                    f"⚠️ {_loc['count']} unit(s) had a blank **LOCATION** and were "
+                    f"counted under **{_loc.get('assigned_location') or 'this facility'}**"
+                    f"{_fnote}. Set their LOCATION if any belong to a different plant."
+                )
+        elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
+            st.info("Using the bundled May 2026 sample schedule.")
+
+
 def render_sidebar() -> dict:
     st.sidebar.title("🏭 Labor Planning")
     st.sidebar.caption("Set up your scenario, then review tabs on the right.")
@@ -4725,12 +5205,15 @@ def render_sidebar() -> dict:
 
     uploaded = None
     manual_entries = None
+    upload_summary_slot = None
 
     if schedule_mode == SCHEDULE_MODE_UPLOAD:
         uploaded = st.sidebar.file_uploader(
             "Choose a CSV or Excel file",
             type=["csv", "xlsx", "xlsm"],
             help=(
+                "Until you upload a file, the newest schedule saved for this "
+                "facility is loaded (see the 📂 panel below). "
                 "CSV or Excel (.xlsx / .xlsm). For a workbook, the first sheet "
                 "whose header row carries the required columns is used — a "
                 "title row above the header, or the plan living on a later "
@@ -4766,8 +5249,10 @@ def render_sidebar() -> dict:
             ),
         )
         st.sidebar.caption(
-            "🔒 Uploaded schedules stay in your browser by default. "
-            "Use the 📂 panel below to save one to GitHub for the team."
+            "📂 The newest schedule saved for this facility loads first; "
+            "upload a file to analyse something else. "
+            "🔒 Uploaded schedules stay in your browser by default — "
+            "use the 📂 panel below to save one to GitHub for the team."
         )
         # A per-plant export can tag a row with the facility the unit is headed
         # to rather than the one building it (the Henderson sheet carries rows
@@ -4789,147 +5274,13 @@ def render_sidebar() -> dict:
         # Save / load / delete uploaded schedules (per-facility, shared)
         _render_uploaded_schedules_panel(location, uploaded)
 
-        # Validation summary — shows once a schedule has actually loaded.
-        # Cleared automatically when the next schedule load attempt happens.
-        _summary = st.session_state.get("_last_upload_summary")
-        if _summary and isinstance(_summary, dict):
-            _src_label = {
-                "upload":  "uploaded CSV",
-                "saved":   "saved schedule",
-                "bundled": "bundled sample",
-            }.get(_summary.get("source", ""), "schedule")
-            if _summary.get("source") == "upload" and _summary.get("sheet"):
-                _src_label = f"uploaded Excel · sheet `{_summary['sheet']}`"
-            _auto = _summary.get("auto_spread")
-            _auto_suffix = ""
-            if isinstance(_auto, dict) and _auto.get("count"):
-                _auto_month = _auto.get("target_month_label", "")
-                _across = f"across **{_auto_month}** " if _auto_month else ""
-                _auto_suffix = (
-                    f"  \n📅 _Auto-leveled {_auto['count']} of "
-                    f"{_auto['total_rows']} undated rows {_across}"
-                    f"({_auto['working_days']} working days)._"
-                )
-            # Note the CSV's own month when it differs from the Plan month, so
-            # the planner understands why (e.g. a May export planned for June).
-            _csv_month = _summary.get("csv_month", "")
-            _shown_month = _summary.get("month", "—")
-            _csv_note = ""
-            if _csv_month and _csv_month not in ("—", _shown_month):
-                _csv_note = f" _(CSV says {_csv_month})_"
-            st.sidebar.success(
-                f"✅ Loaded **{_summary.get('rows', '?')}** rows from "
-                f"**{_summary.get('location', '?')}** "
-                f"· month **{_shown_month}**{_csv_note} "
-                f"({_src_label})"
-                + _auto_suffix
-            )
-            # Placeholder recovery — rows that had a BUILD QTY but no FG SKU ID
-            # were auto-mapped to a catalog estimation placeholder (so they're
-            # counted), or — if no placeholder matched their MODEL TYPE — still
-            # dropped. Warn the planner about both so the count is never a
-            # silent surprise.
-            _rec = _summary.get("recovered")
-            if isinstance(_rec, dict):
-                _by = _rec.get("by_model") or {}
-                if _rec.get("count") and _by:
-                    _accm = _rec.get("acc_by_model") or {}
-                    _parts = []
-                    for _m, (_sku, _n) in _by.items():
-                        _acc = _accm.get(_m)
-                        _acc_txt = f" + `{_acc[0]}`" if _acc else ""
-                        _parts.append(f"{_n}× **{_m}** → `{_sku}`{_acc_txt}")
-                    _lines = "; ".join(_parts)
-                    _acc_note = (
-                        " Accessory-side labor was estimated too."
-                        if _rec.get("acc_count") else ""
-                    )
-                    st.sidebar.warning(
-                        f"⚠️ {_rec['count']} unit(s) had no FG SKU ID — "
-                        f"auto-assigned the catalog **estimation placeholder(s)** so "
-                        f"they're still counted ({_lines}).{_acc_note} Their labor is "
-                        f"an **estimate**; replace with real SKUs when available."
-                    )
-                _unm = _rec.get("unmatched") or {}
-                if _unm:
-                    _ulines = "; ".join(f"{_n}× **{_m}**" for _m, _n in _unm.items())
-                    st.sidebar.warning(
-                        f"⚠️ {sum(_unm.values())} unit(s) had no FG SKU ID **and** no "
-                        f"matching placeholder, so they were dropped ({_ulines}). "
-                        f"Add an `XXX` placeholder for these models (Data & Setup → "
-                        f"Machine catalog) or fill in real SKUs, then re-upload."
-                    )
-                # Rows with neither an FG SKU ID nor a MODEL TYPE can't be
-                # matched to anything, so they're dropped too. Warn separately —
-                # there's no model to add a placeholder for, so the only fix is
-                # to fill the row in — but never silently, or the plan total
-                # comes up short against the source file with no explanation.
-                _nomodel = int(_rec.get("no_model") or 0)
-                if _nomodel:
-                    st.sidebar.warning(
-                        f"⚠️ {_nomodel} unit(s) had no **FG SKU ID** and no "
-                        f"**MODEL TYPE**, so there was nothing to identify them by "
-                        f"and they were dropped. Fill in either column and "
-                        f"re-upload to include them."
-                    )
-            # Undated units — rows with a valid SKU/qty but a blank or
-            # unrecognized PRODUCTION MONTH (e.g. "NEED SN/QA") were folded into
-            # the current plan month so they're counted, not silently dropped.
-            _uns = _summary.get("unscheduled")
-            if isinstance(_uns, dict) and _uns.get("count"):
-                _rlist = "; ".join(
-                    f"{_n}× {_r}" for _r, _n in (_uns.get("by_reason") or {}).items()
-                )
-                _rnote = f" ({_rlist})" if _rlist else ""
-                _amonth = _uns.get("assigned_month")
-                if _amonth:
-                    st.sidebar.warning(
-                        f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION "
-                        f"MONTH** and were counted in **{_amonth}**{_rnote}. Fill "
-                        f"in their PRODUCTION MONTH to date them precisely."
-                    )
-                else:
-                    # No current-format plan month to anchor them to — they're
-                    # kept and counted, but stay undated on the calendar.
-                    st.sidebar.warning(
-                        f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION "
-                        f"MONTH** and no current plan month to date them to"
-                        f"{_rnote}. They're still counted in the totals but remain "
-                        f"undated — fill in their PRODUCTION MONTH to place them."
-                    )
-            # Untagged location — rows with a valid SKU/qty but a blank LOCATION
-            # cell were folded into the active facility so they're counted, not
-            # silently dropped by the location filter.
-            # Rows tagged for a different plant that were folded into this one
-            # (the "Count rows tagged for another plant" checkbox). Always
-            # reported — this one moves units the LOCATION column explicitly
-            # assigned elsewhere, so it must never happen quietly.
-            _fgn = _summary.get("foreign_location")
-            if isinstance(_fgn, dict) and _fgn.get("count"):
-                _plist = "; ".join(
-                    f"{_n} tagged **{_p.title()}**"
-                    for _p, _n in (_fgn.get("by_location") or {}).items()
-                )
-                st.sidebar.warning(
-                    f"🏭 {_fgn['count']} unit(s) tagged for another plant were "
-                    f"counted as **{_fgn.get('assigned_location') or location}** "
-                    f"({_plist}). Untick **Count rows tagged for another plant** "
-                    f"above if they should be excluded instead."
-                )
-
-            _loc = _summary.get("location_recovered")
-            if isinstance(_loc, dict) and _loc.get("count"):
-                _flist = "; ".join(
-                    f"{_n}× {_fg}" for _fg, _n in (_loc.get("by_fg") or {}).items()
-                )
-                _fnote = f" ({_flist})" if _flist else ""
-                st.sidebar.warning(
-                    f"⚠️ {_loc['count']} unit(s) had a blank **LOCATION** and were "
-                    f"counted under **{_loc.get('assigned_location') or 'this facility'}**"
-                    f"{_fnote}. Set their LOCATION if any belong to a different plant."
-                )
-        elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
-            st.sidebar.info("Using the bundled May 2026 sample schedule.")
+        # Confirmation pill + dropped / rescued-unit warnings. The sidebar runs
+        # BEFORE main() loads the schedule, so drawing them here described the
+        # previous run's schedule: right after an upload or a 📥 Load the pill
+        # still showed the old file's row count, and the warnings that explain
+        # a short total were one click behind. main() fills this slot once the
+        # schedule for this run is known — see _render_upload_summary.
+        upload_summary_slot = st.sidebar.container()
     else:
         # Manual mode — auto-spread runs in main() so dates land on the
         # manual rows automatically; the time-window radio below works
@@ -5027,7 +5378,7 @@ def render_sidebar() -> dict:
         if (_manual_row_has_content(shown_entries).tolist()
                 != _manual_row_has_content(manual_entries).tolist()):
             st.session_state[rev_key] = st.session_state.get(rev_key, 0) + 1
-            st.rerun()
+            _defer_rerun()
 
     # Plan month — the authoritative month for the whole tool. It drives:
     #   • where auto-spread drops undated rows (target month),
@@ -5036,29 +5387,42 @@ def render_sidebar() -> dict:
     # Rows whose PRODUCTION DAY falls in a different month still keep their
     # dates, but the page warns the planner they fall outside this month.
     _now = now_local()
-    # Rolling window: 2 months back → 12 months forward, current month first.
-    _month_opts: list[tuple[int, int]] = []
-    for _delta in range(-2, 13):
-        _m = _now.month - 1 + _delta
-        _y = _now.year + _m // 12
-        _month_opts.append((_y, _m % 12 + 1))
-    _month_labels = {
-        (y, m): f"{calendar.month_name[m]} {y}" for (y, m) in _month_opts
-    }
-    _default_idx = _month_opts.index((_now.year, _now.month))
+    # Seed the picker's state BEFORE the selectbox is built — the one moment a
+    # keyed widget's value may be set from code. A main-body button ("📆 Plan
+    # August 2026 instead") that wants to switch the month leaves its request
+    # in PLAN_MONTH_SEED_KEY and reruns; otherwise the current month is seeded
+    # the first time, or whenever the widget's state is gone (the same way the
+    # working-day count is seeded). The widget therefore takes no `index=`:
+    # its state is always present, and always one of its options.
+    _seed = st.session_state.pop(PLAN_MONTH_SEED_KEY, None)
+    _cur = _seed if _seed is not None else st.session_state.get(PLAN_MONTH_KEY)
+    try:
+        _cur = (int(_cur[0]), int(_cur[1]))
+        if not 1 <= _cur[1] <= 12:
+            raise ValueError(_cur)
+    except (TypeError, ValueError, IndexError):
+        _cur = (_now.year, _now.month)
+    if st.session_state.get(PLAN_MONTH_KEY) != _cur:
+        st.session_state[PLAN_MONTH_KEY] = _cur
+    # The rolling 2-back / 12-forward window is the default list; the loaded
+    # schedule's own months and the current selection are always on it too,
+    # so a schedule older than the window can still be planned as its month.
+    _month_opts = _plan_month_options(
+        _now,
+        extra=[_cur, *(st.session_state.get(SCHEDULE_MONTHS_KEY) or [])],
+    )
     plan_month = st.sidebar.selectbox(
         "Plan month",
         _month_opts,
-        index=_default_idx,
-        format_func=lambda ym: _month_labels[ym],
-        key="plan_month_select",
+        format_func=_month_label,
+        key=PLAN_MONTH_KEY,
         help=(
             "The month this plan is for. Sets how the Calendar splits weeks "
             "(Monday–Friday) and where undated rows get auto-scheduled. "
             "Change this to plan a different month — e.g. pick *June 2026*."
         ),
     )
-    plan_month_label = _month_labels[plan_month]
+    plan_month_label = _month_label(plan_month)
     _plan_working_days = _working_days_in_month(plan_month[0], plan_month[1])
     st.sidebar.caption(
         f"📅 **{plan_month_label}** — {len(_plan_working_days)} working days "
@@ -5116,10 +5480,7 @@ def render_sidebar() -> dict:
             _target_days = max(1, sum(1 for d in _plan_working_days if d >= _today))
         else:
             _target_days = _pm_working_days
-        _work_days_sig = (plan_month, time_window, _today_in_plan_month)
-        if st.session_state.get("_work_days_synced_sig") != _work_days_sig:
-            st.session_state["work_days_input"] = _target_days
-            st.session_state["_work_days_synced_sig"] = _work_days_sig
+        _sync_working_days(_target_days, (plan_month, time_window, _today_in_plan_month))
         days = st.number_input(
             "Working days in the period",
             min_value=1, max_value=31,
@@ -5384,8 +5745,14 @@ def render_sidebar() -> dict:
     with st.sidebar.expander("⚙️ Admin", expanded=False):
         _render_admin_panel()
 
+    # A sidebar button that asked for a rerun gets it now: every sidebar
+    # widget above has been built in this run, so none of them loses its
+    # state (see _defer_rerun).
+    _flush_deferred_rerun()
+
     return {
         "uploaded": uploaded,
+        "upload_summary_slot": upload_summary_slot,
         "manual_entries": manual_entries,
         "schedule_mode": schedule_mode,
         "location": location,
@@ -10953,6 +11320,8 @@ TAB_LABELS = (
     TAB_RECOMMENDATIONS, TAB_BUILD_TIME, TAB_PROCESS_FLOW, TAB_DATA_SETUP,
 )
 ACTIVE_TAB_KEY = "_active_tab"
+# Non-widget mirror of the strip's choice (see _render_tab_strip).
+ACTIVE_TAB_MIRROR_KEY = "_active_tab_last"
 
 
 def _render_tab_strip() -> str:
@@ -10966,15 +11335,24 @@ def _render_tab_strip() -> str:
     would make Streamlit warn that the value was set twice). Widgets inside a
     tab that isn't showing are not instantiated, so their state resets when
     the planner comes back — the Data & Setup view picker remembers itself via
-    ``_remember_data_setup_view`` for exactly that reason.
+    ``_remember_data_setup_view`` for exactly that reason. The strip remembers
+    itself the same way (``ACTIVE_TAB_MIRROR_KEY``): a rerun raised before it
+    is built — Sequencer ✅ Accept, 📅 Move into plan month, ➕ Import — wipes
+    its widget state, and without the mirror every one of those bounced the
+    planner back to Overview.
     """
     if st.session_state.get(ACTIVE_TAB_KEY) not in TAB_LABELS:
-        st.session_state[ACTIVE_TAB_KEY] = TAB_OVERVIEW
+        _last = st.session_state.get(ACTIVE_TAB_MIRROR_KEY)
+        st.session_state[ACTIVE_TAB_KEY] = (
+            _last if _last in TAB_LABELS else TAB_OVERVIEW
+        )
     choice = st.segmented_control(
         "Section", TAB_LABELS, selection_mode="single", required=True,
         key=ACTIVE_TAB_KEY, label_visibility="collapsed", width="stretch",
     )
-    return choice if choice in TAB_LABELS else TAB_OVERVIEW
+    choice = choice if choice in TAB_LABELS else TAB_OVERVIEW
+    st.session_state[ACTIVE_TAB_MIRROR_KEY] = choice
+    return choice
 
 
 def main():
@@ -11065,12 +11443,19 @@ def main():
                 "You can still use **📁 Data & Setup** to browse and edit catalogs."
             )
             schedule_df = pd.DataFrame()
+            # The pill must never describe a schedule that didn't load.
+            st.session_state.pop("_last_upload_summary", None)
         if schedule_df.empty and not empty_banner_msg:
             empty_banner_msg = (
                 f"⚠️ No schedule rows found for **{inputs['location']}**. "
                 "Upload a CSV that contains this location, or select a different location. "
                 "You can still use **📁 Data & Setup** to edit catalogs."
             )
+        # The schedule for THIS run is now known — fill the sidebar's
+        # confirmation pill (and its dropped / rescued-unit warnings) with it.
+        _render_upload_summary(
+            inputs.get("upload_summary_slot"), inputs["location"], inputs["uploaded"],
+        )
 
     # ----------------------------------------------------------------
     # Sequencer — Suggest button + accept/discard preview. Renders an
@@ -11307,15 +11692,61 @@ def main():
     if _plan_ym is not None and not schedule_df_full.empty:
         _plan_lbl = inputs.get("plan_month_label", "the selected month")
         _n_move, _carry_total = _plan_month_transfer_counts(schedule_df_full, _plan_ym)
+        # The month the schedule itself is for (PRODUCTION MONTH, by units).
+        # When it isn't the Plan month, offer to plan THAT month instead — the
+        # one-click answer to "switch the Plan month in the sidebar", beside
+        # the more invasive Move. Never automatic: a May export planned for
+        # June is a real case. The button can't set the picker directly (the
+        # sidebar built it already this run), so it leaves a seed the picker
+        # consumes on the rerun — see PLAN_MONTH_SEED_KEY.
+        _sched_ym = _schedule_dominant_month(schedule_df_full)
+        _offer_switch = (
+            _sched_ym is not None
+            and (int(_sched_ym[0]), int(_sched_ym[1]))
+            != (int(_plan_ym[0]), int(_plan_ym[1]))
+        )
+        _sched_lbl = _month_label(_sched_ym) if _offer_switch else ""
+
+        def _switch_plan_month_button(container, stretch: bool) -> None:
+            kwargs = {"width": "stretch"} if stretch else {}
+            if container.button(
+                f"📆 Plan {_sched_lbl} instead",
+                help=(
+                    f"The schedule's own PRODUCTION MONTH is {_sched_lbl}. Sets "
+                    "the sidebar's Plan month to it; the working-day count, the "
+                    "Calendar's weeks and where undated rows are auto-leveled "
+                    "all follow. Nothing in the schedule itself changes."
+                ),
+                key="plan_schedule_month_btn",
+                **kwargs,
+            ):
+                st.session_state[PLAN_MONTH_SEED_KEY] = (
+                    int(_sched_ym[0]), int(_sched_ym[1]),
+                )
+                _track_and_flush(
+                    "plan_month_follow_schedule",
+                    facility=inputs.get("location"), month=_sched_lbl,
+                )
+                st.rerun()
+
         if _n_move:
+            _or_switch = (
+                f", or plan **{_sched_lbl}** instead if that is the month this "
+                "file is for"
+                if _offer_switch else
+                ", or switch the **Plan month** in the sidebar to match the data"
+            )
             st.warning(
                 f"📆 **{_n_move} row(s) aren't on the {_plan_lbl} calendar** — "
                 "they're dated in another month or carried over from an earlier "
                 "month, so they won't show here or count toward this month's "
-                "load. Move them in, or switch the **Plan month** in the sidebar "
-                "to match the data."
+                f"load. Move them in{_or_switch}."
             )
-            if st.button(
+            if _offer_switch:
+                _c_move, _c_switch = st.columns(2)
+            else:
+                _c_move, _c_switch = st.container(), None
+            if _c_move.button(
                 f"📅 Move {_n_move} row(s) into {_plan_lbl}",
                 type="primary",
                 help=(
@@ -11326,6 +11757,7 @@ def main():
                     "built first."
                 ),
                 key="move_into_plan_month_btn",
+                width="stretch",
             ):
                 try:
                     _new_df, _n = _transfer_to_plan_month(
@@ -11348,10 +11780,30 @@ def main():
                         st.info("Nothing to move — all rows already in the plan month.")
                 except Exception as e:
                     st.error(f"❌ Move failed: {e}")
+            if _c_switch is not None:
+                _switch_plan_month_button(_c_switch, stretch=True)
         elif _carry_total:
+            _note = (
+                f" The file itself is dated **{_sched_lbl}** — plan that month "
+                f"instead if this is the {_sched_lbl} schedule."
+                if _offer_switch else ""
+            )
             st.caption(
                 f"📦 {_carry_total} carryover unit(s) — all scheduled in {_plan_lbl}. ✅"
+                + _note
             )
+            if _offer_switch:
+                _switch_plan_month_button(st, stretch=False)
+        elif _offer_switch:
+            # Every row is on this month's calendar and nothing carried over,
+            # yet the file says it is for a different (later) month — say so,
+            # and offer that month, instead of leaving "(CSV says …)" on the
+            # pill as the only hint.
+            st.caption(
+                f"📆 The file itself is dated **{_sched_lbl}**; it is being "
+                f"planned as {_plan_lbl}."
+            )
+            _switch_plan_month_button(st, stretch=False)
 
     _skipped_fg: list = []
     _unknown_acc: list = []

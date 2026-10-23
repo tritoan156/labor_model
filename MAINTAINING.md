@@ -72,6 +72,16 @@ If you forget, a warm Streamlit process keeps serving the cached frame with
 the old columns until the CSV itself changes on disk (an in-app 💾 Save) or
 the Cloud container recycles.
 
+**Catalog CSV saves are mirrored into `data/`.** `core.catalog_storage.
+save_catalog_to_github` writes the text it just pushed to the container's
+`data/<name>.csv` (`mirror_csv_locally`; the JSON stores have always done the
+same), so the mtime-keyed loaders re-read it on the next run and a labor
+edit, an added SKU or a missing-SKU import is in use in the session at once.
+Other users still see it after the redeploy — which is what the save
+confirmations now say. `conftest.py` points `catalog_storage.REPO_ROOT` at a
+temp folder for every test, so a save path driven with a stubbed GitHub can't
+rewrite the tracked catalogs.
+
 **Don't rename the cache arguments with a leading underscore.** Streamlit
 skips `_`-prefixed parameters when building the `st.cache_data` key, and a
 parameter's default value is never part of the key either. The loaders used to
@@ -160,6 +170,15 @@ then. A widget inside `render_sidebar` is built before the deferred rerun
 fires, so it needs nothing extra; a widget outside it that must survive a
 rerun raised before it is built (the strip, a tab body's own picker) needs a
 non-widget mirror like `_remember_data_setup_view`.
+
+**Main-panel buttons that change a widget built elsewhere** (the plan guide,
+the Overview's action buttons) can't set it directly — the sidebar built its
+widgets before main() ran, and the strip / tab bodies are built after the
+button. They leave a one-shot *seed* and rerun; the widget consumes the seed
+right before it is built: `PLAN_MONTH_SEED_KEY` (the Plan month picker),
+`ACTIVE_TAB_SEED_KEY` (the tab strip), `CREW_EXPANDER_SEED_KEY` (the stateful
+👥 Station headcount expander), and `_data_setup_view_last` with the widget
+key popped (the Data & Setup view radio). `_jump_to` does all of this.
 
 ---
 

@@ -262,7 +262,7 @@ class TestReshapeHistory:
             src = inspect.getsource(fn)
             assert '"_loaded_schedule_buffer"] = io.BytesIO' not in src, fn.__name__
         assert "_commit_reshape(" in inspect.getsource(app._render_bulk_move_form)
-        assert "_commit_reshape(" in inspect.getsource(app.main)
+        assert "_commit_reshape(" in inspect.getsource(app._guide_month_step)
         # The sidebar's 📥 Load still defers its rerun; the queue half is shared.
         src = inspect.getsource(app._uploaded_schedule_load)
         assert "st.rerun(" not in src and "_queue_saved_schedule_load" in src

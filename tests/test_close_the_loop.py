@@ -165,10 +165,11 @@ class TestImportClosesTheLoop:
         """The handler stashes its outcome and reruns, so the warning above it
         is rebuilt from the catalogs as they are now and the message survives."""
         import inspect
-        src = inspect.getsource(app.main)
+        src = inspect.getsource(app._import_missing_skus_now)
         assert '"_import_toast"' in src
         assert "their units count now" in src
         assert "after the app redeploys" not in src
+        assert '"_import_toast"' in inspect.getsource(app._render_plan_guide)
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +215,9 @@ class TestMissingCatalogSkus:
 
     def test_main_uses_it_for_the_import_block(self):
         import inspect
-        src = inspect.getsource(app.main)
+        src = inspect.getsource(app._guide_catalog_step)
         assert "_missing_catalog_skus(schedule_df_full, machine_df, acc_df)" in src
-        assert 'units.attrs.get("skipped_fg"' not in src
+        assert 'units.attrs.get("skipped_fg"' not in inspect.getsource(app.main)
 
 
 # ---------------------------------------------------------------------------

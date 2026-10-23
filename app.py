@@ -5013,18 +5013,10 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
             }.get(_summary.get("source", ""), "schedule")
             if _summary.get("source") == "upload" and _summary.get("sheet"):
                 _src_label = f"uploaded Excel · sheet `{_summary['sheet']}`"
-            _auto = _summary.get("auto_spread")
-            _auto_suffix = ""
-            if isinstance(_auto, dict) and _auto.get("count"):
-                _auto_month = _auto.get("target_month_label", "")
-                _across = f"across **{_auto_month}** " if _auto_month else ""
-                _auto_suffix = (
-                    f"  \n📅 _Auto-leveled {_auto['count']} of "
-                    f"{_auto['total_rows']} undated rows {_across}"
-                    f"({_auto['working_days']} working days)._"
-                )
             # Note the CSV's own month when it differs from the Plan month, so
             # the planner understands why (e.g. a May export planned for June).
+            # (Auto-leveled dates are reported once, in the main panel's
+            # Schedule notes, not repeated here.)
             _csv_month = _summary.get("csv_month", "")
             _shown_month = _summary.get("month", "—")
             _csv_note = ""
@@ -5033,7 +5025,7 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
             # "Loaded 277 of 288 rows", then one line per reason a row the
             # file had isn't in the plan, so the two numbers reconcile without
             # opening the CSV. (Rows with a quantity but no SKU are covered by
-            # the placeholder warnings below, in units.)
+            # the placeholder notes below, in units.)
             _rows = _summary.get("rows", "?")
             _src_rows = _summary.get("source_rows")
             _of = (
@@ -5050,24 +5042,17 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
             _other = int(_summary.get("other_location_rows") or 0)
             if _other:
                 _dropped += (
-                    f"  \n🏭 _{_other} row(s) tagged for another plant were left "
-                    f"out — tick **Count rows tagged for another plant** above "
-                    f"to include them._"
+                    f"  \n🏭 _{_other} row(s) for another plant left out — tick "
+                    f"the box above to count them._"
                 )
             # Which file this is. A fresh session opens on the facility's
-            # newest saved schedule, so say that it was picked automatically
-            # and how to change it; a facility with no saved schedules gets
-            # the sample, and says so.
+            # newest saved schedule, so say that it was picked automatically;
+            # a facility with no saved schedules gets the sample, and says so.
             _name = _summary.get("name")
             _which = ""
             if _summary.get("source") == "saved" and _name:
                 if _summary.get("auto_loaded"):
-                    _which = (
-                        f"  \n📂 _**{_name}** — the newest schedule saved for "
-                        f"{_summary.get('location', 'this facility')}, loaded "
-                        f"automatically. Upload a file, or pick another in "
-                        f"**📂 Save / load uploaded schedules**._"
-                    )
+                    _which = f"  \n📂 _**{_name}** — newest save, loaded automatically._"
                 else:
                     _which = f"  \n📂 _Saved schedule **{_name}**._"
             elif _summary.get("source") == "upload" and _name:
@@ -5075,9 +5060,8 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
             elif _summary.get("source") == "bundled":
                 _which = (
                     f"  \nℹ️ _No saved schedules for "
-                    f"{_summary.get('location', 'this facility')} yet, so this is "
-                    f"the bundled May 2026 sample schedule. Upload a file, or save "
-                    f"one in **📂 Save / load uploaded schedules**._"
+                    f"{_summary.get('location', 'this facility')} yet — this is "
+                    f"the bundled May 2026 sample._"
                 )
             st.success(
                 f"✅ Loaded **{_rows}**{_of} rows from "
@@ -5085,14 +5069,17 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
                 f"· month **{_shown_month}**{_csv_note} "
                 f"({_src_label})"
                 + _which
-                + _auto_suffix
                 + _dropped
             )
+            # Everything else the loader rescued or dropped, one short line
+            # each in ONE collapsed expander — they used to be up to six tall
+            # warning boxes in this narrow column. The count is on the label,
+            # so a short total is never a silent surprise.
+            _notes: list[str] = []
             # Placeholder recovery — rows that had a BUILD QTY but no FG SKU ID
             # were auto-mapped to a catalog estimation placeholder (so they're
             # counted), or — if no placeholder matched their MODEL TYPE — still
-            # dropped. Warn the planner about both so the count is never a
-            # silent surprise.
+            # dropped.
             _rec = _summary.get("recovered")
             if isinstance(_rec, dict):
                 _by = _rec.get("by_model") or {}
@@ -5103,38 +5090,27 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
                         _acc = _accm.get(_m)
                         _acc_txt = f" + `{_acc[0]}`" if _acc else ""
                         _parts.append(f"{_n}× **{_m}** → `{_sku}`{_acc_txt}")
-                    _lines = "; ".join(_parts)
-                    _acc_note = (
-                        " Accessory-side labor was estimated too."
-                        if _rec.get("acc_count") else ""
-                    )
-                    st.warning(
-                        f"⚠️ {_rec['count']} unit(s) had no FG SKU ID — "
-                        f"auto-assigned the catalog **estimation placeholder(s)** so "
-                        f"they're still counted ({_lines}).{_acc_note} Their labor is "
-                        f"an **estimate**; replace with real SKUs when available."
+                    _notes.append(
+                        f"**{_rec['count']}** unit(s) with no FG SKU were counted "
+                        f"as **estimation placeholders** ({'; '.join(_parts)}) — "
+                        f"their labor is an estimate."
                     )
                 _unm = _rec.get("unmatched") or {}
                 if _unm:
                     _ulines = "; ".join(f"{_n}× **{_m}**" for _m, _n in _unm.items())
-                    st.warning(
-                        f"⚠️ {sum(_unm.values())} unit(s) had no FG SKU ID **and** no "
-                        f"matching placeholder, so they were dropped ({_ulines}). "
-                        f"Add an `XXX` placeholder for these models (Data & Setup → "
-                        f"Machine catalog) or fill in real SKUs, then re-upload."
+                    _notes.append(
+                        f"**{sum(_unm.values())}** unit(s) with no FG SKU and no "
+                        f"matching placeholder were **dropped** ({_ulines}). Add "
+                        f"an `XXX` placeholder in Data & Setup → Machine catalog."
                     )
                 # Rows with neither an FG SKU ID nor a MODEL TYPE can't be
-                # matched to anything, so they're dropped too. Warn separately —
-                # there's no model to add a placeholder for, so the only fix is
-                # to fill the row in — but never silently, or the plan total
-                # comes up short against the source file with no explanation.
+                # matched to anything, so they're dropped too — there's no model
+                # to add a placeholder for, so the only fix is to fill the row in.
                 _nomodel = int(_rec.get("no_model") or 0)
                 if _nomodel:
-                    st.warning(
-                        f"⚠️ {_nomodel} unit(s) had no **FG SKU ID** and no "
-                        f"**MODEL TYPE**, so there was nothing to identify them by "
-                        f"and they were dropped. Fill in either column and "
-                        f"re-upload to include them."
+                    _notes.append(
+                        f"**{_nomodel}** unit(s) with no FG SKU and no MODEL TYPE "
+                        f"were **dropped**. Fill in either column."
                     )
             # Undated units — rows with a valid SKU/qty but a blank or
             # unrecognized PRODUCTION MONTH (e.g. "NEED SN/QA") were folded into
@@ -5147,23 +5123,17 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
                 _rnote = f" ({_rlist})" if _rlist else ""
                 _amonth = _uns.get("assigned_month")
                 if _amonth:
-                    st.warning(
-                        f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION "
-                        f"MONTH** and were counted in **{_amonth}**{_rnote}. Fill "
-                        f"in their PRODUCTION MONTH to date them precisely."
+                    _notes.append(
+                        f"**{_uns['count']}** unit(s) with no valid PRODUCTION "
+                        f"MONTH were counted in **{_amonth}**{_rnote}."
                     )
                 else:
                     # No current-format plan month to anchor them to — they're
                     # kept and counted, but stay undated on the calendar.
-                    st.warning(
-                        f"⚠️ {_uns['count']} unit(s) had no valid **PRODUCTION "
-                        f"MONTH** and no current plan month to date them to"
-                        f"{_rnote}. They're still counted in the totals but remain "
-                        f"undated — fill in their PRODUCTION MONTH to place them."
+                    _notes.append(
+                        f"**{_uns['count']}** unit(s) with no valid PRODUCTION "
+                        f"MONTH are counted but undated{_rnote}."
                     )
-            # Untagged location — rows with a valid SKU/qty but a blank LOCATION
-            # cell were folded into the active facility so they're counted, not
-            # silently dropped by the location filter.
             # Rows tagged for a different plant that were folded into this one
             # (the "Count rows tagged for another plant" checkbox). Always
             # reported — this one moves units the LOCATION column explicitly
@@ -5174,32 +5144,34 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
                     f"{_n} tagged **{_p.title()}**"
                     for _p, _n in (_fgn.get("by_location") or {}).items()
                 )
-                st.warning(
-                    f"🏭 {_fgn['count']} unit(s) tagged for another plant were "
+                _notes.append(
+                    f"**{_fgn['count']}** unit(s) tagged for another plant were "
                     f"counted as **{_fgn.get('assigned_location') or location}** "
-                    f"({_plist}). Untick **Count rows tagged for another plant** "
-                    f"above if they should be excluded instead."
+                    f"({_plist}). Untick the box above to leave them out."
                 )
-
+            # Untagged location — rows with a valid SKU/qty but a blank LOCATION
+            # cell were folded into the active facility so they're counted, not
+            # silently dropped by the location filter.
             _loc = _summary.get("location_recovered")
             if isinstance(_loc, dict) and _loc.get("count"):
                 _flist = "; ".join(
                     f"{_n}× {_fg}" for _fg, _n in (_loc.get("by_fg") or {}).items()
                 )
                 _fnote = f" ({_flist})" if _flist else ""
-                st.warning(
-                    f"⚠️ {_loc['count']} unit(s) had a blank **LOCATION** and were "
+                _notes.append(
+                    f"**{_loc['count']}** unit(s) with a blank LOCATION were "
                     f"counted under **{_loc.get('assigned_location') or 'this facility'}**"
-                    f"{_fnote}. Set their LOCATION if any belong to a different plant."
+                    f"{_fnote}."
                 )
+            if _notes:
+                with st.expander(f"⚠️ {len(_notes)} note(s) on this file"):
+                    st.markdown("\n".join(f"- {_n}" for _n in _notes))
         elif uploaded is None and "_loaded_schedule_buffer" not in st.session_state:
             st.info("Using the bundled May 2026 sample schedule.")
 
 
 def render_sidebar() -> dict:
     st.sidebar.title("🏭 Labor Planning")
-    st.sidebar.caption("Set up your scenario, then review tabs on the right.")
-    st.sidebar.markdown("---")
 
     # ----------------------------------------------------------------
     # STEP 1 — Facility (always visible)
@@ -5221,6 +5193,7 @@ def render_sidebar() -> dict:
         "How would you like to enter the build plan?",
         [SCHEDULE_MODE_UPLOAD, SCHEDULE_MODE_MANUAL],
         index=0,
+        label_visibility="collapsed",
         help=(
             "Upload a full production schedule (CSV or Excel workbook) — best "
             "for monthly planning. Or paste a SKU list straight out of Excel "
@@ -5278,10 +5251,8 @@ def render_sidebar() -> dict:
             ),
         )
         st.sidebar.caption(
-            "📂 The newest schedule saved for this facility loads first; "
-            "upload a file to analyse something else. "
-            "🔒 Uploaded schedules stay in your browser by default — "
-            "use the 📂 panel below to save one to GitHub for the team."
+            "📂 The newest schedule saved for this facility loads first. "
+            "Uploads stay in your browser until you save one below."
         )
         # A per-plant export can tag a row with the facility the unit is headed
         # to rather than the one building it (the Henderson sheet carries rows
@@ -5315,9 +5286,8 @@ def render_sidebar() -> dict:
         # manual rows automatically; the time-window radio below works
         # for both modes.
         st.sidebar.caption(
-            "Enter FG SKU, Accessory SKU (optional), and Quantity for each row. "
-            "Already have the list in Excel? Use **📋 Paste a list from Excel** "
-            "below — or **📚 Browse catalog** to pick from the known SKUs."
+            "One row per FG SKU (accessory optional) — or paste the list from "
+            "Excel below."
         )
 
         # Cached loaders — same path as main(), no extra I/O
@@ -6592,9 +6562,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     total_units = len(units)
     if total_units == 0 or capacity is None or capacity.empty:
         st.info(
-            "ℹ️ **No schedule loaded.** Upload a CSV or type a few SKUs "
-            "in the sidebar to see your plan's capacity picture and "
-            "recommended actions."
+            "ℹ️ **No schedule loaded.** Upload a file or type SKUs in the sidebar."
         )
         return
 
@@ -6602,7 +6570,6 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # Compute headline numbers
     # =============================================================
     total_labor = int(units["total_labor"].sum())
-    total_batt = int(units["Bat"].where(units["Battery"] > 0, 0).sum())
     # Production HC drives the Required-HC gap; support (Lead/Other) is shown
     # separately so it never makes the plant look falsely overstaffed.
     production_hc, support_hc, total_hc = _split_crew_hc(inputs["crew_config"])
@@ -6614,50 +6581,41 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     over_stations = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
     no_station_list = capacity[capacity["overall_status"] == "🔴 NO STATION"].index.tolist()
     near_cap = capacity[capacity["overall_status"] == "🟠 NEAR-CAP"].index.tolist()
-    tight = capacity[capacity["overall_status"] == "🟡 TIGHT"].index.tolist()
-    ok_stations = capacity[capacity["overall_status"] == "🟢 OK"].index.tolist()
 
     # =============================================================
-    # Big status banner
+    # Layout — the answer first, the detail one click away. This tab used
+    # to stack ten sections (two KPI rows under their own headings, a
+    # paragraph-long bottleneck box, a heatmap, a card grid, a bar chart)
+    # between horizontal rules, so a planner read and scrolled before
+    # finding the verdict. Now: one status line, one KPI row, one
+    # bottleneck line, short actions, then the station / week / battery
+    # visuals behind tabs so only one of them is on screen at a time.
+    # Explanations live in the ⓘ tooltips.
     # =============================================================
     month_label = f" · {schedule_month}" if schedule_month else ""
     st.markdown(f"### {inputs['location']} Manufacturing{month_label}")
 
-    has_blocker = bool(over_stations or no_station_list)
-    has_warning = bool(near_cap)
-
-    if has_blocker:
-        blockers = []
+    if over_stations or no_station_list:
+        _blockers = []
         if over_stations:
-            blockers.append(f"{len(over_stations)} station(s) **over capacity** ({', '.join(over_stations)})")
+            _blockers.append(f"{len(over_stations)} station(s) over capacity")
         if no_station_list:
-            blockers.append(f"{len(no_station_list)} station(s) **not available** here ({', '.join(no_station_list)})")
-        st.error(
-            "🚨 **Action needed.** " + " · ".join(blockers)
-            + "\n\nSee the **Capacity** and **Recommendations** tabs for fixes."
-        )
-    elif has_warning:
+            _blockers.append(f"{len(no_station_list)} with no staff")
+        st.error("🚨 **Action needed** — " + ", ".join(_blockers) + ".")
+    elif near_cap:
         st.warning(
-            f"⚠️ **Watch closely.** {len(near_cap)} station(s) near capacity: "
-            f"**{', '.join(near_cap)}**. Small changes could push them over."
+            f"⚠️ **Watch closely** — {', '.join(near_cap)} "
+            f"{'is' if len(near_cap) == 1 else 'are'} near capacity."
         )
     else:
-        st.success("✅ **All clear.** Every station is within safe capacity for this plan.")
-
-    st.markdown("---")
+        st.success("✅ **All clear** — every station is within safe capacity.")
 
     # =============================================================
-    # Hero KPIs — planner's decision row
-    # ----------------------------------------------------------------
-    # Story arc: what was asked (Planned) → what's possible (Buildable)
-    # → the gap as % (Coverage) → workload context (Total work). The
-    # bottleneck station name lives in the single-line readout BELOW
-    # this row, not in a 5th KPI column — keeps the headline focused on
-    # the question "can I build this plan?" and avoids naming the
-    # bottleneck in 4 different places.
+    # KPI row — what was asked (Planned, with its total work) → what's possible
+    # (Buildable, with the gap and coverage % as its delta) → the people
+    # you have vs need. The bottleneck station is named once, in the line
+    # BELOW this row.
     # =============================================================
-    st.markdown("#### 📦 What this plan builds")
-
     # Buildable is LINE-AWARE: the plant runs parallel production lines
     # (Compressor / Generator / EBOSS / PM) whose outputs add up, so one line
     # isn't throttled by another line's bottleneck (e.g. PDS/compressor is not
@@ -6671,118 +6629,33 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     coverage_pct = (buildable_units / total_units * 100.0) if total_units > 0 else 0.0
     gap_units = buildable_units - total_units  # negative = short; positive = surplus
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(
+    # Four columns, not five: at a laptop width a fifth one truncated both its
+    # value and the labels. The plan's total work rides on Units planned as a
+    # grey note — it sizes the plan rather than deciding anything.
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
         "Units planned", f"{total_units:,}",
-        help="Total finished-good units in this schedule (or manual entry).",
-    )
-    c2.metric(
-        "Buildable units", f"{buildable_units:,}",
+        delta=f"{total_labor / 60.0:,.0f} p-hr of work",
+        delta_color="off", delta_arrow="off",
         help=(
-            "How many units of the current SKU mix the facility can build this "
-            "month. Summed across the parallel production lines (Compressor / "
-            "Generator / EBOSS / PM) — each scales to its OWN bottleneck, so one "
-            "line isn't throttled by another's constraint. See the per-line "
-            "breakdown below."
+            "Total finished-good units in this schedule (or manual entry). "
+            f"Total work across all stations: {_fmt_min_hr(total_labor)}."
         ),
     )
-    # Coverage delta-color: "normal" means a POSITIVE delta (surplus = more
-    # buildable than planned) renders green, and a NEGATIVE delta (short of
-    # plan = bad) renders red. That's the natural "growth is good" reading
-    # for this metric — we want planners to see red when they can't cover
-    # the plan and green when they have headroom.
-    c3.metric(
-        "Coverage", f"{coverage_pct:.0f}%",
-        delta=f"{gap_units:+,} vs plan",
+    # delta_color "normal": a surplus (positive gap) renders green, a
+    # shortfall (negative) red — red when the plan can't be covered.
+    k2.metric(
+        "Buildable units", f"{buildable_units:,}",
+        delta=f"{gap_units:+,} · {coverage_pct:.0f}% of plan",
         delta_color="normal",
         help=(
-            "Buildable ÷ Planned. <100% = the plan exceeds capacity at this "
-            "mix; ≥100% = you have headroom. The delta shows the unit gap."
+            "How many units of the current SKU mix the facility can build this "
+            "month, summed across the parallel production lines (Compressor / "
+            "Generator / EBOSS / PM) — each scales to its OWN bottleneck. The "
+            "delta is the gap to plan and the coverage (buildable ÷ planned)."
         ),
     )
-    _tl_min = int(round(float(total_labor or 0)))
-    _tl_hr = float(total_labor or 0) / 60.0
-    c4.metric(
-        "Total work", f"{_tl_min:,} p-min",
-        help="Total labor required across all stations, shown as person-minutes (with person-hours below).",
-    )
-    c4.caption(f"≈ {_tl_hr:,.1f} p-hr")
-
-    # Per-line breakdown — show how buildable decomposes across the parallel
-    # production lines (only meaningful when the plan spans more than one line).
-    _render_buildable_by_line(_bl, buildable_units)
-
-    if _excluded:
-        st.caption(
-            "⏸️ **Buildable** excludes "
-            + ", ".join(f"**{s}**" for s in _excluded)
-            + " (set in the sidebar → planning assumptions) — those stations "
-            "don't cap the count. They're still shown on the **Capacity** tab."
-        )
-
-    # ----------------------------------------------------------------
-    # Bottleneck line — single, definitive, sits right under the KPIs.
-    # Replaces the previous markdown headline + 2-metric Labor/Throughput
-    # row + caption (the data is preserved inline here).
-    # ----------------------------------------------------------------
-    _lu = float(_mu.get("labor_max_util_safe", 0) or 0)
-    _tu = float(_mu.get("thru_max_util_safe", 0) or 0)
-    _lm = int(_mu.get("labor_max_units", 0) or 0)
-    _tm = int(_mu.get("thru_max_units", 0) or 0)
-    _lb = _mu.get("labor_bottleneck", "") or "—"
-    _tb = _mu.get("thru_bottleneck", "") or "—"
-
-    if _mu["infeasible"]:
-        _ms = ", ".join(f"**{s}**" for s in _mu["missing_stations"])
-        _pm = int(_mu.get("potential_max_units", 0))
-        _pb = _mu.get("potential_bottleneck", "")
-        _pu = float(_mu.get("potential_util_safe", 0) or 0)
-        if _pm > 0 and _pb:
-            _ceiling = (
-                f" Once those are staffed, the next bottleneck would be "
-                f"**{_pb}** at {_pu:.0%} util — capping the mix at "
-                f"**{_pm:,} units**."
-            )
-        elif _pm > 0:
-            _ceiling = (
-                f" Once those are staffed, no other station is binding — "
-                f"the mix could go up to **{_pm:,} units**."
-            )
-        else:
-            _ceiling = ""
-        _one = len(_mu["missing_stations"]) == 1
-        st.error(
-            f"🏭 **Whole-mix cap: 0 units** — holding the current SKU mix in "
-            f"fixed proportion, {_ms} {'has' if _one else 'have'} no HC but this "
-            f"mix needs it, so the mix can't scale as a single block. "
-            f"(Lines that don't route through {'that station' if _one else 'those stations'} "
-            f"can still build — see the per-line **Buildable** breakdown above.) "
-            f"Add headcount in the 👥 **Station headcount** sidebar panel to "
-            f"unlock the full plan.{_ceiling}"
-        )
-    elif _mu.get("bottleneck"):
-        st.markdown(
-            f"🎯 **Bottleneck: {_mu['bottleneck']} · "
-            f"{_mu['max_util_safe']:.0%} util.** "
-            f"Labor cap: **{_lm:,}** ({_lb}) · "
-            f"Throughput cap: **{_tm:,}** ({_tb})."
-        )
-    else:
-        st.markdown(
-            f"🎯 **No binding station detected.** "
-            f"Mix scales freely — capacity headroom available."
-        )
-
-    st.caption(
-        "Scales the current SKU mix proportionally until any station hits "
-        "its safe capacity (HC × shift × days × efficiency × safety) or "
-        "throughput cap. Relieve the bottleneck by adding HC to that "
-        "station in the 👥 **Station headcount** panel."
-    )
-
-    st.markdown("#### 👥 Headcount picture")
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric(
+    k3.metric(
         "People you have", f"{production_hc}",
         help=(
             f"Production headcount across {active_stations} active stations."
@@ -6790,28 +6663,78 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
                "headcount." if support_hc else "")
         ),
     )
-    c6.metric(
+    if total_hc_gap > 0:
+        _hc_delta = f"+{total_hc_gap} short"
+    elif total_hc_gap < 0:
+        _hc_delta = f"-{abs(total_hc_gap)} spare"
+    else:
+        _hc_delta = None
+    k4.metric(
         "People you need", f"{total_required_hc}",
+        delta=_hc_delta,
+        delta_color="inverse",
         help=(
             f"Sum of headcount required at every station to meet this plan, "
             f"using your buffer ({inputs['safety']:.2f}) and "
-            f"productive-time settings ({inputs['efficiency']:.3f})."
+            f"productive-time settings ({inputs['efficiency']:.3f}). The delta "
+            "is the difference to the people you have."
         ),
     )
-    gap_label = "Short" if total_hc_gap > 0 else ("Surplus" if total_hc_gap < 0 else "Even")
-    c7.metric(
-        gap_label, f"{abs(total_hc_gap)}",
-        delta=f"{total_hc_gap:+d}" if total_hc_gap != 0 else None,
-        delta_color="inverse",
-        help="Difference between people you need and people you have.",
-    )
-    short_count = int((capacity["hc_gap"] > 0).sum())
-    c8.metric(
-        "Stations needing more people", f"{short_count}",
-        help="Stations where required headcount exceeds what you have today.",
-    )
 
-    st.markdown("---")
+    # ----------------------------------------------------------------
+    # Bottleneck line — single, definitive, sits right under the KPIs.
+    # ----------------------------------------------------------------
+    _how = (
+        "Scales the current SKU mix proportionally until any station hits its "
+        "safe capacity (HC × shift × days × efficiency × safety) or throughput "
+        "cap. Relieve the bottleneck by adding HC to that station in the "
+        "👥 Station headcount panel."
+    )
+    _lm = int(_mu.get("labor_max_units", 0) or 0)
+    _tm = int(_mu.get("thru_max_units", 0) or 0)
+    _lb = _mu.get("labor_bottleneck", "") or "—"
+    _tb = _mu.get("thru_bottleneck", "") or "—"
+    if _mu["infeasible"]:
+        _missing = list(_mu["missing_stations"])
+        _pm = int(_mu.get("potential_max_units", 0))
+        _pb = _mu.get("potential_bottleneck", "")
+        _pu = float(_mu.get("potential_util_safe", 0) or 0)
+        if _pm > 0 and _pb:
+            _next = f" Next limit once staffed: **{_pb}** at {_pu:.0%} ({_pm:,} units)."
+        elif _pm > 0:
+            _next = f" Once staffed, the mix could reach **{_pm:,} units**."
+        else:
+            _next = ""
+        st.markdown(
+            f"🎯 **Bottleneck: {', '.join(_missing)} "
+            f"{'has' if len(_missing) == 1 else 'have'} no staff**, so the whole "
+            f"mix can't scale.{_next}",
+            help=(
+                _how + " With an unstaffed station the mix can't scale as one "
+                "block (whole-mix cap 0), but lines that don't route through it "
+                "still count toward Buildable — see the per-line breakdown."
+            ),
+        )
+    elif _mu.get("bottleneck"):
+        st.markdown(
+            f"🎯 **Bottleneck: {_mu['bottleneck']} · "
+            f"{_mu['max_util_safe']:.0%} util** — labor cap {_lm:,} ({_lb}) · "
+            f"throughput cap {_tm:,} ({_tb}).",
+            help=_how,
+        )
+    else:
+        st.markdown("🎯 **No binding station** — the mix has headroom.", help=_how)
+
+    if _excluded:
+        st.caption(
+            "⏸️ Buildable ignores "
+            + ", ".join(f"**{s}**" for s in _excluded)
+            + " (⏱️ Working-time settings)."
+        )
+
+    # Per-line breakdown — show how buildable decomposes across the parallel
+    # production lines (only meaningful when the plan spans more than one line).
+    _render_buildable_by_line(_bl, buildable_units)
 
     # =============================================================
     # Proposed-schedule preview — Sequencer feature. When the planner has
@@ -6819,6 +6742,34 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # weekly heatmap side-by-side with the current one so the comparison
     # is glanceable.
     # =============================================================
+    def _make_heatmap(df_util, title=None):
+        # Clip the color scale at 1.5× so spikes don't wash out the lower end.
+        # zmin=0 keeps green visible; zmax=1.5 means anything ≥150% looks
+        # the same deep red — which is fine since that's "definitely red".
+        fig = px.imshow(
+            df_util,
+            text_auto=".0%",
+            color_continuous_scale=[
+                (0.00, "#16A34A"),  # green
+                (0.60, "#A3E635"),  # light green
+                (0.75, "#FACC15"),  # yellow
+                (0.90, "#F97316"),  # orange
+                (1.00, "#DC2626"),  # red
+            ],
+            zmin=0, zmax=1.5,
+            aspect="auto",
+            labels={"x": "Week", "y": "Station", "color": "Util %"},
+        )
+        layout = dict(
+            height=min(400, 60 + 28 * max(len(df_util.index), 1)),
+            margin=dict(l=4, r=4, t=40 if title else 8, b=4),
+            coloraxis_showscale=False,
+        )
+        if title:
+            layout["title"] = dict(text=title, font=dict(size=14))
+        fig.update_layout(**layout)
+        return fig
+
     _proposed = st.session_state.get("_proposed_schedule")
     if (
         isinstance(_proposed, pd.DataFrame) and not _proposed.empty
@@ -6841,35 +6792,8 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
         except Exception:
             proposed_util = None
         if proposed_util is not None and not proposed_util.empty:
-            st.markdown("#### 💡 Current vs proposed (side-by-side)")
-            st.caption(
-                "Left: your **current** weekly pressure. Right: the Sequencer's "
-                "**proposed** level-loaded version. Scroll up to ✅ Accept or 🚫 Discard."
-            )
-
-            def _make_heatmap(df_util, title):
-                fig = px.imshow(
-                    df_util,
-                    text_auto=".0%",
-                    color_continuous_scale=[
-                        (0.00, "#16A34A"),
-                        (0.60, "#A3E635"),
-                        (0.75, "#FACC15"),
-                        (0.90, "#F97316"),
-                        (1.00, "#DC2626"),
-                    ],
-                    zmin=0, zmax=1.5,
-                    aspect="auto",
-                    labels={"x": "Week", "y": "Station", "color": "Util %"},
-                )
-                fig.update_layout(
-                    title=dict(text=title, font=dict(size=14)),
-                    height=min(380, 60 + 26 * max(len(df_util.index), 1)),
-                    margin=dict(l=4, r=4, t=40, b=4),
-                    coloraxis_showscale=False,
-                )
-                return fig
-
+            st.markdown("#### 💡 Current vs proposed")
+            st.caption("✅ Accept or 🚫 Discard the proposal at the top of the page.")
             cL, cR = st.columns(2)
             with cL:
                 st.plotly_chart(
@@ -6883,56 +6807,12 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
                     width="stretch",
                     key="overview_heatmap_proposed",
                 )
-            st.markdown("---")
 
     # =============================================================
-    # Weekly utilization heatmap — STAGING / Step 1 of the time-dimension
-    # work. Renders only when the schedule has a PRODUCTION DAY column;
-    # otherwise the helper returns None and we skip it cleanly.
+    # Recommended actions — auto-generated from data, one short line each
     # =============================================================
-    if weekly_util is not None and not weekly_util.empty:
-        st.markdown("#### 📅 Weekly pressure")
-        st.caption(
-            "Labor utilization per station × week (at a 5-working-days-per-week "
-            "reference). Spot which week is the bottleneck even when the "
-            "whole-month view averages the pressure out."
-        )
-        # Clip the color scale at 1.5× so spikes don't wash out the lower end.
-        # zmin=0 keeps green visible; zmax=1.5 means anything ≥150% looks
-        # the same deep red — which is fine since that's "definitely red".
-        _hm = px.imshow(
-            weekly_util,
-            text_auto=".0%",
-            color_continuous_scale=[
-                (0.00, "#16A34A"),  # green
-                (0.60, "#A3E635"),  # light green
-                (0.75, "#FACC15"),  # yellow
-                (0.90, "#F97316"),  # orange
-                (1.00, "#DC2626"),  # red
-            ],
-            zmin=0, zmax=1.5,
-            aspect="auto",
-            labels={"x": "Week", "y": "Station", "color": "Util %"},
-        )
-        _hm.update_layout(
-            height=min(400, 60 + 28 * len(weekly_util.index)),
-            margin=dict(l=4, r=4, t=8, b=4),
-            coloraxis_showscale=False,
-        )
-        st.plotly_chart(
-            _hm, width="stretch",
-            key="overview_weekly_heatmap_full",
-        )
-        st.markdown("---")
-
-    # =============================================================
-    # Recommended actions — auto-generated from data
-    # =============================================================
-    st.markdown("#### 🎯 Recommended actions")
+    st.markdown("#### 🔧 Recommended actions")
     actions = []
-
-    # NOTE: empty-schedule guard now fires at the very top of the tab
-    # (returns before any KPI rendering), so we don't repeat it here.
 
     # Separate over-capacity stations into "throughput-only" vs "needs HC".
     # A red Overall status can come from labor demand exceeding headcount
@@ -6957,27 +6837,23 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # 1. Stations missing entirely (HC=0 with demand)
     if no_station_list:
         actions.append(
-            f"**Fix facility setup.** {len(no_station_list)} station(s) have demand but 0 headcount: "
-            f"{', '.join(no_station_list)}. Either add people in the sidebar or remove those units from the schedule."
+            f"**Staff {', '.join(no_station_list)}** — demand but no people "
+            "(or take those units off the schedule)."
         )
 
     # 2. Labor-driven over-capacity — name the per-station gap
     if labor_over_stations:
         parts = []
         for st_disp in labor_over_stations:
-            gap = 0
             try:
                 gap = int(capacity.loc[st_disp, "hc_gap"])
             except Exception:
                 gap = 0
-            if gap > 0:
-                parts.append(f"**~{gap} more at {st_disp}**")
-            else:
-                # Gap math couldn't pin it (rounding or no required_hc) — fall back to a generic call-out.
-                parts.append(f"**more capacity at {st_disp}**")
+            # Gap math couldn't pin it (rounding or no required_hc) — name the station alone.
+            parts.append(f"{st_disp} +{gap}" if gap > 0 else st_disp)
         actions.append(
-            f"**Add {', '.join(parts)}** to bring utilization below 100% (with your safety buffer). "
-            f"Alternatives: run overtime, extend working days, or defer some units."
+            f"**Add people:** {' · '.join(parts)} — or run overtime, add "
+            "working days, or defer units."
         )
 
     # 3. Throughput-driven over-capacity — different fix
@@ -6985,80 +6861,72 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
         # Battery Assembly is the canonical case (cell count × cycle time).
         if "Battery Assembly" in throughput_over_stations:
             actions.append(
-                "🔋 **Battery throughput is the bottleneck.** Add battery cells "
-                "(Stations/Cells) or extend working days — hiring more people at "
-                "Battery won't help, because the constraint is the assembly fixture cycle."
+                "🔋 **Add battery cells or working days** — Battery is limited "
+                "by the fixture cycle, not by people."
             )
             others = [s for s in throughput_over_stations if s != "Battery Assembly"]
         else:
             others = list(throughput_over_stations)
         if others:
             actions.append(
-                f"**Throughput is short at {', '.join(others)}** — these stations need more "
-                "parallel cells (Stations/Cells in the sidebar) or longer working days. "
-                "Adding labor without more cells won't move the cycle."
+                f"**Add cells or working days at {', '.join(others)}** — more "
+                "people won't speed up the cycle."
             )
 
     # 4. Headcount short overall (but no station is individually red)
     if total_hc_gap > 0 and not labor_over_stations:
-        actions.append(
-            f"**Plan to add ~{total_hc_gap} people** across the line to comfortably hit this plan."
-        )
+        actions.append(f"**Add ~{total_hc_gap} people** across the line.")
 
     # 5. Near-cap warnings (only when nothing is already red)
     if near_cap and not over_stations:
-        actions.append(
-            f"**Monitor {', '.join(near_cap)}** — these are 90%+ utilized and risky for any schedule change."
-        )
+        actions.append(f"**Watch {', '.join(near_cap)}** — 90%+ loaded.")
 
     # 6. Surplus
     if total_hc_gap < -3:
         idle = capacity[capacity["labor_util_safe"] < 0.5].index.tolist()
         if idle:
             actions.append(
-                f"**Surplus capacity at {', '.join(idle[:3])}** — consider cross-training "
-                f"these {abs(total_hc_gap)} people to support bottleneck stations."
+                f"**Spare capacity at {', '.join(idle[:3])}** — cross-train "
+                "people toward the bottleneck."
             )
 
     if not actions:
-        actions.append("✅ **No action needed** — this plan is well-balanced. Maintain current staffing.")
+        actions.append("✅ **No action needed** — maintain current staffing.")
 
-    for i, action in enumerate(actions, 1):
-        st.markdown(f"{i}. {action}")
-
-    st.markdown("---")
+    st.markdown("\n".join(f"{i}. {a}" for i, a in enumerate(actions, 1)))
 
     # =============================================================
-    # Station status — colored cards instead of a dense table
+    # Visuals — one on screen at a time
     # =============================================================
-    st.markdown("#### 📊 Station status at a glance")
-    st.caption(
-        "Each card shows one station. Color = overall status (labor + throughput). "
-        "Number = how loaded it is."
-    )
+    _has_weeks = weekly_util is not None and not weekly_util.empty
+    _views = ["📊 Stations"] + (["📅 By week"] if _has_weeks else []) + ["🔋 Batteries"]
+    _view_tabs = dict(zip(_views, st.tabs(_views)))
 
-    # Build cards in rows of 4
-    stations_to_show = list(capacity.index)
-    color_map = {
-        "🔴 OVER":       ("#E15759", "white"),
-        "🔴 NO STATION": ("#999999", "white"),
-        "🟠 NEAR-CAP":   ("#F0A04B", "white"),
-        "🟡 TIGHT":      ("#F2D75D", "#333"),
-        "🟢 OK":         ("#70AD47", "white"),
-        "⚪ N/A":         ("#EEEEEE", "#666"),
-    }
-    for i in range(0, len(stations_to_show), 4):
-        cols = st.columns(4)
-        for j, st_name in enumerate(stations_to_show[i:i + 4]):
-            row = capacity.loc[st_name]
-            status = row["overall_status"]
-            bg, fg = color_map.get(status, ("#EEEEEE", "#333"))
-            util_pct = row["labor_util_safe"] * 100 if not row.get("station_missing") else 0
-            hc = int(row["HC"])
-            req = int(row["required_hc"])
-            status_label = status.split(" ", 1)[1] if " " in status else status
-            cols[j].markdown(
-                f"""
+    # Station status — colored cards instead of a dense table. A station
+    # this facility doesn't have and the plan doesn't use (⚪ N/A) gets no
+    # card; it's named in one line underneath instead.
+    with _view_tabs["📊 Stations"]:
+        color_map = {
+            "🔴 OVER":       ("#E15759", "white"),
+            "🔴 NO STATION": ("#999999", "white"),
+            "🟠 NEAR-CAP":   ("#F0A04B", "white"),
+            "🟡 TIGHT":      ("#F2D75D", "#333"),
+            "🟢 OK":         ("#70AD47", "white"),
+        }
+        _unused = capacity[capacity["overall_status"] == "⚪ N/A"].index.tolist()
+        stations_to_show = [s for s in capacity.index if s not in _unused]
+        for i in range(0, len(stations_to_show), 4):
+            cols = st.columns(4)
+            for j, st_name in enumerate(stations_to_show[i:i + 4]):
+                row = capacity.loc[st_name]
+                status = row["overall_status"]
+                bg, fg = color_map.get(status, ("#EEEEEE", "#333"))
+                util_pct = row["labor_util_safe"] * 100 if not row.get("station_missing") else 0
+                hc = int(row["HC"])
+                req = int(row["required_hc"])
+                status_label = status.split(" ", 1)[1] if " " in status else status
+                cols[j].markdown(
+                    f"""
 <div style="background:{bg};color:{fg};padding:12px;border-radius:8px;margin-bottom:8px;">
 <div style="font-weight:600;font-size:0.95rem;">{st_name}</div>
 <div style="font-size:0.78rem;opacity:0.85;">{status_label}</div>
@@ -7066,23 +6934,34 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
 <div style="font-size:0.78rem;opacity:0.85;">{hc} people · need {req}</div>
 </div>
 """,
-                unsafe_allow_html=True,
+                    unsafe_allow_html=True,
+                )
+        if _unused:
+            st.caption("⚪ Not used by this plan: " + ", ".join(_unused))
+
+    # Weekly utilization heatmap — renders only when the schedule has a
+    # PRODUCTION DAY column (or auto-spread dates); otherwise the helper
+    # returns None and the tab is left out.
+    if _has_weeks:
+        with _view_tabs["📅 By week"]:
+            st.caption(
+                "Labor utilization per station and week (5-working-day weeks) — "
+                "the week a station peaks, which the month view averages out."
+            )
+            st.plotly_chart(
+                _make_heatmap(weekly_util), width="stretch",
+                key="overview_weekly_heatmap_full",
             )
 
-    st.markdown("---")
-
-    # =============================================================
-    # Battery type mix (kept — visual is clearer than table)
-    # =============================================================
-    st.markdown("#### 🔋 Batteries needed by type")
-    fig = px.bar(
-        batt_type, x="batt_type", y="total_batteries", color="batt_type",
-        text="total_batteries",
-        labels={"batt_type": "Battery type", "total_batteries": "Batteries"},
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(showlegend=False, height=340, margin=dict(t=20, b=20))
-    st.plotly_chart(fig, width="stretch")
+    with _view_tabs["🔋 Batteries"]:
+        fig = px.bar(
+            batt_type, x="batt_type", y="total_batteries", color="batt_type",
+            text="total_batteries",
+            labels={"batt_type": "Battery type", "total_batteries": "Batteries"},
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(showlegend=False, height=340, margin=dict(t=20, b=20))
+        st.plotly_chart(fig, width="stretch")
 
 
 def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, total_units: int = 0, units=None):
@@ -11494,10 +11373,6 @@ def _render_tab_strip() -> str:
 
 def main():
     st.title("🏭 Labor Capacity Planner")
-    st.caption(
-        "Plan production capacity across facilities. "
-        "Set up your scenario in the sidebar, then review the tabs below."
-    )
 
     inputs = render_sidebar()
 
@@ -11534,8 +11409,7 @@ def main():
         manual_entries = inputs.get("manual_entries")
         if manual_entries is None or manual_entries.empty:
             empty_banner_msg = (
-                "✏️ **Manual entry mode** — fill in FG SKU and Quantity in the sidebar to populate "
-                "the analysis tabs. You can still use **📁 Data & Setup** to edit catalogs."
+                "✏️ **Add FG SKUs and quantities in the sidebar** to see the analysis."
             )
         else:
             machine_skus = set(machine_df["SKU"])
@@ -11544,8 +11418,7 @@ def main():
             )
             if schedule_df.empty:
                 empty_banner_msg = (
-                    "✏️ **Manual entry mode** — fill in at least one row (FG SKU + Quantity > 0) in "
-                    "the sidebar. You can still use **📁 Data & Setup** to edit catalogs."
+                    "✏️ **Fill in at least one row** (FG SKU + Qty > 0) in the sidebar."
                 )
         # Manual rows don't carry a PRODUCTION DAY — the resolver auto-spreads
         # them so the Calendar tab, the Sequencer Suggest button, and the
@@ -11575,18 +11448,14 @@ def main():
             )
         except ScheduleColumnError as e:
             # Planner-friendly message with no internals leaked.
-            empty_banner_msg = (
-                f"📤 **We couldn't read your uploaded schedule.**  \n{e}  \n"
-                "You can still use **📁 Data & Setup** to browse and edit catalogs."
-            )
+            empty_banner_msg = f"📤 **We couldn't read your uploaded schedule.**  \n{e}"
             schedule_df = pd.DataFrame()
             # The pill must never describe a schedule that didn't load.
             st.session_state.pop("_last_upload_summary", None)
         if schedule_df.empty and not empty_banner_msg:
             empty_banner_msg = (
-                f"⚠️ No schedule rows found for **{inputs['location']}**. "
-                "Upload a CSV that contains this location, or select a different location. "
-                "You can still use **📁 Data & Setup** to edit catalogs."
+                f"⚠️ **No schedule rows for {inputs['location']}.** Upload a file "
+                "that includes it, or pick another facility."
             )
         # The schedule for THIS run is now known — fill the sidebar's
         # confirmation pill (and its dropped / rescued-unit warnings) with it.
@@ -11638,10 +11507,8 @@ def main():
         if window == "This week":
             if not _today_in_schedule_month:
                 empty_banner_msg = (
-                    "📅 **\"This week\" was ignored** — today isn't inside "
-                    "this schedule's month. Switch the **Time window** "
-                    "selector back to *Whole month* (or pick a date inside "
-                    "the schedule's month for the filter to work)."
+                    "📅 **\"This week\" was ignored** — today isn't in this "
+                    "schedule's month. Set **Time window** to *Whole month*."
                 )
             else:
                 current_week = week_of_month(_today_date)
@@ -11654,8 +11521,7 @@ def main():
                 if schedule_df.empty and not empty_banner_msg:
                     empty_banner_msg = (
                         f"📅 **No units scheduled for week {current_week}** "
-                        f"in {inputs['location']}'s plan. Switch the **Time window** "
-                        "selector in the sidebar back to *Whole month* to see the full plan."
+                        f"at {inputs['location']}. Set **Time window** to *Whole month*."
                     )
         elif window == "Remaining (from today)":
             schedule_df = schedule_df[
@@ -11665,15 +11531,13 @@ def main():
             if schedule_df.empty and not empty_banner_msg:
                 if not _today_in_schedule_month and _sched_months:
                     empty_banner_msg = (
-                        "📅 **No remaining units from today onward.** "
-                        "This schedule is for a different month than today — "
-                        "switch back to *Whole month* to see it."
+                        "📅 **No units left from today on** — this schedule is "
+                        "for another month. Set **Time window** to *Whole month*."
                     )
                 else:
                     empty_banner_msg = (
-                        "📅 **No remaining units scheduled from today onward.** "
-                        "Switch the **Time window** selector to *Whole month* "
-                        "to see the full plan."
+                        "📅 **No units left from today on.** Set **Time window** "
+                        "to *Whole month*."
                     )
 
     # ----------------------------------------------------------------
@@ -11687,8 +11551,8 @@ def main():
         units = _expand_schedule(schedule_df, machine_df, acc_df)
         if units.empty:
             empty_banner_msg = (
-                "⚠️ Could not expand schedule into units. Check that FG / Accessory SKUs "
-                "match the catalog. You can edit catalogs in **📁 Data & Setup**."
+                "⚠️ **No units could be built from this schedule** — check that "
+                "its FG / accessory SKUs are in the catalogs (**📁 Data & Setup**)."
             )
 
         # Track one schedule_load event per unique (mode, location, row-count)
@@ -11756,68 +11620,42 @@ def main():
     if empty_banner_msg:
         st.info(empty_banner_msg)
 
-    # Top-of-page reconciliation banner — units the loader had to DROP, i.e.
-    # exactly the gap between the unit total in the planner's source file and
-    # the total the model reports. The per-reason detail lives in the sidebar,
-    # but the sidebar is easy to scroll past, and "why doesn't this match my
-    # Excel?" is the first thing a planner asks. Mirror the headline number
-    # onto the main panel so the discrepancy is never a silent surprise.
-    _upl = st.session_state.get("_last_upload_summary") or {}
+    # ----------------------------------------------------------------
+    # Schedule notes — what the loader had to leave out or fill in, and the
+    # plan-month / missing-SKU actions, in ONE collapsed expander above the
+    # tab strip. These used to be up to five full-width banners stacked over
+    # every tab, so the planner read paragraphs before reaching any number.
+    # The expander's label carries each note's headline ("162 units not
+    # counted · dates auto-filled"), so none of them is silent; the detail
+    # and the buttons sit inside. Everything is counted first because the
+    # label has to exist before the expander does.
+    # ----------------------------------------------------------------
+    # Units the loader had to DROP — exactly the gap between the unit total in
+    # the planner's source file and the total the model reports ("why doesn't
+    # this match my Excel?"). The per-model detail is in the sidebar's notes.
+    # Upload mode only: the summary describes the last uploaded file, which a
+    # switch to ✏️ manual entry leaves behind in session state.
+    _upl = (
+        st.session_state.get("_last_upload_summary") or {}
+        if inputs.get("schedule_mode") != SCHEDULE_MODE_MANUAL else {}
+    )
     _upl_rec = _upl.get("recovered") if isinstance(_upl, dict) else None
+    _unm_map: dict = {}
+    _n_unmatched = _n_nomodel = 0
     if isinstance(_upl_rec, dict):
         _unm_map = _upl_rec.get("unmatched") or {}
         _n_unmatched = int(sum(_unm_map.values()))
         _n_nomodel = int(_upl_rec.get("no_model") or 0)
-        _n_dropped = _n_unmatched + _n_nomodel
-        if _n_dropped:
-            _why = []
-            if _n_unmatched:
-                _models = ", ".join(
-                    f"`{_m}`×{_n}" for _m, _n in list(_unm_map.items())[:6]
-                )
-                _why.append(
-                    f"**{_n_unmatched}** had no FG SKU and no matching `XXX` "
-                    f"placeholder ({_models})"
-                )
-            if _n_nomodel:
-                _why.append(
-                    f"**{_n_nomodel}** had neither an FG SKU nor a MODEL TYPE"
-                )
-            st.warning(
-                f"➖ **{_n_dropped} unit(s) in your file are NOT in these "
-                f"numbers.** "
-                + "; ".join(_why)
-                + ". Every total on every tab is short by that much. Fix: add an "
-                "`XXX` placeholder for those models in **📁 Data & Setup → "
-                "Machine catalog**, or fill in the SKUs and re-upload. "
-                "(Full breakdown in the sidebar.)"
-            )
+    _n_dropped = _n_unmatched + _n_nomodel
 
-    # Top-of-page warning when the schedule references SKUs the catalogs don't
-    # know about. `expand_schedule` quietly drops unknown FG rows and lets
-    # unknown accessories build with zero acc labor — without this banner a
-    # planner could trust analysis numbers that are missing units. Keep it
-    # compact; the full list lives in 📁 Data & Setup → 🔍 Data Quality.
-    # Auto-spread banner — fires when _auto_spread_dates filled in blank
-    # PRODUCTION DAY rows. We surface it prominently so the planner knows
-    # the dates driving the heatmap are *synthetic* (a level-load baseline),
-    # not what their ERP told them.
+    # Auto-spread — _auto_spread_dates filled in blank PRODUCTION DAY rows, so
+    # the dates driving the heatmap are a synthetic level-load baseline.
     _auto = (
         schedule_df_full.attrs.get("auto_spread")
         if (hasattr(schedule_df_full, "attrs") and not schedule_df_full.empty)
         else None
     )
-    if isinstance(_auto, dict) and _auto.get("count"):
-        st.warning(
-            "📅 **No PRODUCTION DAY in your schedule** — we auto-leveled "
-            f"**{_auto['count']} of {_auto['total_rows']} units** across "
-            f"**{_auto['target_month_label']}** "
-            f"({_auto['working_days']} working days) so weekly labor is "
-            "roughly balanced. The Overview heatmap reflects this "
-            "synthetic sequence. To pin your own dates, add a "
-            "**PRODUCTION DAY** column to your CSV (any date format works) "
-            "and re-upload."
-        )
+    _n_auto = int(_auto.get("count") or 0) if isinstance(_auto, dict) else 0
 
     # Plan-month transfer — the Plan month picker is authoritative, so any rows
     # that aren't dated inside it won't show on the Calendar or count toward
@@ -11826,8 +11664,11 @@ def main():
     # another month, and carryover rows (older PRODUCTION MONTH) not yet dated
     # here. They're merged into ONE action over the union of the two.
     _plan_ym = inputs.get("plan_month")
+    _plan_lbl = inputs.get("plan_month_label", "the selected month")
+    _n_move = _carry_total = 0
+    _sched_ym = None
+    _offer_switch = False
     if _plan_ym is not None and not schedule_df_full.empty:
-        _plan_lbl = inputs.get("plan_month_label", "the selected month")
         _n_move, _carry_total = _plan_month_transfer_counts(schedule_df_full, _plan_ym)
         # The month the schedule itself is for (PRODUCTION MONTH, by units).
         # When it isn't the Plan month, offer to plan THAT month instead — the
@@ -11842,42 +11683,202 @@ def main():
             and (int(_sched_ym[0]), int(_sched_ym[1]))
             != (int(_plan_ym[0]), int(_plan_ym[1]))
         )
-        _sched_lbl = _month_label(_sched_ym) if _offer_switch else ""
+    _sched_lbl = _month_label(_sched_ym) if _offer_switch else ""
 
-        def _switch_plan_month_button(container, stretch: bool) -> None:
-            kwargs = {"width": "stretch"} if stretch else {}
-            if container.button(
-                f"📆 Plan {_sched_lbl} instead",
-                help=(
-                    f"The schedule's own PRODUCTION MONTH is {_sched_lbl}. Sets "
-                    "the sidebar's Plan month to it; the working-day count, the "
-                    "Calendar's weeks and where undated rows are auto-leveled "
-                    "all follow. Nothing in the schedule itself changes."
-                ),
-                key="plan_schedule_month_btn",
-                **kwargs,
-            ):
-                st.session_state[PLAN_MONTH_SEED_KEY] = (
-                    int(_sched_ym[0]), int(_sched_ym[1]),
-                )
-                _track_and_flush(
-                    "plan_month_follow_schedule",
-                    facility=inputs.get("location"), month=_sched_lbl,
-                )
-                st.rerun()
+    # SKUs the catalogs don't know about. `expand_schedule` quietly drops
+    # unknown FG rows and lets unknown accessories build with zero acc labor —
+    # without this note a planner could trust numbers that are missing units.
+    _skipped_fg: list = []
+    _unknown_acc: list = []
+    if not units.empty and hasattr(units, "attrs"):
+        _skipped_fg = list(units.attrs.get("skipped_fg", []) or [])
+        _unknown_acc = list(units.attrs.get("unknown_acc", []) or [])
+    _n_missing = len(_skipped_fg) + len(_unknown_acc)
 
-        if _n_move:
+    _note_heads = []
+    if _n_dropped:
+        _note_heads.append(f"{_n_dropped} units not counted")
+    if _n_missing:
+        _note_heads.append(f"{_n_missing} SKUs not in the catalogs")
+    if _n_move:
+        _note_heads.append(f"{_n_move} rows off the {_plan_lbl} calendar")
+    if _n_auto:
+        _note_heads.append("dates auto-filled")
+    if _offer_switch:
+        _note_heads.append(f"file is dated {_sched_lbl}")
+    if _carry_total and not _n_move and not _note_heads:
+        _note_heads.append(f"{_carry_total} carryover units")
+
+    def _switch_plan_month_button(container, stretch: bool) -> None:
+        kwargs = {"width": "stretch"} if stretch else {}
+        if container.button(
+            f"📆 Plan {_sched_lbl} instead",
+            help=(
+                f"The schedule's own PRODUCTION MONTH is {_sched_lbl}. Sets "
+                "the sidebar's Plan month to it; the working-day count, the "
+                "Calendar's weeks and where undated rows are auto-leveled "
+                "all follow. Nothing in the schedule itself changes."
+            ),
+            key="plan_schedule_month_btn",
+            **kwargs,
+        ):
+            st.session_state[PLAN_MONTH_SEED_KEY] = (
+                int(_sched_ym[0]), int(_sched_ym[1]),
+            )
+            _track_and_flush(
+                "plan_month_follow_schedule",
+                facility=inputs.get("location"), month=_sched_lbl,
+            )
+            st.rerun()
+
+    _notes_box = (
+        st.expander(
+            ("⚠️" if (_n_dropped or _n_missing or _n_move) else "ℹ️")
+            + " Schedule notes — " + " · ".join(_note_heads),
+        )
+        if _note_heads else None
+    )
+
+    if _n_dropped:
+        _why = []
+        if _n_unmatched:
+            _models = ", ".join(
+                f"`{_m}`×{_n}" for _m, _n in list(_unm_map.items())[:6]
+            )
+            _why.append(
+                f"{_n_unmatched} have no FG SKU and no `XXX` placeholder ({_models})"
+            )
+        if _n_nomodel:
+            _why.append(f"{_n_nomodel} have neither an FG SKU nor a MODEL TYPE")
+        _notes_box.warning(
+            f"➖ **{_n_dropped} unit(s) in your file aren't counted** — "
+            + "; ".join(_why)
+            + ". Every total is short by that much. Add `XXX` placeholders in "
+            "**📁 Data & Setup → Machine catalog**, or fill in the SKUs and re-upload."
+        )
+
+    if _n_missing:
+        with _notes_box:
+            _preview_fg = ", ".join(f"`{s}`" for s in _skipped_fg[:5])
+            _preview_acc = ", ".join(f"`{s}`" for s in _unknown_acc[:5])
+            _bits = []
+            if _skipped_fg:
+                extra = f" (+{len(_skipped_fg) - 5} more)" if len(_skipped_fg) > 5 else ""
+                _bits.append(
+                    f"**{len(_skipped_fg)} FG SKU(s) not in the machine catalog** — "
+                    f"their rows are left out: {_preview_fg}{extra}."
+                )
+            if _unknown_acc:
+                extra = f" (+{len(_unknown_acc) - 5} more)" if len(_unknown_acc) > 5 else ""
+                _bits.append(
+                    f"**{len(_unknown_acc)} accessory SKU(s) not in the accessory catalog** — "
+                    f"built with zero accessory labor: {_preview_acc}{extra}."
+                )
+            st.warning("⚠️ " + "  \n".join(_bits))
+
+            # The routing each missing FG SKU would be seeded with, so the planner
+            # sees it before clicking import (accessories have no routing).
+            if _skipped_fg:
+                _seed_tbl = _routing_seed_preview(
+                    "data/machine_clean.csv", [{"SKU": s} for s in _skipped_fg],
+                )
+                if _seed_tbl is not None:
+                    with st.expander(
+                        f"🧭 Per-facility routing the {len(_skipped_fg)} imported "
+                        "FG SKU(s) would get",
+                        expanded=False,
+                    ):
+                        st.caption(
+                            "Seeded from the most similar SKU already in the machine "
+                            "catalog (same family and class) so each plant's custom "
+                            "routing carries over; `defaults` means every station keeps "
+                            "its own team. Adjust it afterwards in **📁 Data & Setup → "
+                            "🏭 Machine catalog**."
+                        )
+                        st.dataframe(_seed_tbl, width="stretch", hide_index=True)
+
+            # Quick import — one click adds every missing SKU to the catalogs as a
+            # placeholder (zero labor, today's date) so its units stop being
+            # dropped. The planner fills in real labor times afterwards.
+            _token = _github_token()
+            _ic1, _ic2 = st.columns([2, 3])
+            with _ic1:
+                _do_import = st.button(
+                    f"➕ Import {_n_missing} missing SKU(s) into the catalogs",
+                    width="stretch",
+                    type="primary",
+                    disabled=not _token,
+                    help=(
+                        "Adds each missing FG SKU to the machine catalog and each "
+                        "missing accessory SKU to the accessory catalog as a "
+                        "zero-labor placeholder, committed to GitHub. Fill in the "
+                        "real labor times afterwards in 📁 Data & Setup."
+                    ),
+                )
+            if not _token:
+                with _ic2:
+                    st.caption(
+                        "🔒 Importing needs the GitHub token "
+                        "(`github_token` in Streamlit Secrets)."
+                    )
+            if _do_import:
+                _added_all: list[str] = []
+                _skipped_all: list[str] = []
+                _failed = False
+                try:
+                    with st.spinner("Importing missing SKUs into the catalogs…"):
+                        if _skipped_fg:
+                            _a, _s = _import_missing_skus_to_catalog(
+                                "data/machine_clean.csv", "machine", _skipped_fg, _token,
+                            )
+                            _added_all += _a
+                            _skipped_all += _s
+                        if _unknown_acc:
+                            _a, _s = _import_missing_skus_to_catalog(
+                                "data/acc_clean.csv", "accessory", _unknown_acc, _token,
+                            )
+                            _added_all += _a
+                            _skipped_all += _s
+                except Exception as e:
+                    _failed = True
+                    st.error(f"❌ Import failed: {e}")
+                if not _failed:
+                    try:
+                        _clear_catalog_cache("data/machine_clean.csv", "data/acc_clean.csv")
+                    except Exception:
+                        pass
+                    _track_and_flush(
+                        "missing_sku_import",
+                        n_added=len(_added_all), n_skipped=len(_skipped_all),
+                    )
+                    if _added_all:
+                        st.success(
+                            f"✅ Imported **{len(_added_all)}** SKU(s) as zero-labor "
+                            "placeholders. They'll appear in the catalogs after the "
+                            "app redeploys (~1 min) — then set their labor times in "
+                            "**📁 Data & Setup**."
+                            + (
+                                f"  \n_Skipped {len(_skipped_all)} already-present / "
+                                "invalid SKU(s)._" if _skipped_all else ""
+                            )
+                        )
+                    else:
+                        st.info(
+                            "Nothing imported — every missing SKU was already in the "
+                            "catalog (another user may have just added them). Refresh "
+                            "to see them."
+                        )
+
+    if _n_move:
+        with _notes_box:
             _or_switch = (
-                f", or plan **{_sched_lbl}** instead if that is the month this "
-                "file is for"
-                if _offer_switch else
-                ", or switch the **Plan month** in the sidebar to match the data"
+                f", or plan **{_sched_lbl}** instead" if _offer_switch
+                else ", or change the **Plan month** in the sidebar"
             )
             st.warning(
                 f"📆 **{_n_move} row(s) aren't on the {_plan_lbl} calendar** — "
-                "they're dated in another month or carried over from an earlier "
-                "month, so they won't show here or count toward this month's "
-                f"load. Move them in{_or_switch}."
+                "they're dated in another month or carried over, so they don't "
+                f"count toward this month's load. Move them in{_or_switch}."
             )
             if _offer_switch:
                 _c_move, _c_switch = st.columns(2)
@@ -11919,148 +11920,32 @@ def main():
                     st.error(f"❌ Move failed: {e}")
             if _c_switch is not None:
                 _switch_plan_month_button(_c_switch, stretch=True)
-        elif _carry_total:
-            _note = (
-                f" The file itself is dated **{_sched_lbl}** — plan that month "
-                f"instead if this is the {_sched_lbl} schedule."
-                if _offer_switch else ""
-            )
-            st.caption(
-                f"📦 {_carry_total} carryover unit(s) — all scheduled in {_plan_lbl}. ✅"
-                + _note
-            )
-            if _offer_switch:
-                _switch_plan_month_button(st, stretch=False)
-        elif _offer_switch:
-            # Every row is on this month's calendar and nothing carried over,
-            # yet the file says it is for a different (later) month — say so,
-            # and offer that month, instead of leaving "(CSV says …)" on the
-            # pill as the only hint.
-            st.caption(
-                f"📆 The file itself is dated **{_sched_lbl}**; it is being "
-                f"planned as {_plan_lbl}."
-            )
-            _switch_plan_month_button(st, stretch=False)
 
-    _skipped_fg: list = []
-    _unknown_acc: list = []
-    if not units.empty and hasattr(units, "attrs"):
-        _skipped_fg = list(units.attrs.get("skipped_fg", []) or [])
-        _unknown_acc = list(units.attrs.get("unknown_acc", []) or [])
-    if _skipped_fg or _unknown_acc:
-        _preview_fg = ", ".join(f"`{s}`" for s in _skipped_fg[:5])
-        _preview_acc = ", ".join(f"`{s}`" for s in _unknown_acc[:5])
-        _bits = []
-        if _skipped_fg:
-            extra = f" (+{len(_skipped_fg) - 5} more)" if len(_skipped_fg) > 5 else ""
-            _bits.append(
-                f"**{len(_skipped_fg)} FG SKU(s) missing from machine catalog** — "
-                f"their rows were dropped from analysis: {_preview_fg}{extra}."
-            )
-        if _unknown_acc:
-            extra = f" (+{len(_unknown_acc) - 5} more)" if len(_unknown_acc) > 5 else ""
-            _bits.append(
-                f"**{len(_unknown_acc)} accessory SKU(s) missing from accessory catalog** — "
-                f"those units built with zero accessory labor: {_preview_acc}{extra}."
-            )
-        st.warning(
-            "⚠️ " + "  \n".join(_bits)
-            + "  \n→ Quick-import them below, or edit catalogs in **📁 Data & Setup**."
+    if _n_auto:
+        _notes_box.markdown(
+            f"📅 **No PRODUCTION DAY in your schedule** — {_auto['count']} of "
+            f"{_auto['total_rows']} units were spread evenly across "
+            f"{_auto['target_month_label']} ({_auto['working_days']} working "
+            "days), and the weekly view uses those dates. Add a **PRODUCTION "
+            "DAY** column to pin your own."
         )
 
-        # The routing each missing FG SKU would be seeded with, so the planner
-        # sees it before clicking import (accessories have no routing).
-        if _skipped_fg:
-            _seed_tbl = _routing_seed_preview(
-                "data/machine_clean.csv", [{"SKU": s} for s in _skipped_fg],
-            )
-            if _seed_tbl is not None:
-                with st.expander(
-                    f"🧭 Per-facility routing the {len(_skipped_fg)} imported "
-                    "FG SKU(s) would get",
-                    expanded=False,
-                ):
-                    st.caption(
-                        "Seeded from the most similar SKU already in the machine "
-                        "catalog (same family and class) so each plant's custom "
-                        "routing carries over; `defaults` means every station keeps "
-                        "its own team. Adjust it afterwards in **📁 Data & Setup → "
-                        "🏭 Machine catalog**."
-                    )
-                    st.dataframe(_seed_tbl, width="stretch", hide_index=True)
-
-        # Quick import — one click adds every missing SKU to the catalogs as a
-        # placeholder (zero labor, today's date) so its units stop being
-        # dropped. The planner fills in real labor times afterwards.
-        _n_missing = len(_skipped_fg) + len(_unknown_acc)
-        _token = _github_token()
-        _ic1, _ic2 = st.columns([2, 3])
-        with _ic1:
-            _do_import = st.button(
-                f"➕ Import {_n_missing} missing SKU(s) into the catalogs",
-                width="stretch",
-                type="primary",
-                disabled=not _token,
-                help=(
-                    "Adds each missing FG SKU to the machine catalog and each "
-                    "missing accessory SKU to the accessory catalog as a "
-                    "zero-labor placeholder, committed to GitHub. Fill in the "
-                    "real labor times afterwards in 📁 Data & Setup."
-                ),
-            )
-        if not _token:
-            with _ic2:
-                st.caption(
-                    "🔒 Importing needs the GitHub token "
-                    "(`github_token` in Streamlit Secrets)."
+    if not _n_move and (_carry_total or _offer_switch):
+        with _notes_box:
+            if _carry_total:
+                st.markdown(
+                    f"📦 {_carry_total} carryover unit(s), all scheduled in "
+                    f"{_plan_lbl}. ✅"
                 )
-        if _do_import:
-            _added_all: list[str] = []
-            _skipped_all: list[str] = []
-            _failed = False
-            try:
-                with st.spinner("Importing missing SKUs into the catalogs…"):
-                    if _skipped_fg:
-                        _a, _s = _import_missing_skus_to_catalog(
-                            "data/machine_clean.csv", "machine", _skipped_fg, _token,
-                        )
-                        _added_all += _a
-                        _skipped_all += _s
-                    if _unknown_acc:
-                        _a, _s = _import_missing_skus_to_catalog(
-                            "data/acc_clean.csv", "accessory", _unknown_acc, _token,
-                        )
-                        _added_all += _a
-                        _skipped_all += _s
-            except Exception as e:
-                _failed = True
-                st.error(f"❌ Import failed: {e}")
-            if not _failed:
-                try:
-                    _clear_catalog_cache("data/machine_clean.csv", "data/acc_clean.csv")
-                except Exception:
-                    pass
-                _track_and_flush(
-                    "missing_sku_import",
-                    n_added=len(_added_all), n_skipped=len(_skipped_all),
+            if _offer_switch:
+                # Every row is on this month's calendar, yet the file says it is
+                # for a different month — say so, and offer that month, instead
+                # of leaving "(CSV says …)" on the pill as the only hint.
+                st.markdown(
+                    f"📆 The file itself is dated **{_sched_lbl}**; it is being "
+                    f"planned as {_plan_lbl}."
                 )
-                if _added_all:
-                    st.success(
-                        f"✅ Imported **{len(_added_all)}** SKU(s) as zero-labor "
-                        "placeholders. They'll appear in the catalogs after the "
-                        "app redeploys (~1 min) — then set their labor times in "
-                        "**📁 Data & Setup**."
-                        + (
-                            f"  \n_Skipped {len(_skipped_all)} already-present / "
-                            "invalid SKU(s)._" if _skipped_all else ""
-                        )
-                    )
-                else:
-                    st.info(
-                        "Nothing imported — every missing SKU was already in the "
-                        "catalog (another user may have just added them). Refresh "
-                        "to see them."
-                    )
+                _switch_plan_month_button(st, stretch=False)
 
     # Top-level tabs, ordered from executive summary → planner detail → admin.
     # Batteries content folded into Capacity. Update Labor + Data Quality + Source Data
@@ -12075,10 +11960,8 @@ def main():
     # Helper — show an "empty state" message inside analysis tabs when there's no schedule
     def _empty_state(tab_name: str):
         st.info(
-            f"📭 **{tab_name} needs a schedule to populate.**  \n"
-            "• In the sidebar, switch to **📤 Upload schedule file** or **✏️ Paste or type SKUs**.  \n"
-            "• You can still edit catalogs, items, packages, and the process flow from the "
-            "**📁 Data & Setup** tab without a schedule."
+            f"📭 **{tab_name} needs a schedule to populate.** Upload a file or "
+            "type SKUs in the sidebar — catalogs stay editable in **📁 Data & Setup**."
         )
 
     if active_tab == TAB_OVERVIEW:

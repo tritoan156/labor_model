@@ -90,6 +90,8 @@ _stale = (
     # Catalog CSV saves mirror the pushed text into data/ so this session uses
     # the new values at once — app.py imports the helper directly.
     or not hasattr(core.catalog_storage, "mirror_csv_locally")
+    # An unreadable CSV upload is a ScheduleColumnError, not a crash.
+    or not hasattr(core.data_loader, "_read_schedule_table")
 )
 if _stale:
     # Reload in DEPENDENCY ORDER: constants first (every other module imports
@@ -733,6 +735,10 @@ PLAN_MONTH_SEED_KEY = "_plan_month_seed"
 # written by _stash_upload_summary and read by the picker, so those months are
 # always on its list even when they fall outside the rolling default window.
 SCHEDULE_MONTHS_KEY = "_schedule_months"
+# The (year, month) tuples the active schedule's rows are DATED in (PRODUCTION
+# DAY, i.e. after auto-spread) — recorded by main() so the sidebar can apply
+# the same "does the Time window slice anything" rule (see _window_applies).
+SCHEDULE_DATED_MONTHS_KEY = "_schedule_dated_months"
 
 
 def _month_label(ym) -> str:
@@ -1522,6 +1528,8 @@ _CROSS_MODE_SCHEDULE_KEYS = (
     "_loaded_schedule_buffer",
     "_loaded_schedule_source",
     "_loaded_schedule_name",
+    "_loaded_schedule_kind",
+    "_loaded_schedule_label",
     "_proposed_schedule",
     "_proposed_schedule_overloads",
 )
@@ -1548,6 +1556,161 @@ def _note_schedule_mode(schedule_mode: str) -> bool:
             st.session_state.pop("_last_upload_summary", None)
     st.session_state["_schedule_mode_seen"] = schedule_mode
     return changed
+
+
+def _commit_reshape(new_df: pd.DataFrame, label: str, *, event: "str | None" = None,
+                    **payload) -> None:
+    """Hand a reshaped schedule (Sequencer ✅ Accept, 🗓 Apply, 🔀 Bulk move,
+    🧹 Strip, 📅 Move into plan month) to the resolver as the next active
+    schedule, with the bookkeeping that makes it undoable.
+
+    Writes the one-shot buffer the resolver consumes, tags it ``kind =
+    "reshape"`` so :func:`_load_schedule_df` keeps the previous bytes as the
+    undo step (and the schedule's source / name — a reshaped upload used to be
+    relabelled "saved schedule"), and stashes the confirmation as a one-shot
+    toast the main panel replays after the rerun — a ``st.success`` drawn here
+    was thrown away with the run that raised it. The caller reruns.
+    """
+    st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
+        new_df.to_csv(index=False).encode("utf-8")
+    )
+    st.session_state["_loaded_schedule_kind"] = "reshape"
+    st.session_state["_loaded_schedule_label"] = str(label)
+    st.session_state["_schedule_toast"] = ("success", f"✅ {label}.")
+    if event:
+        _track_and_flush(event, **payload)
+
+
+def _schedule_edit_count() -> int:
+    """How many reshapes the active schedule carries since it was loaded."""
+    try:
+        return int(st.session_state.get("_schedule_edit_count", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _queue_schedule_bytes(csv_bytes: bytes, *, kind: "str | None", source: str,
+                          name: "str | None", toast: str) -> None:
+    """Common tail of the way-back actions: queue ``csv_bytes`` for the
+    resolver with its kind / source / name and a one-shot toast."""
+    st.session_state["_loaded_schedule_buffer"] = io.BytesIO(csv_bytes)
+    if kind:
+        st.session_state["_loaded_schedule_kind"] = kind
+    else:
+        st.session_state.pop("_loaded_schedule_kind", None)
+    st.session_state.pop("_loaded_schedule_label", None)
+    st.session_state["_loaded_schedule_source"] = source
+    if name:
+        st.session_state["_loaded_schedule_name"] = name
+    else:
+        st.session_state.pop("_loaded_schedule_name", None)
+    st.session_state["_schedule_toast"] = ("success", toast)
+
+
+def _undo_last_reshape() -> bool:
+    """Queue the schedule as it was before the last reshape. The resolver
+    (kind ``undo``) drops the undo step and counts the edit off. False when
+    there is nothing to undo."""
+    undo = st.session_state.get("_schedule_undo")
+    if not isinstance(undo, dict) or not undo.get("csv"):
+        return False
+    label = undo.get("label") or "the last change"
+    _queue_schedule_bytes(
+        undo["csv"], kind="undo", source=undo.get("source") or "saved",
+        name=undo.get("name"), toast=f"↩️ Undid: {label}.",
+    )
+    _track_and_flush("schedule_undo", label=label)
+    return True
+
+
+def _restore_schedule_as_loaded() -> bool:
+    """Queue the schedule exactly as it was loaded (upload, 📥 Load, the
+    automatic newest save, or the sample), dropping every reshape since.
+    False when nothing was recorded."""
+    orig = st.session_state.get("_schedule_original")
+    if not isinstance(orig, dict) or not orig.get("csv"):
+        return False
+    _queue_schedule_bytes(
+        orig["csv"], kind="restore", source=orig.get("source") or "saved",
+        name=orig.get("name"), toast="⏮ Back to the schedule as it was loaded.",
+    )
+    _track_and_flush("schedule_restore_original", edits=_schedule_edit_count())
+    return True
+
+
+def _queue_bundled_sample_load() -> bool:
+    """Queue the bundled sample (``data/may_schedule.csv``) as a chosen
+    schedule — promoted like a 📥 Load, so the facility's newest save isn't
+    picked again on the next run. False when the sample file is missing."""
+    p = DATA_DIR / "may_schedule.csv"
+    try:
+        csv_bytes = p.read_bytes()
+    except OSError:
+        return False
+    _queue_schedule_bytes(
+        csv_bytes, kind=None, source="bundled", name="May 2026 sample",
+        toast="🧪 Using the bundled May 2026 sample schedule.",
+    )
+    _track_and_flush("schedule_load_sample")
+    return True
+
+
+def _restore_schedule_before_error() -> bool:
+    """After an upload the loader couldn't read, put back the schedule that
+    was active before it (kept aside by the resolver) and clear the error.
+    False when there was nothing active before."""
+    prev = st.session_state.pop("_schedule_before_error", None)
+    st.session_state.pop("_active_schedule_error", None)
+    if not isinstance(prev, dict) or not prev.get("csv"):
+        return False
+    st.session_state["_active_schedule_csv"] = prev["csv"]
+    st.session_state["_active_schedule_source"] = prev.get("source") or "saved"
+    st.session_state["_active_schedule_name"] = prev.get("name")
+    st.session_state["_active_schedule_sheet"] = prev.get("sheet")
+    if prev.get("auto_for"):
+        st.session_state["_active_schedule_auto_for"] = prev["auto_for"]
+    else:
+        st.session_state.pop("_active_schedule_auto_for", None)
+    for _k in ("_schedule_undo", "_schedule_original", "_schedule_edit_count"):
+        if prev.get(_k) is not None:
+            st.session_state[_k] = prev[_k]
+    return True
+
+
+def _drop_manual_override() -> bool:
+    """✏️ manual mode's way back: forget the reshape laid over the typed grid so
+    the next run analyses the grid as typed. False when there was none."""
+    if st.session_state.pop("_manual_schedule_override", None) is None:
+        return False
+    st.session_state["_schedule_toast"] = ("success", "↩️ Back to the list as typed.")
+    return True
+
+
+def _window_applies(plan_month, schedule_months) -> bool:
+    """Whether a "This week" / "Remaining (from today)" window has anything to
+    slice: today must fall inside the Plan month AND, when the schedule carries
+    dated rows, inside a month those rows are dated in. One rule for the
+    sidebar's working-day count and main()'s slice — they used to decide
+    differently (plan month vs. dated months) and could judge a week of demand
+    against a month of capacity, or the reverse.
+
+    ``schedule_months`` is any iterable of ``(year, month)`` tuples (the
+    ``SCHEDULE_MONTHS_KEY`` list, or the months of PRODUCTION DAY); empty /
+    None means "no dated rows", which the Plan month alone decides.
+    """
+    if not plan_month:
+        return False
+    now = now_local()
+    today = (now.year, now.month)
+    if today != (int(plan_month[0]), int(plan_month[1])):
+        return False
+    months = set()
+    for m in (schedule_months or ()):
+        try:
+            months.add((int(m[0]), int(m[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return not months or today in months
 
 
 def _note_facility(location: str) -> bool:
@@ -1600,6 +1763,8 @@ def _resolve_manual_schedule(base_df, location, machine_df, acc_df, plan_month=N
     buf = st.session_state.pop("_loaded_schedule_buffer", None)
     st.session_state.pop("_loaded_schedule_source", None)
     st.session_state.pop("_loaded_schedule_name", None)
+    st.session_state.pop("_loaded_schedule_kind", None)
+    st.session_state.pop("_loaded_schedule_label", None)
     if buf is not None and sig:
         st.session_state["_manual_schedule_override"] = {
             "sig": sig, "csv": buf.getvalue(),
@@ -1643,6 +1808,9 @@ def _has_active_schedule(uploaded_file=None) -> bool:
         and _upload_sig(uploaded_file) != st.session_state.get("_seen_upload_sig")
     ):
         return True
+    if st.session_state.get("_active_schedule_error"):
+        # The last upload couldn't be read; nothing analysable to push.
+        return False
     return st.session_state.get("_active_schedule_csv") is not None
 
 
@@ -1883,32 +2051,72 @@ def _load_schedule_df(
     buf = st.session_state.pop("_loaded_schedule_buffer", None)
     if buf is not None:
         csv_bytes = buf.getvalue()
-        st.session_state["_active_schedule_csv"] = csv_bytes
-        st.session_state["_active_schedule_source"] = st.session_state.pop(
-            "_loaded_schedule_source", "saved"
-        )
-        # A 📥 Load names the saved schedule; a reshape keeps the name of the
-        # schedule it reshaped. Either way the planner chose it, so it is no
-        # longer the facility-bound automatic first pick (step 3c).
-        st.session_state["_active_schedule_name"] = st.session_state.pop(
-            "_loaded_schedule_name", st.session_state.get("_active_schedule_name"),
-        )
-        st.session_state.pop("_active_schedule_auto_for", None)
-        # A programmatic load is always CSV — no workbook sheet to report,
-        # and any earlier failed-workbook banner is superseded.
-        st.session_state["_active_schedule_sheet"] = None
-        st.session_state.pop("_active_schedule_error", None)
-        # A programmatic load supersedes whatever file is still sitting in the
-        # uploader widget — mark it "seen" so the next rerun doesn't treat it
-        # as a fresh upload and clobber what we just loaded.
-        if uploaded_file is not None:
-            st.session_state["_seen_upload_sig"] = _upload_sig(uploaded_file)
+        kind = st.session_state.pop("_loaded_schedule_kind", None)
+        label = st.session_state.pop("_loaded_schedule_label", None)
+        # Parse FIRST: a buffer the loader can't read (a saved file that
+        # went bad) must not replace the schedule that is active now.
         df = load_schedule(
             io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
             placeholder_map=placeholder_map, acc_skus=acc_skus,
             absorb_foreign_locations=_absorb_foreign,
         )
-        return _finalize(df, st.session_state["_active_schedule_source"])
+        prev_csv = st.session_state.get("_active_schedule_csv")
+        prev_source = st.session_state.get("_active_schedule_source")
+        prev_name = st.session_state.get("_active_schedule_name")
+        edits = _schedule_edit_count()
+        if kind == "reshape":
+            # A reshape keeps the source and name of the schedule it reshaped
+            # (it is not a "saved schedule" just because it came through the
+            # buffer) and leaves the previous bytes behind as the undo step.
+            source = prev_source or "saved"
+            name = prev_name
+            st.session_state.pop("_loaded_schedule_source", None)
+            st.session_state.pop("_loaded_schedule_name", None)
+            if prev_csv is not None:
+                st.session_state["_schedule_undo"] = {
+                    "csv": prev_csv, "label": label, "source": prev_source,
+                    "name": prev_name,
+                    "sheet": st.session_state.get("_active_schedule_sheet"),
+                }
+            st.session_state["_schedule_edit_count"] = edits + 1
+        elif kind == "undo":
+            source = st.session_state.pop("_loaded_schedule_source", prev_source or "saved")
+            name = st.session_state.pop("_loaded_schedule_name", prev_name)
+            st.session_state.pop("_schedule_undo", None)
+            st.session_state["_schedule_edit_count"] = max(0, edits - 1)
+        elif kind == "restore":
+            source = st.session_state.pop("_loaded_schedule_source", prev_source or "saved")
+            name = st.session_state.pop("_loaded_schedule_name", prev_name)
+            st.session_state.pop("_schedule_undo", None)
+            st.session_state["_schedule_edit_count"] = 0
+        else:
+            # A fresh load — 📥 Load, "load newest", "use the sample": names
+            # the schedule, starts the edit history over, and is what "⏮ back
+            # to as loaded" returns to.
+            source = st.session_state.pop("_loaded_schedule_source", "saved")
+            name = st.session_state.pop("_loaded_schedule_name", prev_name)
+            st.session_state.pop("_schedule_undo", None)
+            st.session_state["_schedule_edit_count"] = 0
+            st.session_state["_schedule_original"] = {
+                "csv": csv_bytes, "source": source, "name": name, "sheet": None,
+            }
+        st.session_state["_active_schedule_csv"] = csv_bytes
+        st.session_state["_active_schedule_source"] = source
+        # The planner chose this schedule (or chose to go back to it), so it
+        # is no longer the facility-bound automatic first pick (step 3c).
+        st.session_state["_active_schedule_name"] = name
+        st.session_state.pop("_active_schedule_auto_for", None)
+        # A programmatic load is always CSV — no workbook sheet to report,
+        # and any earlier failed-upload banner is superseded.
+        st.session_state["_active_schedule_sheet"] = None
+        st.session_state.pop("_active_schedule_error", None)
+        st.session_state.pop("_schedule_before_error", None)
+        # A programmatic load supersedes whatever file is still sitting in the
+        # uploader widget — mark it "seen" so the next rerun doesn't treat it
+        # as a fresh upload and clobber what we just loaded.
+        if uploaded_file is not None:
+            st.session_state["_seen_upload_sig"] = _upload_sig(uploaded_file)
+        return _finalize(df, source)
 
     # 2) Live file upload — but only treat it as authoritative when it's a
     #    *new* file. The uploader keeps returning the same object across
@@ -1926,32 +2134,62 @@ def _load_schedule_df(
                 csv_bytes, sheet = upload_to_schedule_csv(
                     getattr(uploaded_file, "name", ""), uploaded_file.getvalue(),
                 )
+                # Parse before promoting: bytes the loader can't read never
+                # become the active schedule (they used to, and the same
+                # exception then came back on every rerun).
+                df = load_schedule(
+                    io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
+                    placeholder_map=placeholder_map, acc_skus=acc_skus,
+                    absorb_foreign_locations=_absorb_foreign,
+                )
             except ScheduleColumnError as exc:
-                # No sheet had a usable header. Remember the failure so later
-                # reruns (any widget nudge) keep showing the banner instead of
-                # silently reviving the previous schedule — the persistence a
-                # malformed CSV already gets by living in _active_schedule_csv.
-                st.session_state.pop("_active_schedule_csv", None)
-                st.session_state.pop("_active_schedule_name", None)
-                st.session_state.pop("_active_schedule_auto_for", None)
+                # The file is unusable. Remember the failure so later reruns
+                # (any widget nudge) keep showing the banner instead of
+                # silently reviving the previous schedule — but keep that
+                # previous schedule aside: "⏮ Back to the previous schedule"
+                # and emptying the uploader both put it back.
+                if st.session_state.get("_active_schedule_csv") is not None:
+                    st.session_state["_schedule_before_error"] = {
+                        "csv": st.session_state.get("_active_schedule_csv"),
+                        "source": st.session_state.get("_active_schedule_source"),
+                        "name": st.session_state.get("_active_schedule_name"),
+                        "sheet": st.session_state.get("_active_schedule_sheet"),
+                        "auto_for": st.session_state.get("_active_schedule_auto_for"),
+                        "_schedule_undo": st.session_state.get("_schedule_undo"),
+                        "_schedule_original": st.session_state.get("_schedule_original"),
+                        "_schedule_edit_count": st.session_state.get("_schedule_edit_count"),
+                    }
+                for _k in ("_active_schedule_csv", "_active_schedule_name",
+                           "_active_schedule_auto_for", "_schedule_undo",
+                           "_schedule_original", "_schedule_edit_count"):
+                    st.session_state.pop(_k, None)
                 st.session_state["_active_schedule_sheet"] = None
                 st.session_state["_active_schedule_error"] = str(exc)
                 raise
             st.session_state.pop("_active_schedule_error", None)
+            st.session_state.pop("_schedule_before_error", None)
             st.session_state["_active_schedule_csv"] = csv_bytes
             st.session_state["_active_schedule_source"] = "upload"
             st.session_state["_active_schedule_sheet"] = sheet
-            st.session_state["_active_schedule_name"] = (
-                getattr(uploaded_file, "name", None) or None
-            )
+            _upload_name = getattr(uploaded_file, "name", None) or None
+            st.session_state["_active_schedule_name"] = _upload_name
             st.session_state.pop("_active_schedule_auto_for", None)
-            df = load_schedule(
-                io.BytesIO(csv_bytes), location=location, machine_skus=machine_skus,
-                placeholder_map=placeholder_map, acc_skus=acc_skus,
-                absorb_foreign_locations=_absorb_foreign,
-            )
+            st.session_state.pop("_schedule_undo", None)
+            st.session_state["_schedule_edit_count"] = 0
+            st.session_state["_schedule_original"] = {
+                "csv": csv_bytes, "source": "upload", "name": _upload_name,
+                "sheet": sheet,
+            }
             return _finalize(df, "upload")
         # Same file as before → fall through to the persisted active schedule.
+
+    # 2b) The failed upload has left the uploader: the error has nothing to
+    #     describe any more. Put back what was active before it (or let 3c /
+    #     4 resolve afresh) instead of keeping the banner up for a file that
+    #     is gone while the sidebar talks about the bundled sample.
+    if uploaded_file is None and st.session_state.get("_active_schedule_error"):
+        st.session_state.pop("_seen_upload_sig", None)
+        _restore_schedule_before_error()
 
     # 3) Persisted active schedule — survives reruns from slider/widget changes.
     #    An automatic first pick (3c) belongs to the facility it was picked
@@ -1962,7 +2200,8 @@ def _load_schedule_df(
     _auto_for = st.session_state.get("_active_schedule_auto_for")
     if active is not None and _auto_for and _auto_for != location:
         for _k in ("_active_schedule_csv", "_active_schedule_source",
-                   "_active_schedule_name", "_active_schedule_auto_for"):
+                   "_active_schedule_name", "_active_schedule_auto_for",
+                   "_schedule_undo", "_schedule_original", "_schedule_edit_count"):
             st.session_state.pop(_k, None)
         active = None
     if active is not None:
@@ -2000,6 +2239,11 @@ def _load_schedule_df(
             st.session_state["_active_schedule_name"] = _name
             st.session_state["_active_schedule_auto_for"] = location
             st.session_state.pop("_active_schedule_error", None)
+            st.session_state.pop("_schedule_undo", None)
+            st.session_state["_schedule_edit_count"] = 0
+            st.session_state["_schedule_original"] = {
+                "csv": csv_bytes, "source": "saved", "name": _name, "sheet": None,
+            }
             try:
                 df = load_schedule(
                     io.BytesIO(csv_bytes), location=location,
@@ -2012,7 +2256,8 @@ def _load_schedule_df(
                 # planner never chose it. Fall back to the sample.
                 for _k in ("_active_schedule_csv", "_active_schedule_source",
                            "_active_schedule_sheet", "_active_schedule_name",
-                           "_active_schedule_auto_for"):
+                           "_active_schedule_auto_for", "_schedule_original",
+                           "_schedule_edit_count"):
                     st.session_state.pop(_k, None)
             else:
                 _track_and_flush(
@@ -2234,17 +2479,13 @@ def _render_sequencer_controls(
                 st.session_state.pop("_proposed_schedule_overloads", None)
                 # Push the accepted CSV through the upload buffer so the
                 # standard loader path picks it up on the next rerun.
-                csv_text = accepted.to_csv(index=False)
-                st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
-                    csv_text.encode("utf-8")
-                )
-                _track_and_flush(
-                    "sequencer_accept",
+                _commit_reshape(
+                    accepted, "Accepted the level-loaded proposal",
+                    event="sequencer_accept",
                     facility=inputs.get("location"),
                     rows=int(len(accepted)),
                     overloads=len(overloads),
                 )
-                st.success("Proposal accepted — refreshing the analysis…")
                 st.rerun()
             if c2.button("🚫 Discard", width="stretch"):
                 st.session_state.pop("_proposed_schedule", None)
@@ -2503,15 +2744,10 @@ def _apply_sequencer_edits(base_df: pd.DataFrame, edited: pd.DataFrame) -> None:
     """
     try:
         merged = _merge_sequencer_edits_into_full(base_df, edited)
-        csv_text = merged.to_csv(index=False)
-        st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
-            csv_text.encode("utf-8")
+        _commit_reshape(
+            merged, "Applied the sequence edits",
+            event="sequencer_apply", rows=int(len(merged)),
         )
-        _track_and_flush(
-            "sequencer_apply",
-            rows=int(len(merged)),
-        )
-        st.success("Edits applied — refreshing the analysis…")
         st.rerun()
     except Exception as e:
         st.error(f"❌ Couldn't apply edits: {e}")
@@ -2656,17 +2892,12 @@ def _render_bulk_move_form(
         return
 
     # Commit through the same buffer the editor uses.
-    csv_text = new_df.to_csv(index=False)
-    st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
-        csv_text.encode("utf-8")
-    )
-    _track_and_flush(
-        "sequencer_bulk_move",
+    _commit_reshape(
+        new_df,
+        f"Moved {moved} unit(s) of {chosen_sku} from week {from_week} to "
+        f"week {to_week} of {label}",
+        event="sequencer_bulk_move",
         sku=chosen_sku, from_week=from_week, to_week=to_week, units=moved,
-    )
-    st.success(
-        f"🔀 Moved **{moved}** unit(s) of **{chosen_sku}** from "
-        f"week {from_week} → week {to_week} of {label}."
     )
     st.rerun()
 
@@ -2902,17 +3133,12 @@ def _render_suffix_cleanup_view(
         ),
     ):
         try:
-            csv_text = cleaned.to_csv(index=False)
-            st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
-                csv_text.encode("utf-8")
-            )
-            _track_and_flush(
-                "suffix_cleanup_strip",
+            _commit_reshape(
+                cleaned,
+                f"Stripped suffixes from {n_fg_preview} FG and "
+                f"{n_acc_preview} accessory cells",
+                event="suffix_cleanup_strip",
                 n_fg=n_fg_preview, n_acc=n_acc_preview,
-            )
-            st.success(
-                f"✅ Stripped suffixes from **{n_fg_preview} FG** + "
-                f"**{n_acc_preview} accessory** cells — refreshing analysis…"
             )
             st.rerun()
         except Exception as e:
@@ -3690,20 +3916,39 @@ def _uploaded_schedule_load(location: str, name: str) -> None:
     buffer is cleared once consumed, so a fresh upload still wins on the
     rerun after that.
     """
+    if _queue_saved_schedule_load(location, name):
+        _defer_rerun()
+
+
+def _queue_saved_schedule_load(location: str, name: str) -> bool:
+    """Queue the saved schedule ``name`` for the resolver (a fresh load: it
+    names the schedule and starts the edit history over). Shared by the
+    sidebar's 📥 Load (which defers its rerun) and the main panel's way-back
+    buttons (which rerun at once). False when the save is empty."""
     block = get_uploaded_schedule(location, name) or {}
     csv_text = block.get("csv_content", "")
     if not csv_text:
         st.warning(f"Saved schedule '{name}' is empty.")
-        return
-    st.session_state["_loaded_schedule_buffer"] = io.BytesIO(csv_text.encode("utf-8"))
-    st.session_state["_loaded_schedule_name"] = name
+        return False
+    _queue_schedule_bytes(
+        csv_text.encode("utf-8"), kind=None, source="saved", name=name,
+        toast=f"📥 Loaded saved schedule **{name}** for {location}.",
+    )
     _track_and_flush("schedule_load_saved", facility=location, name=name)
     # Shown at the top of the panel on the rerun — a message drawn here would
     # be thrown away with the rest of this run.
     st.session_state[f"_uploaded_schedule_toast_{location}"] = (
         "success", f"📥 Loaded saved schedule **{name}** for {location}.",
     )
-    _defer_rerun()
+    return True
+
+
+def _queue_newest_saved_load(location: str) -> bool:
+    """Queue the facility's newest saved schedule — the 📂 picker's default."""
+    newest = _newest_saved_schedule(location)
+    if newest is None:
+        return False
+    return _queue_saved_schedule_load(location, newest[0])
 
 
 def _uploaded_schedule_delete(location: str, name: str) -> None:
@@ -5559,7 +5804,16 @@ def render_sidebar() -> dict:
         # edit sticks until the month or window changes.
         _pm_working_days = len(_plan_working_days)
         _now = now_local()
-        _today_in_plan_month = (_now.year, _now.month) == (plan_month[0], plan_month[1])
+        # Same rule main() uses to decide whether the window slices anything
+        # (today inside the Plan month and, once the schedule is known, a
+        # month its rows are DATED in — PRODUCTION DAY after auto-spread, not
+        # the file's own PRODUCTION MONTH) — so demand and capacity always
+        # cover the same period. The dated months come from the previous
+        # run's load (main() records them); the first run of a new schedule
+        # re-syncs on the next one.
+        _today_in_plan_month = _window_applies(
+            plan_month, st.session_state.get(SCHEDULE_DATED_MONTHS_KEY) or [],
+        )
         if time_window == "This week" and _today_in_plan_month:
             _target_days = 5
         elif time_window == "Remaining (from today)" and _today_in_plan_month:
@@ -11585,6 +11839,82 @@ def _render_tab_strip() -> str:
     return choice
 
 
+def _render_schedule_recovery_buttons(inputs: dict) -> None:
+    """The ways back from an upload the loader couldn't read, under the error
+    banner: the schedule that was active before it, the facility's newest
+    saved schedule, or the bundled sample. Main-panel buttons rerun at once
+    (the sidebar is already built)."""
+    location = inputs.get("location", "Henderson")
+    has_prev = isinstance(st.session_state.get("_schedule_before_error"), dict)
+    has_saved = _newest_saved_schedule(location) is not None
+    cols = st.columns(3)
+    if has_prev and cols[0].button(
+        "⏮ Back to the previous schedule", key="recover_prev_btn", width="stretch",
+        help="Puts back the schedule that was being analysed before this upload.",
+    ):
+        if _restore_schedule_before_error():
+            st.session_state["_schedule_toast"] = (
+                "success", "⏮ Back to the schedule from before the upload.",
+            )
+        st.rerun()
+    if has_saved and cols[1].button(
+        "📂 Load the newest saved schedule", key="recover_newest_btn", width="stretch",
+    ):
+        if _queue_newest_saved_load(location):
+            st.rerun()
+    if cols[2].button(
+        "🧪 Use the bundled sample", key="recover_sample_btn", width="stretch",
+    ):
+        if _queue_bundled_sample_load():
+            st.rerun()
+    st.caption(
+        "Or remove the file from the uploader to go back to what was loaded "
+        "before, and fix the file before uploading it again."
+    )
+
+
+def _render_schedule_toast_and_undo(inputs: dict) -> None:
+    """Replay the one-shot schedule toast and, in upload mode, offer ↩️ Undo /
+    ⏮ Back to as loaded while the active schedule carries reshapes; in ✏️
+    manual mode, ↩️ Back to the list as typed while an override is laid over
+    the grid."""
+    toast = st.session_state.pop("_schedule_toast", None)
+    if isinstance(toast, tuple) and len(toast) == 2:
+        (st.success if toast[0] == "success" else st.info)(toast[1])
+    manual = inputs.get("schedule_mode") == SCHEDULE_MODE_MANUAL
+    if manual:
+        if st.session_state.get("_manual_schedule_override") is not None:
+            if st.button(
+                "↩️ Back to the list as typed", key="manual_override_back_btn",
+                help="Forget the reshape laid over the grid and analyse the rows as typed.",
+            ):
+                _drop_manual_override()
+                st.rerun()
+        return
+    edits = _schedule_edit_count()
+    if edits <= 0:
+        return
+    undo = st.session_state.get("_schedule_undo")
+    undo_label = (undo.get("label") if isinstance(undo, dict) else None) or "the last change"
+    c1, c2, c3 = st.columns([2, 2, 3])
+    if isinstance(undo, dict) and c1.button(
+        f"↩️ Undo: {undo_label}", key="schedule_undo_btn", width="stretch",
+        help="Puts the schedule back as it was before that change.",
+    ):
+        if _undo_last_reshape():
+            st.rerun()
+    if isinstance(st.session_state.get("_schedule_original"), dict) and c2.button(
+        "⏮ Back to as loaded", key="schedule_restore_btn", width="stretch",
+        help=f"Drops all {edits} change(s) made since this schedule was loaded.",
+    ):
+        if _restore_schedule_as_loaded():
+            st.rerun()
+    c3.caption(
+        f"✏️ {edits} change(s) since this schedule was loaded — not saved yet. "
+        "💾 Save schedule in the sidebar keeps them for the team."
+    )
+
+
 def main():
     st.title("🏭 Labor Capacity Planner")
     st.caption(
@@ -11622,6 +11952,7 @@ def main():
     # ----------------------------------------------------------------
     schedule_df = pd.DataFrame()
     empty_banner_msg = None
+    schedule_load_error = None
 
     if inputs.get("schedule_mode") == SCHEDULE_MODE_MANUAL:
         manual_entries = inputs.get("manual_entries")
@@ -11672,6 +12003,7 @@ def main():
                 f"📤 **We couldn't read your uploaded schedule.**  \n{e}  \n"
                 "You can still use **📁 Data & Setup** to browse and edit catalogs."
             )
+            schedule_load_error = str(e)
             schedule_df = pd.DataFrame()
             # The pill must never describe a schedule that didn't load.
             st.session_state.pop("_last_upload_summary", None)
@@ -11713,6 +12045,8 @@ def main():
         schedule_df = _recompute_carryover(schedule_df, inputs.get("plan_month"))
 
     schedule_df_full = schedule_df.copy() if not schedule_df.empty else schedule_df
+    if schedule_df.empty or "PRODUCTION DAY" not in schedule_df.columns:
+        st.session_state.pop(SCHEDULE_DATED_MONTHS_KEY, None)
     if not schedule_df.empty and "PRODUCTION DAY" in schedule_df.columns:
         window = inputs.get("time_window", "Whole month")
         # Detect the schedule's actual month so "This week" / "Remaining"
@@ -11722,19 +12056,22 @@ def main():
         _now = now_local()
         _today_date = _now.date()
         _today_ts = pd.Timestamp(_today_date)
-        _sched_months = set(
-            schedule_df["PRODUCTION DAY"].dropna().dt.to_period("M").astype(str)
-        ) if "PRODUCTION DAY" in schedule_df.columns else set()
-        _today_period = f"{_now.year}-{_now.month:02d}"
-        _today_in_schedule_month = _today_period in _sched_months
+        _sched_periods = (
+            schedule_df["PRODUCTION DAY"].dropna().dt.to_period("M")
+            if "PRODUCTION DAY" in schedule_df.columns else pd.Series(dtype=object)
+        )
+        _sched_months = {str(p) for p in _sched_periods}
+        _dated_months = sorted({(int(p.year), int(p.month)) for p in _sched_periods})
+        st.session_state[SCHEDULE_DATED_MONTHS_KEY] = _dated_months
+        _today_in_schedule_month = _window_applies(inputs.get("plan_month"), _dated_months)
 
         if window == "This week":
             if not _today_in_schedule_month:
                 empty_banner_msg = (
                     "📅 **\"This week\" was ignored** — today isn't inside "
-                    "this schedule's month. Switch the **Time window** "
-                    "selector back to *Whole month* (or pick a date inside "
-                    "the schedule's month for the filter to work)."
+                    "the month this plan is dated in. Set the **Time window** "
+                    "back to *Whole month*, or pick the schedule's own month "
+                    "as the **Plan month**."
                 )
             else:
                 current_week = week_of_month(_today_date)
@@ -11848,6 +12185,13 @@ def main():
     # Top-of-page banner when there's no schedule loaded
     if empty_banner_msg:
         st.info(empty_banner_msg)
+    if schedule_load_error:
+        _render_schedule_recovery_buttons(inputs)
+
+    # What the last reshape / way-back action did — stashed before its rerun
+    # so the message survives — and, while the active schedule carries
+    # reshapes, the ways back.
+    _render_schedule_toast_and_undo(inputs)
 
     # Top-of-page reconciliation banner — units the loader had to DROP, i.e.
     # exactly the gap between the unit total in the planner's source file and
@@ -11996,15 +12340,10 @@ def main():
                         inputs["location"], _plan_ym,
                     )
                     if _n:
-                        st.session_state["_loaded_schedule_buffer"] = io.BytesIO(
-                            _new_df.to_csv(index=False).encode("utf-8")
-                        )
-                        _track_and_flush(
-                            "plan_month_transfer",
+                        _commit_reshape(
+                            _new_df, f"Moved {_n} row(s) into {_plan_lbl}",
+                            event="plan_month_transfer",
                             facility=inputs.get("location"), n=_n,
-                        )
-                        st.success(
-                            f"✅ Moved **{_n}** row(s) into {_plan_lbl} — refreshing…"
                         )
                         st.rerun()
                     else:

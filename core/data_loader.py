@@ -878,6 +878,30 @@ def _apply_placeholder_recovery(
     return summary
 
 
+def _read_schedule_table(path) -> pd.DataFrame:
+    """``pd.read_csv`` for a schedule, with a parse failure turned into the
+    planner-facing :class:`ScheduleColumnError`.
+
+    ``ParserError`` (ragged rows, an unterminated quote) and ``EmptyDataError``
+    (an empty file) are ``ValueError`` subclasses that used to escape
+    ``load_schedule`` unhandled; the app had already made the bytes its active
+    schedule, so the same exception came back on every rerun with no way out
+    but a browser reload. Now the message says what to do and the resolver
+    never stores bytes it couldn't read.
+    """
+    try:
+        return pd.read_csv(path, encoding="latin-1")
+    except ScheduleColumnError:
+        raise
+    except ValueError as exc:
+        first = str(exc).strip().splitlines()
+        reason = (first[0][:160] if first else exc.__class__.__name__)
+        raise ScheduleColumnError(
+            f"We couldn't read this file as a CSV table ({reason}). Export the "
+            "sheet as CSV (UTF-8) or upload the .xlsx workbook itself."
+        ) from exc
+
+
 def load_schedule(
     path: Union[Path, str, io.IOBase, None] = None,
     location: str = "HENDERSON",
@@ -925,7 +949,7 @@ def load_schedule(
     """
     if path is None:
         path = DATA_DIR / "may_schedule.csv"
-    df = pd.read_csv(path, encoding="latin-1")
+    df = _read_schedule_table(path)
     source_rows = int(len(df))
 
     # 1) Strip UTF-8 BOM and stray whitespace from column headers so an Excel

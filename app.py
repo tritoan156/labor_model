@@ -5470,8 +5470,6 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
 
 def render_sidebar() -> dict:
     st.sidebar.title("🏭 Labor Planning")
-    st.sidebar.caption("Set up your scenario, then review tabs on the right.")
-    st.sidebar.markdown("---")
 
     # ----------------------------------------------------------------
     # STEP 1 — Facility (always visible)
@@ -5494,6 +5492,7 @@ def render_sidebar() -> dict:
         "How would you like to enter the build plan?",
         [SCHEDULE_MODE_UPLOAD, SCHEDULE_MODE_MANUAL],
         index=0,
+        label_visibility="collapsed",
         help=(
             "Upload a full production schedule (CSV or Excel workbook) — best "
             "for monthly planning. Or paste a SKU list straight out of Excel "
@@ -5551,10 +5550,8 @@ def render_sidebar() -> dict:
             ),
         )
         st.sidebar.caption(
-            "📂 The newest schedule saved for this facility loads first; "
-            "upload a file to analyse something else. "
-            "🔒 Uploaded schedules stay in your browser by default — "
-            "use the 📂 panel below to save one to GitHub for the team."
+            "📂 The newest schedule saved for this facility loads first. "
+            "Uploads stay in your browser until you save one below."
         )
         # A per-plant export can tag a row with the facility the unit is headed
         # to rather than the one building it (the Henderson sheet carries rows
@@ -5588,9 +5585,8 @@ def render_sidebar() -> dict:
         # manual rows automatically; the time-window radio below works
         # for both modes.
         st.sidebar.caption(
-            "Enter FG SKU, Accessory SKU (optional), and Quantity for each row. "
-            "Already have the list in Excel? Use **📋 Paste a list from Excel** "
-            "below — or **📚 Browse catalog** to pick from the known SKUs."
+            "One row per FG SKU (accessory optional) — or paste the list from "
+            "Excel below."
         )
 
         # Cached loaders — same path as main(), no extra I/O
@@ -6910,9 +6906,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     total_units = len(units)
     if total_units == 0 or capacity is None or capacity.empty:
         st.info(
-            "ℹ️ **No schedule loaded.** Upload a CSV or type a few SKUs "
-            "in the sidebar to see your plan's capacity picture and "
-            "recommended actions."
+            "ℹ️ **No schedule loaded.** Upload a file or type SKUs in the sidebar."
         )
         return
 
@@ -6920,7 +6914,6 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # Compute headline numbers
     # =============================================================
     total_labor = int(units["total_labor"].sum())
-    total_batt = int(units["Bat"].where(units["Battery"] > 0, 0).sum())
     # Production HC drives the Required-HC gap; support (Lead/Other) is shown
     # separately so it never makes the plant look falsely overstaffed.
     production_hc, support_hc, total_hc = _split_crew_hc(inputs["crew_config"])
@@ -6932,50 +6925,41 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     over_stations = capacity[capacity["overall_status"] == "🔴 OVER"].index.tolist()
     no_station_list = capacity[capacity["overall_status"] == "🔴 NO STATION"].index.tolist()
     near_cap = capacity[capacity["overall_status"] == "🟠 NEAR-CAP"].index.tolist()
-    tight = capacity[capacity["overall_status"] == "🟡 TIGHT"].index.tolist()
-    ok_stations = capacity[capacity["overall_status"] == "🟢 OK"].index.tolist()
 
     # =============================================================
-    # Big status banner
+    # Layout — the answer first, the detail one click away. This tab used
+    # to stack ten sections (two KPI rows under their own headings, a
+    # paragraph-long bottleneck box, a heatmap, a card grid, a bar chart)
+    # between horizontal rules, so a planner read and scrolled before
+    # finding the verdict. Now: one status line, one KPI row, one
+    # bottleneck line, short actions, then the station / week / battery
+    # visuals behind tabs so only one of them is on screen at a time.
+    # Explanations live in the ⓘ tooltips.
     # =============================================================
     month_label = f" · {schedule_month}" if schedule_month else ""
     st.markdown(f"### {inputs['location']} Manufacturing{month_label}")
 
-    has_blocker = bool(over_stations or no_station_list)
-    has_warning = bool(near_cap)
-
-    if has_blocker:
-        blockers = []
+    if over_stations or no_station_list:
+        _blockers = []
         if over_stations:
-            blockers.append(f"{len(over_stations)} station(s) **over capacity** ({', '.join(over_stations)})")
+            _blockers.append(f"{len(over_stations)} station(s) over capacity")
         if no_station_list:
-            blockers.append(f"{len(no_station_list)} station(s) **not available** here ({', '.join(no_station_list)})")
-        st.error(
-            "🚨 **Action needed.** " + " · ".join(blockers)
-            + "\n\nSee the **Capacity** and **Recommendations** tabs for fixes."
-        )
-    elif has_warning:
+            _blockers.append(f"{len(no_station_list)} with no staff")
+        st.error("🚨 **Action needed** — " + ", ".join(_blockers) + ".")
+    elif near_cap:
         st.warning(
-            f"⚠️ **Watch closely.** {len(near_cap)} station(s) near capacity: "
-            f"**{', '.join(near_cap)}**. Small changes could push them over."
+            f"⚠️ **Watch closely** — {', '.join(near_cap)} "
+            f"{'is' if len(near_cap) == 1 else 'are'} near capacity."
         )
     else:
-        st.success("✅ **All clear.** Every station is within safe capacity for this plan.")
-
-    st.markdown("---")
+        st.success("✅ **All clear** — every station is within safe capacity.")
 
     # =============================================================
-    # Hero KPIs — planner's decision row
-    # ----------------------------------------------------------------
-    # Story arc: what was asked (Planned) → what's possible (Buildable)
-    # → the gap as % (Coverage) → workload context (Total work). The
-    # bottleneck station name lives in the single-line readout BELOW
-    # this row, not in a 5th KPI column — keeps the headline focused on
-    # the question "can I build this plan?" and avoids naming the
-    # bottleneck in 4 different places.
+    # KPI row — what was asked (Planned, with its total work) → what's possible
+    # (Buildable, with the gap and coverage % as its delta) → the people
+    # you have vs need. The bottleneck station is named once, in the line
+    # BELOW this row.
     # =============================================================
-    st.markdown("#### 📦 What this plan builds")
-
     # Buildable is LINE-AWARE: the plant runs parallel production lines
     # (Compressor / Generator / EBOSS / PM) whose outputs add up, so one line
     # isn't throttled by another line's bottleneck (e.g. PDS/compressor is not
@@ -6989,119 +6973,33 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     coverage_pct = (buildable_units / total_units * 100.0) if total_units > 0 else 0.0
     gap_units = buildable_units - total_units  # negative = short; positive = surplus
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(
+    # Four columns, not five: at a laptop width a fifth one truncated both its
+    # value and the labels. The plan's total work rides on Units planned as a
+    # grey note — it sizes the plan rather than deciding anything.
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
         "Units planned", f"{total_units:,}",
-        help="Total finished-good units in this schedule (or manual entry).",
-    )
-    c2.metric(
-        "Buildable units", f"{buildable_units:,}",
+        delta=f"{total_labor / 60.0:,.0f} p-hr of work",
+        delta_color="off", delta_arrow="off",
         help=(
-            "How many units of the current SKU mix the facility can build this "
-            "month. Summed across the parallel production lines (Compressor / "
-            "Generator / EBOSS / PM) — each scales to its OWN bottleneck, so one "
-            "line isn't throttled by another's constraint. See the per-line "
-            "breakdown below."
+            "Total finished-good units in this schedule (or manual entry). "
+            f"Total work across all stations: {_fmt_min_hr(total_labor)}."
         ),
     )
-    # Coverage delta-color: "normal" means a POSITIVE delta (surplus = more
-    # buildable than planned) renders green, and a NEGATIVE delta (short of
-    # plan = bad) renders red. That's the natural "growth is good" reading
-    # for this metric — we want planners to see red when they can't cover
-    # the plan and green when they have headroom.
-    c3.metric(
-        "Coverage", f"{coverage_pct:.0f}%",
-        delta=f"{gap_units:+,} vs plan",
+    # delta_color "normal": a surplus (positive gap) renders green, a
+    # shortfall (negative) red — red when the plan can't be covered.
+    k2.metric(
+        "Buildable units", f"{buildable_units:,}",
+        delta=f"{gap_units:+,} · {coverage_pct:.0f}% of plan",
         delta_color="normal",
         help=(
-            "Buildable ÷ Planned. <100% = the plan exceeds capacity at this "
-            "mix; ≥100% = you have headroom. The delta shows the unit gap."
+            "How many units of the current SKU mix the facility can build this "
+            "month, summed across the parallel production lines (Compressor / "
+            "Generator / EBOSS / PM) — each scales to its OWN bottleneck. The "
+            "delta is the gap to plan and the coverage (buildable ÷ planned)."
         ),
     )
-    _tl_min = int(round(float(total_labor or 0)))
-    _tl_hr = float(total_labor or 0) / 60.0
-    c4.metric(
-        "Total work", f"{_tl_min:,} p-min",
-        help="Total labor required across all stations, shown as person-minutes (with person-hours below).",
-    )
-    c4.caption(f"≈ {_tl_hr:,.1f} p-hr")
-
-    # Per-line breakdown — show how buildable decomposes across the parallel
-    # production lines (only meaningful when the plan spans more than one line).
-    _render_buildable_by_line(_bl, buildable_units)
-
-    if _excluded:
-        st.caption(
-            "⏸️ **Buildable** excludes "
-            + ", ".join(f"**{s}**" for s in _excluded)
-            + " (set in the sidebar → **⏱️ Working-time settings**) — those "
-            "stations don't cap the count. They're still shown on the "
-            "**Capacity** tab."
-        )
-
-    # ----------------------------------------------------------------
-    # Bottleneck line — single, definitive, sits right under the KPIs.
-    # Replaces the previous markdown headline + 2-metric Labor/Throughput
-    # row + caption (the data is preserved inline here).
-    # ----------------------------------------------------------------
-    _lu = float(_mu.get("labor_max_util_safe", 0) or 0)
-    _tu = float(_mu.get("thru_max_util_safe", 0) or 0)
-    _lm = int(_mu.get("labor_max_units", 0) or 0)
-    _tm = int(_mu.get("thru_max_units", 0) or 0)
-    _lb = _mu.get("labor_bottleneck", "") or "—"
-    _tb = _mu.get("thru_bottleneck", "") or "—"
-
-    if _mu["infeasible"]:
-        _ms = ", ".join(f"**{s}**" for s in _mu["missing_stations"])
-        _pm = int(_mu.get("potential_max_units", 0))
-        _pb = _mu.get("potential_bottleneck", "")
-        _pu = float(_mu.get("potential_util_safe", 0) or 0)
-        if _pm > 0 and _pb:
-            _ceiling = (
-                f" Once those are staffed, the next bottleneck would be "
-                f"**{_pb}** at {_pu:.0%} util — capping the mix at "
-                f"**{_pm:,} units**."
-            )
-        elif _pm > 0:
-            _ceiling = (
-                f" Once those are staffed, no other station is binding — "
-                f"the mix could go up to **{_pm:,} units**."
-            )
-        else:
-            _ceiling = ""
-        _one = len(_mu["missing_stations"]) == 1
-        st.error(
-            f"🏭 **Whole-mix cap: 0 units** — holding the current SKU mix in "
-            f"fixed proportion, {_ms} {'has' if _one else 'have'} no HC but this "
-            f"mix needs it, so the mix can't scale as a single block. "
-            f"(Lines that don't route through {'that station' if _one else 'those stations'} "
-            f"can still build — see the per-line **Buildable** breakdown above.) "
-            f"Add headcount in the 👥 **Station headcount** sidebar panel to "
-            f"unlock the full plan.{_ceiling}"
-        )
-    elif _mu.get("bottleneck"):
-        st.markdown(
-            f"🎯 **Bottleneck: {_mu['bottleneck']} · "
-            f"{_mu['max_util_safe']:.0%} util.** "
-            f"Labor cap: **{_lm:,}** ({_lb}) · "
-            f"Throughput cap: **{_tm:,}** ({_tb})."
-        )
-    else:
-        st.markdown(
-            f"🎯 **No binding station detected.** "
-            f"Mix scales freely — capacity headroom available."
-        )
-
-    st.caption(
-        "Scales the current SKU mix proportionally until any station hits "
-        "its safe capacity (HC × shift × days × efficiency × safety) or "
-        "throughput cap. Relieve the bottleneck by adding HC to that "
-        "station in the 👥 **Station headcount** panel."
-    )
-
-    st.markdown("#### 👥 Headcount picture")
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric(
+    k3.metric(
         "People you have", f"{production_hc}",
         help=(
             f"Production headcount across {active_stations} active stations."
@@ -7109,28 +7007,78 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
                "headcount." if support_hc else "")
         ),
     )
-    c6.metric(
+    if total_hc_gap > 0:
+        _hc_delta = f"+{total_hc_gap} short"
+    elif total_hc_gap < 0:
+        _hc_delta = f"-{abs(total_hc_gap)} spare"
+    else:
+        _hc_delta = None
+    k4.metric(
         "People you need", f"{total_required_hc}",
+        delta=_hc_delta,
+        delta_color="inverse",
         help=(
             f"Sum of headcount required at every station to meet this plan, "
             f"using your buffer ({inputs['safety']:.2f}) and "
-            f"productive-time settings ({inputs['efficiency']:.3f})."
+            f"productive-time settings ({inputs['efficiency']:.3f}). The delta "
+            "is the difference to the people you have."
         ),
     )
-    gap_label = "Short" if total_hc_gap > 0 else ("Surplus" if total_hc_gap < 0 else "Even")
-    c7.metric(
-        gap_label, f"{abs(total_hc_gap)}",
-        delta=f"{total_hc_gap:+d}" if total_hc_gap != 0 else None,
-        delta_color="inverse",
-        help="Difference between people you need and people you have.",
-    )
-    short_count = int((capacity["hc_gap"] > 0).sum())
-    c8.metric(
-        "Stations needing more people", f"{short_count}",
-        help="Stations where required headcount exceeds what you have today.",
-    )
 
-    st.markdown("---")
+    # ----------------------------------------------------------------
+    # Bottleneck line — single, definitive, sits right under the KPIs.
+    # ----------------------------------------------------------------
+    _how = (
+        "Scales the current SKU mix proportionally until any station hits its "
+        "safe capacity (HC × shift × days × efficiency × safety) or throughput "
+        "cap. Relieve the bottleneck by adding HC to that station in the "
+        "👥 Station headcount panel."
+    )
+    _lm = int(_mu.get("labor_max_units", 0) or 0)
+    _tm = int(_mu.get("thru_max_units", 0) or 0)
+    _lb = _mu.get("labor_bottleneck", "") or "—"
+    _tb = _mu.get("thru_bottleneck", "") or "—"
+    if _mu["infeasible"]:
+        _missing = list(_mu["missing_stations"])
+        _pm = int(_mu.get("potential_max_units", 0))
+        _pb = _mu.get("potential_bottleneck", "")
+        _pu = float(_mu.get("potential_util_safe", 0) or 0)
+        if _pm > 0 and _pb:
+            _next = f" Next limit once staffed: **{_pb}** at {_pu:.0%} ({_pm:,} units)."
+        elif _pm > 0:
+            _next = f" Once staffed, the mix could reach **{_pm:,} units**."
+        else:
+            _next = ""
+        st.markdown(
+            f"🎯 **Bottleneck: {', '.join(_missing)} "
+            f"{'has' if len(_missing) == 1 else 'have'} no staff**, so the whole "
+            f"mix can't scale.{_next}",
+            help=(
+                _how + " With an unstaffed station the mix can't scale as one "
+                "block (whole-mix cap 0), but lines that don't route through it "
+                "still count toward Buildable — see the per-line breakdown."
+            ),
+        )
+    elif _mu.get("bottleneck"):
+        st.markdown(
+            f"🎯 **Bottleneck: {_mu['bottleneck']} · "
+            f"{_mu['max_util_safe']:.0%} util** — labor cap {_lm:,} ({_lb}) · "
+            f"throughput cap {_tm:,} ({_tb}).",
+            help=_how,
+        )
+    else:
+        st.markdown("🎯 **No binding station** — the mix has headroom.", help=_how)
+
+    if _excluded:
+        st.caption(
+            "⏸️ Buildable ignores "
+            + ", ".join(f"**{s}**" for s in _excluded)
+            + " (⏱️ Working-time settings)."
+        )
+
+    # Per-line breakdown — show how buildable decomposes across the parallel
+    # production lines (only meaningful when the plan spans more than one line).
+    _render_buildable_by_line(_bl, buildable_units)
 
     # =============================================================
     # Proposed-schedule preview — Sequencer feature. When the planner has
@@ -7138,6 +7086,34 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # weekly heatmap side-by-side with the current one so the comparison
     # is glanceable.
     # =============================================================
+    def _make_heatmap(df_util, title=None):
+        # Clip the color scale at 1.5× so spikes don't wash out the lower end.
+        # zmin=0 keeps green visible; zmax=1.5 means anything ≥150% looks
+        # the same deep red — which is fine since that's "definitely red".
+        fig = px.imshow(
+            df_util,
+            text_auto=".0%",
+            color_continuous_scale=[
+                (0.00, "#16A34A"),  # green
+                (0.60, "#A3E635"),  # light green
+                (0.75, "#FACC15"),  # yellow
+                (0.90, "#F97316"),  # orange
+                (1.00, "#DC2626"),  # red
+            ],
+            zmin=0, zmax=1.5,
+            aspect="auto",
+            labels={"x": "Week", "y": "Station", "color": "Util %"},
+        )
+        layout = dict(
+            height=min(400, 60 + 28 * max(len(df_util.index), 1)),
+            margin=dict(l=4, r=4, t=40 if title else 8, b=4),
+            coloraxis_showscale=False,
+        )
+        if title:
+            layout["title"] = dict(text=title, font=dict(size=14))
+        fig.update_layout(**layout)
+        return fig
+
     _proposed = st.session_state.get("_proposed_schedule")
     if (
         isinstance(_proposed, pd.DataFrame) and not _proposed.empty
@@ -7160,35 +7136,8 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
         except Exception:
             proposed_util = None
         if proposed_util is not None and not proposed_util.empty:
-            st.markdown("#### 💡 Current vs proposed (side-by-side)")
-            st.caption(
-                "Left: your **current** weekly pressure. Right: the Sequencer's "
-                "**proposed** level-loaded version. Scroll up to ✅ Accept or 🚫 Discard."
-            )
-
-            def _make_heatmap(df_util, title):
-                fig = px.imshow(
-                    df_util,
-                    text_auto=".0%",
-                    color_continuous_scale=[
-                        (0.00, "#16A34A"),
-                        (0.60, "#A3E635"),
-                        (0.75, "#FACC15"),
-                        (0.90, "#F97316"),
-                        (1.00, "#DC2626"),
-                    ],
-                    zmin=0, zmax=1.5,
-                    aspect="auto",
-                    labels={"x": "Week", "y": "Station", "color": "Util %"},
-                )
-                fig.update_layout(
-                    title=dict(text=title, font=dict(size=14)),
-                    height=min(380, 60 + 26 * max(len(df_util.index), 1)),
-                    margin=dict(l=4, r=4, t=40, b=4),
-                    coloraxis_showscale=False,
-                )
-                return fig
-
+            st.markdown("#### 💡 Current vs proposed")
+            st.caption("✅ Accept or 🚫 Discard the proposal at the top of the page.")
             cL, cR = st.columns(2)
             with cL:
                 st.plotly_chart(
@@ -7202,56 +7151,12 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
                     width="stretch",
                     key="overview_heatmap_proposed",
                 )
-            st.markdown("---")
 
     # =============================================================
-    # Weekly utilization heatmap — STAGING / Step 1 of the time-dimension
-    # work. Renders only when the schedule has a PRODUCTION DAY column;
-    # otherwise the helper returns None and we skip it cleanly.
+    # Recommended actions — auto-generated from data, one short line each
     # =============================================================
-    if weekly_util is not None and not weekly_util.empty:
-        st.markdown("#### 📅 Weekly pressure")
-        st.caption(
-            "Labor utilization per station × week (at a 5-working-days-per-week "
-            "reference). Spot which week is the bottleneck even when the "
-            "whole-month view averages the pressure out."
-        )
-        # Clip the color scale at 1.5× so spikes don't wash out the lower end.
-        # zmin=0 keeps green visible; zmax=1.5 means anything ≥150% looks
-        # the same deep red — which is fine since that's "definitely red".
-        _hm = px.imshow(
-            weekly_util,
-            text_auto=".0%",
-            color_continuous_scale=[
-                (0.00, "#16A34A"),  # green
-                (0.60, "#A3E635"),  # light green
-                (0.75, "#FACC15"),  # yellow
-                (0.90, "#F97316"),  # orange
-                (1.00, "#DC2626"),  # red
-            ],
-            zmin=0, zmax=1.5,
-            aspect="auto",
-            labels={"x": "Week", "y": "Station", "color": "Util %"},
-        )
-        _hm.update_layout(
-            height=min(400, 60 + 28 * len(weekly_util.index)),
-            margin=dict(l=4, r=4, t=8, b=4),
-            coloraxis_showscale=False,
-        )
-        st.plotly_chart(
-            _hm, width="stretch",
-            key="overview_weekly_heatmap_full",
-        )
-        st.markdown("---")
-
-    # =============================================================
-    # Recommended actions — auto-generated from data
-    # =============================================================
-    st.markdown("#### 🎯 Recommended actions")
+    st.markdown("#### 🔧 Recommended actions")
     actions = []
-
-    # NOTE: empty-schedule guard now fires at the very top of the tab
-    # (returns before any KPI rendering), so we don't repeat it here.
 
     # Separate over-capacity stations into "throughput-only" vs "needs HC".
     # A red Overall status can come from labor demand exceeding headcount
@@ -7276,27 +7181,23 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # 1. Stations missing entirely (HC=0 with demand)
     if no_station_list:
         actions.append(
-            f"**Fix facility setup.** {len(no_station_list)} station(s) have demand but 0 headcount: "
-            f"{', '.join(no_station_list)}. Either add people in the sidebar or remove those units from the schedule."
+            f"**Staff {', '.join(no_station_list)}** — demand but no people "
+            "(or take those units off the schedule)."
         )
 
     # 2. Labor-driven over-capacity — name the per-station gap
     if labor_over_stations:
         parts = []
         for st_disp in labor_over_stations:
-            gap = 0
             try:
                 gap = int(capacity.loc[st_disp, "hc_gap"])
             except Exception:
                 gap = 0
-            if gap > 0:
-                parts.append(f"**~{gap} more at {st_disp}**")
-            else:
-                # Gap math couldn't pin it (rounding or no required_hc) — fall back to a generic call-out.
-                parts.append(f"**more capacity at {st_disp}**")
+            # Gap math couldn't pin it (rounding or no required_hc) — name the station alone.
+            parts.append(f"{st_disp} +{gap}" if gap > 0 else st_disp)
         actions.append(
-            f"**Add {', '.join(parts)}** to bring utilization below 100% (with your safety buffer). "
-            f"Alternatives: run overtime, extend working days, or defer some units."
+            f"**Add people:** {' · '.join(parts)} — or run overtime, add "
+            "working days, or defer units."
         )
 
     # 3. Throughput-driven over-capacity — different fix
@@ -7304,81 +7205,73 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
         # Battery Assembly is the canonical case (cell count × cycle time).
         if "Battery Assembly" in throughput_over_stations:
             actions.append(
-                "🔋 **Battery throughput is the bottleneck.** Add battery cells "
-                "(Stations/Cells) or extend working days — hiring more people at "
-                "Battery won't help, because the constraint is the assembly fixture cycle."
+                "🔋 **Add battery cells or working days** — Battery is limited "
+                "by the fixture cycle, not by people."
             )
             others = [s for s in throughput_over_stations if s != "Battery Assembly"]
         else:
             others = list(throughput_over_stations)
         if others:
             actions.append(
-                f"**Throughput is short at {', '.join(others)}** — these stations need more "
-                "parallel cells (Stations/Cells in the sidebar) or longer working days. "
-                "Adding labor without more cells won't move the cycle."
+                f"**Add cells or working days at {', '.join(others)}** — more "
+                "people won't speed up the cycle."
             )
 
     # 4. Headcount short overall (but no station is individually red)
     if total_hc_gap > 0 and not labor_over_stations:
-        actions.append(
-            f"**Plan to add ~{total_hc_gap} people** across the line to comfortably hit this plan."
-        )
+        actions.append(f"**Add ~{total_hc_gap} people** across the line.")
 
     # 5. Near-cap warnings (only when nothing is already red)
     if near_cap and not over_stations:
-        actions.append(
-            f"**Monitor {', '.join(near_cap)}** — these are 90%+ utilized and risky for any schedule change."
-        )
+        actions.append(f"**Watch {', '.join(near_cap)}** — 90%+ loaded.")
 
     # 6. Surplus
     if total_hc_gap < -3:
         idle = capacity[capacity["labor_util_safe"] < 0.5].index.tolist()
         if idle:
             actions.append(
-                f"**Surplus capacity at {', '.join(idle[:3])}** — consider cross-training "
-                f"these {abs(total_hc_gap)} people to support bottleneck stations."
+                f"**Spare capacity at {', '.join(idle[:3])}** — cross-train "
+                "people toward the bottleneck."
             )
 
     if not actions:
-        actions.append("✅ **No action needed** — this plan is well-balanced. Maintain current staffing.")
+        actions.append("✅ **No action needed** — maintain current staffing.")
 
-    for i, action in enumerate(actions, 1):
-        st.markdown(f"{i}. {action}")
+    st.markdown("\n".join(f"{i}. {a}" for i, a in enumerate(actions, 1)))
     _render_action_jumps(over_stations, no_station_list, near_cap)
 
-    st.markdown("---")
-
     # =============================================================
-    # Station status — colored cards instead of a dense table
+    # Visuals — one on screen at a time
     # =============================================================
-    st.markdown("#### 📊 Station status at a glance")
-    st.caption(
-        "Each card shows one station. Color = overall status (labor + throughput). "
-        "Number = how loaded it is."
-    )
+    _has_weeks = weekly_util is not None and not weekly_util.empty
+    _views = ["📊 Stations"] + (["📅 By week"] if _has_weeks else []) + ["🔋 Batteries"]
+    _view_tabs = dict(zip(_views, st.tabs(_views)))
 
-    # Build cards in rows of 4
-    stations_to_show = list(capacity.index)
-    color_map = {
-        "🔴 OVER":       ("#E15759", "white"),
-        "🔴 NO STATION": ("#999999", "white"),
-        "🟠 NEAR-CAP":   ("#F0A04B", "white"),
-        "🟡 TIGHT":      ("#F2D75D", "#333"),
-        "🟢 OK":         ("#70AD47", "white"),
-        "⚪ N/A":         ("#EEEEEE", "#666"),
-    }
-    for i in range(0, len(stations_to_show), 4):
-        cols = st.columns(4)
-        for j, st_name in enumerate(stations_to_show[i:i + 4]):
-            row = capacity.loc[st_name]
-            status = row["overall_status"]
-            bg, fg = color_map.get(status, ("#EEEEEE", "#333"))
-            util_pct = row["labor_util_safe"] * 100 if not row.get("station_missing") else 0
-            hc = int(row["HC"])
-            req = int(row["required_hc"])
-            status_label = status.split(" ", 1)[1] if " " in status else status
-            cols[j].markdown(
-                f"""
+    # Station status — colored cards instead of a dense table. A station
+    # this facility doesn't have and the plan doesn't use (⚪ N/A) gets no
+    # card; it's named in one line underneath instead.
+    with _view_tabs["📊 Stations"]:
+        color_map = {
+            "🔴 OVER":       ("#E15759", "white"),
+            "🔴 NO STATION": ("#999999", "white"),
+            "🟠 NEAR-CAP":   ("#F0A04B", "white"),
+            "🟡 TIGHT":      ("#F2D75D", "#333"),
+            "🟢 OK":         ("#70AD47", "white"),
+        }
+        _unused = capacity[capacity["overall_status"] == "⚪ N/A"].index.tolist()
+        stations_to_show = [s for s in capacity.index if s not in _unused]
+        for i in range(0, len(stations_to_show), 4):
+            cols = st.columns(4)
+            for j, st_name in enumerate(stations_to_show[i:i + 4]):
+                row = capacity.loc[st_name]
+                status = row["overall_status"]
+                bg, fg = color_map.get(status, ("#EEEEEE", "#333"))
+                util_pct = row["labor_util_safe"] * 100 if not row.get("station_missing") else 0
+                hc = int(row["HC"])
+                req = int(row["required_hc"])
+                status_label = status.split(" ", 1)[1] if " " in status else status
+                cols[j].markdown(
+                    f"""
 <div style="background:{bg};color:{fg};padding:12px;border-radius:8px;margin-bottom:8px;">
 <div style="font-weight:600;font-size:0.95rem;">{st_name}</div>
 <div style="font-size:0.78rem;opacity:0.85;">{status_label}</div>
@@ -7386,23 +7279,34 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
 <div style="font-size:0.78rem;opacity:0.85;">{hc} people · need {req}</div>
 </div>
 """,
-                unsafe_allow_html=True,
+                    unsafe_allow_html=True,
+                )
+        if _unused:
+            st.caption("⚪ Not used by this plan: " + ", ".join(_unused))
+
+    # Weekly utilization heatmap — renders only when the schedule has a
+    # PRODUCTION DAY column (or auto-spread dates); otherwise the helper
+    # returns None and the tab is left out.
+    if _has_weeks:
+        with _view_tabs["📅 By week"]:
+            st.caption(
+                "Labor utilization per station and week (5-working-day weeks) — "
+                "the week a station peaks, which the month view averages out."
+            )
+            st.plotly_chart(
+                _make_heatmap(weekly_util), width="stretch",
+                key="overview_weekly_heatmap_full",
             )
 
-    st.markdown("---")
-
-    # =============================================================
-    # Battery type mix (kept — visual is clearer than table)
-    # =============================================================
-    st.markdown("#### 🔋 Batteries needed by type")
-    fig = px.bar(
-        batt_type, x="batt_type", y="total_batteries", color="batt_type",
-        text="total_batteries",
-        labels={"batt_type": "Battery type", "total_batteries": "Batteries"},
-    )
-    fig.update_traces(textposition="outside")
-    fig.update_layout(showlegend=False, height=340, margin=dict(t=20, b=20))
-    st.plotly_chart(fig, width="stretch")
+    with _view_tabs["🔋 Batteries"]:
+        fig = px.bar(
+            batt_type, x="batt_type", y="total_batteries", color="batt_type",
+            text="total_batteries",
+            labels={"batt_type": "Battery type", "total_batteries": "Batteries"},
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(showlegend=False, height=340, margin=dict(t=20, b=20))
+        st.plotly_chart(fig, width="stretch")
 
 
 def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, total_units: int = 0, units=None):
@@ -12176,7 +12080,12 @@ def _guide_catalog_step(schedule_df_full, machine_df, acc_df, inputs: dict) -> d
     estimation placeholders, and placeholders imported this session that
     still need labor times."""
     _skipped_fg, _unknown_acc = _missing_catalog_skus(schedule_df_full, machine_df, acc_df)
-    summary = st.session_state.get("_last_upload_summary") or {}
+    # Upload mode only: the summary describes the last uploaded file, which a
+    # switch to ✏️ manual entry leaves behind in session state.
+    summary = (
+        st.session_state.get("_last_upload_summary") or {}
+        if inputs.get("schedule_mode") != SCHEDULE_MODE_MANUAL else {}
+    )
     rec = summary.get("recovered") or {}
     est = int(rec.get("count") or 0) if isinstance(rec, dict) else 0
     imported = list(st.session_state.get("_guide_imported_skus") or [])
@@ -12474,10 +12383,6 @@ def _render_action_jumps(over, missing, near) -> None:
 
 def main():
     st.title("🏭 Labor Capacity Planner")
-    st.caption(
-        "Plan production capacity across facilities. "
-        "Set up your scenario in the sidebar, then review the tabs below."
-    )
 
     inputs = render_sidebar()
 

@@ -216,10 +216,14 @@ def test_pill_says_loaded_n_of_m_and_accounts_for_rows_with_no_qty(at):
         assert f"Loaded **{summary['rows']}** of **{source_rows}** rows" in pill
     else:
         assert f"Loaded **{summary['rows']}** rows" in pill
+    # The pill is one line; the skipped rows are explained once, in the plan
+    # guide's "How this file was read" expander on the main panel.
+    assert "had no BUILD QTY" not in pill
+    details = " ".join(str(m.value) for m in at.main.markdown)
     if no_qty:
-        assert f"{no_qty} row(s) had no BUILD QTY and were skipped; 0 units lost" in pill
+        assert f"**{no_qty} row(s) had no BUILD QTY** and were skipped — 0 units lost" in details
     else:
-        assert "had no BUILD QTY" not in pill
+        assert "had no BUILD QTY" not in details
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +552,8 @@ def test_switch_button_lives_in_main_and_the_picker_takes_no_index():
     picker = picker[:picker.index("help=")]
     assert "index=" not in picker
     assert "key=PLAN_MONTH_KEY" in picker
-    main_src = inspect.getsource(app.main)
+    # The button lives in the plan guide's month step now (drawn from main()).
+    main_src = inspect.getsource(app._guide_month_step)
     assert "PLAN_MONTH_SEED_KEY" in main_src
     assert 'key="plan_schedule_month_btn"' in main_src
+    assert "_render_plan_guide(" in inspect.getsource(app.main)

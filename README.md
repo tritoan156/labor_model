@@ -142,6 +142,20 @@ That holds however the row arrived — pasted through the panel, pasted straight
 
 ---
 
+## The plan guide
+
+The panel at the top of the main page walks the workflow in order and carries the button for whatever needs doing next — one line per step, a colored box only when a step needs attention:
+
+1. **Schedule** — what is loaded (the facility's newest saved schedule opens first), how many of the file's rows count, and how many units are *not* counted and why (the "Why N of M rows?" expander holds the breakdown that used to be five sidebar warnings). After a reshape it shows **↩️ Undo** and **⏮ Back to as loaded**; after an upload the app couldn't read it offers **⏮ Back to the previous schedule**, **📂 Load the newest saved schedule** and **🧪 Use the bundled sample** (removing the file from the uploader also goes back).
+2. **Month** — the Plan month against the month the file is dated for, rows the calendar leaves out, auto-leveled dates, and the time window; **📆 Plan *month* instead** switches the Plan month in one click, **📅 Move N row(s) into *month*** re-dates the off-calendar rows (undoable).
+3. **Catalog** — SKUs the catalogs don't know; **➕ Import** adds them as zero-labor placeholders, in use at once, and **🏭 Open Machine catalog** jumps to where labor times are edited.
+4. **Capacity** — stations over / unstaffed / near capacity, people needed vs on hand, the busiest week; **👥 Edit headcount** opens the sidebar's crew panel, **🔧 Recommendations** opens that tab, **💡 Level-load the month** asks the Sequencer for a proposal (its Accept / Discard panel appears under the guide).
+5. **Save** — only while something is unsaved (an upload that lives in this browser only, or changes since the schedule was loaded): a name and **💾 Save plan**.
+
+Every save — catalog cells, added SKUs, imports, crew, settings, schedules — is in use in your session the moment it lands; teammates see it after the ~1 minute Streamlit Cloud rebuild.
+
+---
+
 ## Export & link to Excel
 
 **📁 Data & Setup → 📤 Export & Excel link** gives three ways to get the data out:

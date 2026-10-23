@@ -17,11 +17,16 @@ from __future__ import annotations
 
 import base64
 import os
+from pathlib import Path
 from typing import Optional, Tuple
 
 import requests
 
 GITHUB_REPO = "tritoan156/labor_model"
+# The checkout this module runs from. Catalog CSV saves are mirrored under
+# REPO_ROOT / "data" so the running app uses them before the redeploy; tests
+# point this at a temp folder (see conftest.py).
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _resolve_branch() -> str:
@@ -142,6 +147,40 @@ class GitHubConflict(Exception):
     """Raised when the PUT fails because the SHA was stale (HTTP 409 or 422)."""
 
 
+def mirror_csv_locally(file_path: str, csv_text: str) -> bool:
+    """Write the CSV text just pushed for ``file_path`` into this checkout's
+    ``data/`` folder, so the app's loaders (keyed on file mtime) pick it up on
+    the very next run instead of after the Streamlit Cloud redeploy.
+
+    The JSON stores have always done this (their ``_write_local``); the catalog
+    CSVs did not, so a labor edit, an added SKU or a missing-SKU import was
+    pushed to GitHub but the session kept analysing the deployed copy — and
+    the planner was told to wait for a rebuild. Only ``data/<name>.csv`` is
+    mirrored, nothing that would land outside ``REPO_ROOT/data``, and the
+    bytes go down verbatim (binary mode, so a Windows text layer can't turn
+    pandas' ``\r\n`` into ``\r\r\n``). Never raises: on a read-only host
+    the deployed copy simply stays. Returns True when the file was written.
+    """
+    try:
+        rel = Path(str(file_path).replace("\\", "/").lstrip("/"))
+        if (
+            rel.suffix.lower() != ".csv"
+            or len(rel.parts) != 2
+            or rel.parts[0] != "data"
+        ):
+            return False
+        data_dir = (Path(REPO_ROOT) / "data").resolve()
+        target = (Path(REPO_ROOT) / rel).resolve()
+        if target.parent != data_dir:
+            return False
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with open(target, "wb") as fh:
+            fh.write(str(csv_text).encode("utf-8"))
+        return True
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def save_catalog_to_github(
     csv_text: str,
     file_path: str,
@@ -192,4 +231,6 @@ def save_catalog_to_github(
             f"Body: {put_r.text[:200]}"
         )
     put_r.raise_for_status()
+    # The push landed: make this container use the same text at once.
+    mirror_csv_locally(file_path, csv_text)
     return put_r.json()

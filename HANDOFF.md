@@ -85,6 +85,17 @@ against per-station headcount + throughput capacity.
   XXX-placeholder form, the Overview's "Import N missing SKU(s)" button and
   the Excel import's new rows — and each preview shows what the SKU got.
   `_machine_family` / `_machine_class` live in that module too.
+- **The plan guide:** `_render_plan_guide` in `app.py` is the one panel above
+  the tab strip (schedule → month → catalog → capacity → save). Each step is
+  built by a `_guide_*_step` function that returns data (fact, status,
+  action descriptors) and drawn by `_render_guide_step`; `main()` renders it
+  into a slot reserved above the Sequencer's proposal panel once every frame
+  the tabs use is known. Main-panel buttons may `st.rerun()` (the sidebar is
+  already built); jumps to a tab / Data & Setup view / the crew expander go
+  through `_jump_to`, which leaves one-shot seeds the widgets consume.
+  Reshapes go through `_commit_reshape` (undo / as-loaded bookkeeping in
+  `_load_schedule_df`); catalog CSV saves mirror into `data/` through
+  `core.catalog_storage.mirror_csv_locally`, so a save is in use at once.
 - **Catalog editors:** the live ones are `tab_floor_verification_machine` and
   `tab_floor_verification_accessory` (dispatched from the Data & Setup radio). An
   older monolithic `tab_floor_verification` was deleted as dead code — don't

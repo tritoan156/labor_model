@@ -164,7 +164,7 @@ class TestImportMissingSkus:
         assert list(out.columns) == list(acc.columns) and not routing_columns_in(out.columns)
 
     def test_the_overview_shows_the_routing_before_the_click(self):
-        src = inspect.getsource(app.main)
+        src = inspect.getsource(app._guide_catalog_step)   # the plan guide's step 3
         assert re.search(r'_routing_seed_preview\(\s*"data/machine_clean\.csv",\s*\[\{"SKU": s\} for s in _skipped_fg\]', src)
 
 

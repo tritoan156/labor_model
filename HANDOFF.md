@@ -73,7 +73,13 @@ against per-station headcount + throughput capacity.
   compute path stays facility-agnostic. The catalog editor shows only the active
   facility's 5 routing dropdowns. `Undercarriage Station` is a second-hop
   reroute (moves what Final-Station routing dropped at Undercarriage on to
-  another team, e.g. Henderson → Com Accessories).
+  another team, e.g. Henderson → Com Accessories). A **new SKU** gets all 15
+  cells **seeded** by `core/sku_routing.RoutingSeeder` from the most similar
+  catalog row (same family + class → same family → the facility column's
+  majority → the station default), on every add path — the add-SKU form, the
+  XXX-placeholder form, the Overview's "Import N missing SKU(s)" button and
+  the Excel import's new rows — and each preview shows what the SKU got.
+  `_machine_family` / `_machine_class` live in that module too.
 - **Catalog editors:** the live ones are `tab_floor_verification_machine` and
   `tab_floor_verification_accessory` (dispatched from the Data & Setup radio). An
   older monolithic `tab_floor_verification` was deleted as dead code — don't
@@ -90,8 +96,6 @@ against per-station headcount + throughput capacity.
 
 ## Open follow-ups (not done)
 
-- New SKUs leave the 15 routing columns blank → default routing, won't inherit
-  custom per-facility routing. Consider seeding them.
 - Many tables now carry both p-min and p-hr columns — wider; a global toggle may
   help if width becomes an issue.
 

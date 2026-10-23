@@ -914,10 +914,19 @@ def load_schedule(
 
     Raises ``ScheduleColumnError`` (a ValueError subclass) with a planner-
     friendly message when a required column simply isn't present.
+
+    Row accounting, so the UI can say "Loaded 277 of 288 rows" and explain
+    the gap, lives in ``.attrs`` next to the recovery summaries:
+    ``source_rows`` (data rows read from the file), ``no_qty_rows`` (rows
+    dropped for a blank, zero, negative or non-numeric BUILD QTY — they carry
+    no units, so nothing is lost) and ``other_location_rows`` (rows tagged
+    with a different facility and left out because
+    ``absorb_foreign_locations`` is off).
     """
     if path is None:
         path = DATA_DIR / "may_schedule.csv"
     df = pd.read_csv(path, encoding="latin-1")
+    source_rows = int(len(df))
 
     # 1) Strip UTF-8 BOM and stray whitespace from column headers so an Excel
     # export (which often saves as UTF-8 with BOM on Windows) doesn't
@@ -957,7 +966,13 @@ def load_schedule(
     _fg_ok = df["FG SKU ID"].notna() & (
         df["FG SKU ID"].fillna("").astype(str).str.strip() != ""
     )
-    df = df[_fg_ok & df["__qty_num"].notna() & (df["__qty_num"] > 0)].copy()
+    _qty_ok = df["__qty_num"].notna() & (df["__qty_num"] > 0)
+    # Rows with no positive quantity are the one drop that used to go
+    # unexplained: an export routinely carries blank-qty lines (headers for
+    # a model family, units not yet released), so the plan "lost" rows the
+    # planner could count in Excel. Tally them so the pill can reconcile.
+    no_qty_rows = int((~_qty_ok).sum())
+    df = df[_fg_ok & _qty_ok].copy()
     df["BUILD QTY"] = df["__qty_num"].astype(int)
     df.drop(columns=["__qty_num"], inplace=True)
 
@@ -985,6 +1000,7 @@ def load_schedule(
     foreign_location_recovered = {
         "count": 0, "rows": 0, "assigned_location": "", "by_location": {}, "by_fg": {},
     }
+    other_location_rows = 0
     if location:
         loc_target = location.upper()
         blank_loc = df["LOC"].isin(["", "NAN", "NONE"])
@@ -1014,6 +1030,8 @@ def load_schedule(
             df.loc[foreign_loc, "LOCATION"] = location
             df.loc[foreign_loc, "LOC"] = loc_target
             keep_loc = keep_loc | foreign_loc
+        else:
+            other_location_rows = int(foreign_loc.sum())
         if blank_loc.any():
             _fg = df.loc[blank_loc, "FG_RAW"].astype(str)
             location_recovered = {
@@ -1128,6 +1146,9 @@ def load_schedule(
     df.attrs["unscheduled_recovered"] = unscheduled
     df.attrs["location_recovered"] = location_recovered
     df.attrs["foreign_location_recovered"] = foreign_location_recovered
+    df.attrs["source_rows"] = source_rows
+    df.attrs["no_qty_rows"] = no_qty_rows
+    df.attrs["other_location_rows"] = other_location_rows
     return df
 
 

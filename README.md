@@ -96,6 +96,14 @@ Upload the `.xlsx` / `.xlsm` straight from the planner — no Save-As-CSV step. 
 
 Click **📥 Download blank template** under the file uploader in the sidebar. You get an empty CSV with the right headers and two example rows.
 
+### Right after a load
+
+A fresh session opens on the facility's **newest saved schedule** — the one the 📂 picker defaults to — and the pill names it ("loaded automatically"); only a facility with no saved schedules opens on the bundled May 2026 sample, and says so. Uploading a file, loading another saved schedule or reshaping the plan replaces that first pick for good; switching facility before you do re-opens on the new facility's newest save.
+
+The sidebar pill says what actually loaded — **Loaded 277 of 288 rows** — and accounts for the gap: rows with no `BUILD QTY` are listed on their own line ("11 rows had no BUILD QTY and were skipped; 0 units lost"), rows tagged for another plant on another, and the rest of the warnings name the units that were rescued or dropped. If the file is for a different month than the sidebar's **Plan month** (a saved August schedule opened in October), the page says so and offers **📆 Plan August 2026 instead** next to **📅 Move N row(s) into October 2026**: the first switches the Plan month to the schedule's own month (the working-day count and the Calendar follow), the second re-dates the rows into the month you picked. Nothing switches on its own — a May export planned for June is a real case. The schedule's own months are always on the Plan month list, even when they fall outside its usual window of 2 months back to 12 forward.
+
+The **📂 Save / load uploaded schedules** picker lists the newest save first and defaults to it; its row count is the CSV's real data-row count, so it matches the pill.
+
 ### Privacy
 
 Uploaded schedules stay **only in your browser** unless you explicitly click **💾 Save schedule** in the sidebar. Saving pushes the CSV to `data/uploaded_schedules.json` on GitHub, where teammates planning the same facility can reload it.

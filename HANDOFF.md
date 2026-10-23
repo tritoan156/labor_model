@@ -90,6 +90,19 @@ against per-station headcount + throughput capacity.
   buildable-unit ceilings split by labor cap vs throughput cap; it powers the
   Overview hero KPIs (Units planned / Buildable / Coverage% / Total work) and the
   Capacity tab.
+- **Plan month is a seeded widget:** `render_sidebar` seeds
+  `st.session_state[PLAN_MONTH_KEY]` before building the picker (no `index=`),
+  and the main-panel **📆 Plan <month> instead** button — offered when the
+  loaded schedule's dominant PRODUCTION MONTH differs from the Plan month —
+  switches it by writing `PLAN_MONTH_SEED_KEY` and rerunning; the picker's
+  options are the rolling window plus the schedule's own months
+  (`SCHEDULE_MONTHS_KEY`). The pill says "Loaded N of M rows" and lists rows
+  dropped for having no BUILD QTY (`load_schedule` attrs `source_rows` /
+  `no_qty_rows` / `other_location_rows`). A fresh session opens on the
+  facility's newest saved schedule (`_load_schedule_df` step 3c), tagged
+  `_active_schedule_auto_for` so a facility switch re-resolves while any
+  upload / 📥 Load / reshape ends the automatic pick; a facility with no
+  saves keeps the bundled sample. `tests/test_schedule_load_moment.py`.
 - **p-min/p-hr:** all person-minute displays also show person-hours via
   `_fmt_min_hr(...)`.
 

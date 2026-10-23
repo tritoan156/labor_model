@@ -20,12 +20,17 @@ by main() after the load. AppTest drives the real script — one run per step,
 so related steps share one app instance.
 """
 import inspect
+import io
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
 app = pytest.importorskip("app")
+
+from core.data_loader import load_schedule  # noqa: E402
+from core.uploaded_schedule_storage import names_newest_first  # noqa: E402
 
 APP_PATH = Path(__file__).resolve().parent.parent / "app.py"
 LOCATION = "Henderson"
@@ -85,12 +90,36 @@ def _pill(at) -> str:
 
 def _move_into_plan_month_button(at):
     """The main-panel "📅 Move N row(s) into <plan month>" button — present
-    whenever the loaded schedule isn't dated in the plan month (true for the
-    bundled May 2026 sample in any other month)."""
-    for b in at.main.button:
-        if (b.label or "").startswith("📅 Move"):
-            return b
-    pytest.skip("the loaded schedule is already on the plan month's calendar")
+    when the loaded schedule carries PRODUCTION DAY values outside the plan
+    month. A fresh session opens on the facility's newest saved schedule,
+    which is usually undated (auto-spread puts every row on the plan month's
+    calendar), so when the button isn't up, first load a saved schedule whose
+    rows are frozen in another month."""
+    def _find():
+        for b in at.main.button:
+            if (b.label or "").startswith("📅 Move"):
+                return b
+        return None
+
+    found = _find()
+    if found is not None:
+        return found
+    plan = tuple(at.session_state["plan_month_select"])
+    for name, block in _saved_schedules().items():
+        df = load_schedule(
+            io.BytesIO(block["csv_content"].encode("utf-8")), location=LOCATION.upper(),
+        )
+        if "PRODUCTION DAY" not in df.columns:
+            continue
+        days = pd.to_datetime(df["PRODUCTION DAY"], errors="coerce").dropna()
+        if any((d.year, d.month) != plan for d in days):
+            _widget(at, "selectbox", "Saved schedule").set_value(name).run()
+            _button(at, "📥 Load").click().run()
+            assert not at.exception
+            found = _find()
+            if found is not None:
+                return found
+    pytest.skip("no available schedule has rows dated outside the plan month")
 
 
 def _working_days() -> int:
@@ -131,7 +160,7 @@ def test_load_keeps_window_sliders_and_working_days(at):
     _widget(at, "slider", "New hire %").set_value(33).run()
     assert not at.exception
     assert at.session_state["work_days_input"] == 5  # one week
-    assert "(bundled sample)" in _pill(at)
+    assert "(saved schedule)" in _pill(at)  # a fresh session opens on the newest save
 
     _button(at, "📥 Load").click().run()
     assert not at.exception
@@ -173,20 +202,27 @@ def test_load_keeps_plan_month_and_active_tab(at):
 @needs_saved_schedule
 def test_pill_describes_the_schedule_on_screen_right_after_load(at):
     """The sidebar confirmation is drawn by main() after the load, so on the
-    very run that 📥 Load lands it names the saved schedule — not the sample
-    the planner just replaced."""
-    assert "(bundled sample)" in _pill(at)
-    summary_before = dict(at.session_state["_last_upload_summary"])
+    very run that 📥 Load lands it names the schedule just loaded — not the
+    one the planner replaced. (A fresh session opens on the facility's newest
+    saved schedule, so load a different one to tell the two apart.)"""
+    names = names_newest_first(_saved_schedules())
+    if len(names) < 2:
+        pytest.skip("two saved schedules are needed to tell a 📥 Load from the first load")
+    pill_before = _pill(at)
+    assert "(saved schedule)" in pill_before and f"**{names[0]}**" in pill_before
+    assert at.session_state["_last_upload_summary"]["name"] == names[0]
 
+    _widget(at, "selectbox", "Saved schedule").set_value(names[1]).run()
     _button(at, "📥 Load").click().run()
     assert not at.exception
 
     summary = at.session_state["_last_upload_summary"]
     assert summary["source"] == "saved"
+    assert summary["name"] == names[1]
     pill = _pill(at)
     assert "(saved schedule)" in pill
     assert f"**{summary['rows']}**" in pill
-    assert summary["rows"] != summary_before["rows"] or "(bundled sample)" not in pill
+    assert f"**{names[1]}**" in pill and f"**{names[0]}**" not in pill
     # The handler's own confirmation is replayed on the rerun instead of being
     # thrown away with the run that raised it.
     assert any("Loaded saved schedule" in str(s.value) for s in at.sidebar.success)

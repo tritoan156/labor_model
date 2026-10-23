@@ -96,7 +96,7 @@ class TestNewCoreNamesAreProbed:
         'hasattr(core.excel_io, "reconcile_pending")',             # app imports it
         'hasattr(core.sku_routing, "seed_facility_routing")',      # app imports it
         'hasattr(core.uploaded_schedule_storage, "names_newest_first")',  # app imports it
-        'hasattr(core.sku_routing, "seed_facility_routing")',      # app imports it
+        'hasattr(core.catalog_storage, "mirror_csv_locally")',     # app imports it
     ])
     def test_probed_in_stale_block(self, probe):
         assert STALE_BLOCK, "couldn't find the `_stale = (...)` block in app.py"

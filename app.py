@@ -87,9 +87,9 @@ _stale = (
     or not hasattr(core.sku_routing, "seed_facility_routing")
     # Saved-schedule picker: parsed row count + newest-first ordering.
     or not hasattr(core.uploaded_schedule_storage, "names_newest_first")
-    # Routing seeds for new SKUs (also where _machine_family / _machine_class
-    # now live) — app.py imports these names directly.
-    or not hasattr(core.sku_routing, "seed_facility_routing")
+    # Catalog CSV saves mirror the pushed text into data/ so this session uses
+    # the new values at once — app.py imports the helper directly.
+    or not hasattr(core.catalog_storage, "mirror_csv_locally")
 )
 if _stale:
     # Reload in DEPENDENCY ORDER: constants first (every other module imports
@@ -180,6 +180,7 @@ from core.catalog_storage import (
     save_catalog_to_github,
     fetch_catalog_csv_from_github,
     latest_catalog_sha,
+    mirror_csv_locally,
     GitHubConflict,
 )
 from core.scenario_storage import (
@@ -527,11 +528,11 @@ def _load_usage_log_cached(mtime: float):
 # heatmap) that the save never touched — so the first click after any save
 # paid for a full recompute. Now that the loaders above key on file mtime, a
 # file this container rewrites (scenarios, saved schedules, process flow, the
-# usage log) invalidates on its own; the clears below are cheap insurance for
-# that path. The catalog CSVs are the exception: a save goes to GitHub only
-# and the local copy stays as deployed, so no clear can show the new rows
-# before the redeploy — but the 30-second SHA lookup must be dropped so the
-# stale-data banner sees the new commit at once instead of up to 30 s later.
+# usage log — and, since `core.catalog_storage.mirror_csv_locally`, every
+# catalog CSV a save pushes) invalidates on its own; the clears below are
+# cheap insurance for that path, and the 30-second SHA lookup must be dropped
+# so the stale-data banner sees the new commit at once instead of up to 30 s
+# later.
 # ---------------------------------------------------------------------------
 def _catalog_loader_for(file_path: str):
     """The cached loader that reads ``file_path`` (any ``data/...`` spelling)."""
@@ -598,6 +599,38 @@ def _expand_schedule(schedule_df, machine_df, acc_df):
     units.attrs["skipped_fg"] = attrs["skipped_fg"]
     units.attrs["unknown_acc"] = attrs["unknown_acc"]
     return units
+
+
+def _missing_catalog_skus(schedule_df, machine_df, acc_df) -> "tuple[list[str], list[str]]":
+    """FG SKUs and accessory SKUs the schedule references that the catalogs
+    don't carry — ``(fg_missing, acc_missing)``, each sorted.
+
+    Same membership tests as ``expand_schedule`` (``FG_BASE`` against the
+    machine catalog's index, ``ACC`` against the accessory catalog's), but
+    computed from the schedule itself, so the list — and the ➕ Import button
+    it drives — is there even when every FG SKU is unknown and the unit table
+    came back empty. Accessories on rows whose FG was dropped are included
+    too (the unit table never saw those rows), which is what the planner
+    wants to import. Returns two empty lists for an empty schedule.
+    """
+    if schedule_df is None or schedule_df.empty:
+        return [], []
+    machine_index = set(machine_df.index) if machine_df is not None else set()
+    acc_index = set(acc_df.index) if acc_df is not None else set()
+    fg_col = "FG_BASE" if "FG_BASE" in schedule_df.columns else "FG_RAW"
+    fg_missing: set[str] = set()
+    if fg_col in schedule_df.columns:
+        for v in schedule_df[fg_col].dropna().astype(str):
+            v = v.strip()
+            if v and v not in machine_index:
+                fg_missing.add(v)
+    acc_missing: set[str] = set()
+    if "ACC" in schedule_df.columns:
+        for v in schedule_df["ACC"].dropna().astype(str):
+            v = v.strip()
+            if v and v.lower() != "nan" and v not in acc_index:
+                acc_missing.add(v)
+    return sorted(fg_missing), sorted(acc_missing)
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -1502,12 +1535,32 @@ def _discard_cross_mode_schedule_state() -> None:
 
 def _note_schedule_mode(schedule_mode: str) -> bool:
     """Record the sidebar mode for this run; on a change from the previous run,
-    discard the cross-mode state. Returns True when the mode changed."""
+    discard the cross-mode state. Returns True when the mode changed.
+
+    The upload summary (the pill and the dropped-unit numbers) describes the
+    last upload; in ✏️ manual mode it would describe a file the planner is no
+    longer analysing, so it goes too."""
     prev = st.session_state.get("_schedule_mode_seen")
     changed = prev is not None and prev != schedule_mode
     if changed:
         _discard_cross_mode_schedule_state()
+        if schedule_mode == SCHEDULE_MODE_MANUAL:
+            st.session_state.pop("_last_upload_summary", None)
     st.session_state["_schedule_mode_seen"] = schedule_mode
+    return changed
+
+
+def _note_facility(location: str) -> bool:
+    """Record the facility for this run; on a change, drop a pending Sequencer
+    proposal. The proposal was built from the previous plant's rows and crew —
+    ✅ Accept at the new plant would adopt it as that plant's schedule.
+    Returns True when the facility changed."""
+    prev = st.session_state.get("_facility_seen")
+    changed = prev is not None and prev != location
+    if changed:
+        st.session_state.pop("_proposed_schedule", None)
+        st.session_state.pop("_proposed_schedule_overloads", None)
+    st.session_state["_facility_seen"] = location
     return changed
 
 
@@ -3370,21 +3423,21 @@ def _show_github_error(e, action: str = "Save") -> None:
 
 
 def _post_save_redeploy_notice(key_suffix: str) -> None:
-    """Standard "save pushed → Cloud is redeploying" notice + a reload button.
+    """Standard line after a GitHub-writing save.
 
-    Every GitHub-writing save triggers a ~1–2 min Streamlit Cloud rebuild before
-    other browsers (and a hard refresh) see the change. Showing this uniformly —
-    with a one-click reload — stops a planner who waits and refreshes from
-    assuming the save failed. ``key_suffix`` keeps the button key unique per
-    call site / facility.
+    Every store mirrors what it pushed into this container's ``data/`` folder,
+    so the saved values are in use in this session at once; other browsers
+    pick them up after the ~1–2 min Streamlit Cloud rebuild. Saying exactly
+    that stops a planner from waiting and refreshing for a value that already
+    drives the numbers on screen. (It used to promise a 🔄 Refresh banner that
+    never fires for your own commit and carry a reload button whose click was
+    a plain rerun; ``key_suffix`` is kept so call sites don't change.)
     """
-    st.info(
-        "⏳ **Streamlit Cloud is now redeploying** with your saved values "
-        "(~1–2 minutes). Other users see them after that; the 🔄 Refresh banner "
-        "at the top of the relevant tab pulls them in mid-session."
+    del key_suffix
+    st.caption(
+        "In use now. Teammates see the saved values after the app redeploys "
+        "(~1–2 minutes)."
     )
-    if st.button("🔄 I waited — reload now", key=f"reload_after_save_{key_suffix}"):
-        st.rerun()
 
 
 def _confirm_destructive(confirm_key: str, token: str, warn_msg: str) -> bool:
@@ -4735,10 +4788,11 @@ def _render_help_glossary() -> None:
 **Status colors**
 🟢 OK · 🟡 Tight · 🟠 Near capacity · 🔴 Over capacity · ⚪ Not at this facility
 
-**Sidebar in three steps**
+**Sidebar in four steps**
 1. **Pick a facility** — Henderson, Spartanburg, or Cypress. Each has its own crew config.
-2. **Tell us what to build** — upload your monthly schedule (CSV or Excel workbook), or paste / type a few SKUs for a quick what-if.
-3. **Tune** — working days, shift length, safety, efficiency, and per-station headcount under the expanders below.
+2. **Tell us what to build** — upload your monthly schedule (CSV or Excel workbook), or paste / type a few SKUs for a quick what-if. The newest schedule saved for the facility loads on its own.
+3. **Plan month & window** — the month this plan is for, and whether to look at the whole month, this week, or the rest of the month.
+4. **Capacity settings** — working days, shift length, safety, efficiency, workforce availability, and per-station headcount under the two expanders.
 
 **Pasting a list from Excel**
 Pick **✏️ Paste or type SKUs** in step 2, open **📋 Paste a list from Excel**, and paste the cells you copied. You don't need the full schedule layout — just SKUs, with an accessory column and a quantity column if you have them:
@@ -5212,6 +5266,7 @@ def render_sidebar() -> dict:
         label_visibility="collapsed",
         help="Each facility has its own saved headcount and station setup.",
     )
+    _note_facility(location)
 
     # ----------------------------------------------------------------
     # STEP 2 — Schedule (always visible)
@@ -5440,6 +5495,7 @@ def render_sidebar() -> dict:
         _now,
         extra=[_cur, *(st.session_state.get(SCHEDULE_MONTHS_KEY) or [])],
     )
+    st.sidebar.markdown("#### Step 3 · Plan month & window")
     plan_month = st.sidebar.selectbox(
         "Plan month",
         _month_opts,
@@ -5478,8 +5534,10 @@ def render_sidebar() -> dict:
     st.sidebar.markdown("---")
 
     # ----------------------------------------------------------------
-    # STEP 3 — Settings, behind an expander
+    # STEP 4 — Capacity settings: working time + station headcount, each
+    # behind an expander
     # ----------------------------------------------------------------
+    st.sidebar.markdown("#### Step 4 · Capacity settings")
     with st.sidebar.expander("⏱️ Working-time settings", expanded=False):
         st.caption("How much capacity you have per person per day.")
         # Saved per-facility planning assumptions. Seeds the Safety / Efficiency
@@ -5680,7 +5738,7 @@ def render_sidebar() -> dict:
         )
 
     # ----------------------------------------------------------------
-    # STEP 4 — Station headcount (per facility), behind an expander
+    # STEP 4 (cont.) — Station headcount (per facility), behind an expander
     # ----------------------------------------------------------------
     with st.sidebar.expander(f"👥 Station headcount for {location}", expanded=False):
         st.caption(
@@ -5693,9 +5751,23 @@ def render_sidebar() -> dict:
 
         crew_default_df = load_facility_crew_df(location)
         # Friendly display: rename columns for the editor
-        display_crew = crew_default_df.rename(
+        display_saved = crew_default_df.rename(
             columns={"HC": "People", "Conc": "Stations/Cells", "Crew": "Crew per unit"}
         )
+        # Unsaved edits live in the editor's widget state, which Streamlit
+        # drops the moment this facility's editor isn't drawn (a facility
+        # switch and back). Keep a per-facility draft of the edited table and
+        # seed the editor from it, so the planner's numbers come back with
+        # them; 💾 Save crew is still what persists them for everyone.
+        _crew_draft_key = f"_crew_draft_{location}"
+        _draft = st.session_state.get(_crew_draft_key)
+        display_crew = display_saved
+        if (
+            isinstance(_draft, pd.DataFrame)
+            and list(_draft.index) == list(display_saved.index)
+            and list(_draft.columns) == list(display_saved.columns)
+        ):
+            display_crew = _draft
 
         edited_display = st.data_editor(
             display_crew,
@@ -5717,6 +5789,15 @@ def render_sidebar() -> dict:
                 ),
             },
         )
+        # Remember the edited table while it differs from what's saved; once
+        # they match again (a save, or edits undone) the draft goes.
+        try:
+            if edited_display.equals(display_saved):
+                st.session_state.pop(_crew_draft_key, None)
+            else:
+                st.session_state[_crew_draft_key] = edited_display.copy()
+        except Exception:
+            pass
         # Convert back to internal column names
         edited = edited_display.rename(
             columns={"People": "HC", "Stations/Cells": "Conc", "Crew per unit": "Crew"}
@@ -6716,8 +6797,9 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
         st.caption(
             "⏸️ **Buildable** excludes "
             + ", ".join(f"**{s}**" for s in _excluded)
-            + " (set in the sidebar → planning assumptions) — those stations "
-            "don't cap the count. They're still shown on the **Capacity** tab."
+            + " (set in the sidebar → **⏱️ Working-time settings**) — those "
+            "stations don't cap the count. They're still shown on the "
+            "**Capacity** tab."
         )
 
     # ----------------------------------------------------------------
@@ -7106,7 +7188,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
             "⏸️ Excluded from buildable-unit sizing: "
             + ", ".join(f"**{s}**" for s in _excluded)
             + " — still shown below, but they don't cap Buildable units. "
-            "Change this in the sidebar → planning assumptions."
+            "Change this in the sidebar → **⏱️ Working-time settings**."
         )
 
     # =============================================================
@@ -7827,8 +7909,9 @@ def _render_export_view(schedule_df, units, capacity, inputs, location: str) -> 
     )
     if db_bytes:
         st.caption(
-            f"{len(db_bytes) / 1024:,.0f} KB · reflects the data files as of this "
-            "app's last redeploy (saves land after the ~1 minute rebuild)."
+            f"{len(db_bytes) / 1024:,.0f} KB · built from this app's data files, "
+            "including every save made here (other users' saves land after "
+            "the ~1 minute rebuild)."
         )
 
     # ---- 2) This session's analysis -----------------------------------------
@@ -9040,7 +9123,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
         st.success(
             f"✅ Added XXX placeholder accessory `{new_sku}` "
             + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
-            + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
+            + "  \nIn use now; teammates see it after the redeploy (~1 min)."
         )
         _render_seeded_routing(seed)
 
@@ -9211,7 +9294,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
         st.success(
             f"✅ Added `{new_sku}` to `{file_path}` "
             + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
-            + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
+            + "  \nIn use now; teammates see it after the redeploy (~1 min)."
         )
         _render_seeded_routing(seed)
 
@@ -9273,6 +9356,19 @@ def _render_stale_data_banner(file_path: str) -> None:
             )
         with c2:
             if st.button("🔄 Refresh", key=f"stale_refresh_{file_path}"):
+                # Pull their commit into this container's copy so the view —
+                # and every tab — uses it now, not after the next redeploy.
+                try:
+                    _fresh_bytes, _fresh_sha = fetch_catalog_csv_from_github(
+                        file_path, token,
+                    )
+                    if _fresh_bytes:
+                        mirror_csv_locally(
+                            file_path, _fresh_bytes.decode("utf-8-sig"),
+                        )
+                        latest = _fresh_sha or latest
+                except Exception:
+                    pass
                 try:
                     _clear_catalog_cache(file_path)
                 except Exception:
@@ -9961,13 +10057,10 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
             + (" …" if len(skipped_additions) > 12 else "")
             + ". Export a fresh workbook to update those rows."
         )
-    st.info(
-        "⏳ **Streamlit Cloud is now redeploying** with the new values "
-        "(~1–2 minutes). The Refresh banner at the top of this tab will let "
-        "you reload once it's ready."
+    st.caption(
+        "In use now. Teammates see the new values after the app redeploys "
+        "(~1–2 minutes)."
     )
-    if st.button("🔄 I waited — try reloading now", key=f"reload_after_save_{label}"):
-        st.rerun()
     return commit_sha or "saved"
 
 
@@ -11218,7 +11311,7 @@ def _apply_recon_to_acc_csv(selected_df, acc_df):
     st.success(
         f"✅ Wrote {n_diffs} updated cell(s) to acc_clean.csv "
         + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
-        + "  \nNew values apply after the app redeploys (~1 min)."
+        + "  \nIn use now; teammates see them after the redeploy (~1 min)."
     )
 
 
@@ -11876,8 +11969,9 @@ def main():
             st.warning(
                 f"📆 **{_n_move} row(s) aren't on the {_plan_lbl} calendar** — "
                 "they're dated in another month or carried over from an earlier "
-                "month, so they won't show here or count toward this month's "
-                f"load. Move them in{_or_switch}."
+                "month, so the Calendar and the weekly view leave them out "
+                "(the totals still count them). Move them in"
+                f"{_or_switch}."
             )
             if _offer_switch:
                 _c_move, _c_switch = st.columns(2)
@@ -11942,11 +12036,16 @@ def main():
             )
             _switch_plan_month_button(st, stretch=False)
 
-    _skipped_fg: list = []
-    _unknown_acc: list = []
-    if not units.empty and hasattr(units, "attrs"):
-        _skipped_fg = list(units.attrs.get("skipped_fg", []) or [])
-        _unknown_acc = list(units.attrs.get("unknown_acc", []) or [])
+    # What the last ➕ Import did — stashed before its rerun so the message
+    # survives, and the list below is rebuilt from the catalogs as they are now.
+    _import_toast = st.session_state.pop("_import_toast", None)
+    if isinstance(_import_toast, tuple) and len(_import_toast) == 2:
+        (st.success if _import_toast[0] == "success" else st.info)(_import_toast[1])
+
+    # Computed from the schedule rather than the unit table, so the list and
+    # the import button are there even when every FG SKU is unknown and
+    # expansion came back empty.
+    _skipped_fg, _unknown_acc = _missing_catalog_skus(schedule_df_full, machine_df, acc_df)
     if _skipped_fg or _unknown_acc:
         _preview_fg = ", ".join(f"`{s}`" for s in _skipped_fg[:5])
         _preview_acc = ", ".join(f"`{s}`" for s in _unknown_acc[:5])
@@ -12036,6 +12135,9 @@ def main():
                 _failed = True
                 st.error(f"❌ Import failed: {e}")
             if not _failed:
+                # The save mirrored the new rows into data/, so clearing the
+                # loader cache and rerunning is enough for the units to count:
+                # the warning above rebuilds from the catalogs as they are now.
                 try:
                     _clear_catalog_cache("data/machine_clean.csv", "data/acc_clean.csv")
                 except Exception:
@@ -12045,22 +12147,24 @@ def main():
                     n_added=len(_added_all), n_skipped=len(_skipped_all),
                 )
                 if _added_all:
-                    st.success(
+                    st.session_state["_import_toast"] = (
+                        "success",
                         f"✅ Imported **{len(_added_all)}** SKU(s) as zero-labor "
-                        "placeholders. They'll appear in the catalogs after the "
-                        "app redeploys (~1 min) — then set their labor times in "
-                        "**📁 Data & Setup**."
+                        "placeholders — their units count now. Set their labor "
+                        "times in **📁 Data & Setup → 🏭 Machine catalog** / "
+                        "**🔌 Accessory catalog**."
                         + (
                             f"  \n_Skipped {len(_skipped_all)} already-present / "
                             "invalid SKU(s)._" if _skipped_all else ""
-                        )
+                        ),
                     )
                 else:
-                    st.info(
-                        "Nothing imported — every missing SKU was already in the "
-                        "catalog (another user may have just added them). Refresh "
-                        "to see them."
+                    st.session_state["_import_toast"] = (
+                        "info",
+                        "Nothing imported — every missing SKU is already in the "
+                        "catalog.",
                     )
+                st.rerun()
 
     # Top-level tabs, ordered from executive summary → planner detail → admin.
     # Batteries content folded into Capacity. Update Labor + Data Quality + Source Data
@@ -12074,9 +12178,19 @@ def main():
 
     # Helper — show an "empty state" message inside analysis tabs when there's no schedule
     def _empty_state(tab_name: str):
+        if inputs.get("schedule_mode") == SCHEDULE_MODE_MANUAL:
+            _how = (
+                "• Type or paste SKUs in the sidebar (**✏️ Paste or type SKUs**), "
+                "or switch to **📤 Upload schedule file**."
+            )
+        else:
+            _how = (
+                "• Upload a readable schedule, or load a saved one from the "
+                "sidebar's **📂 Save / load uploaded schedules** panel — or "
+                "switch to **✏️ Paste or type SKUs** for a quick what-if."
+            )
         st.info(
-            f"📭 **{tab_name} needs a schedule to populate.**  \n"
-            "• In the sidebar, switch to **📤 Upload schedule file** or **✏️ Paste or type SKUs**.  \n"
+            f"📭 **{tab_name} needs a schedule to populate.**  \n{_how}  \n"
             "• You can still edit catalogs, items, packages, and the process flow from the "
             "**📁 Data & Setup** tab without a schedule."
         )

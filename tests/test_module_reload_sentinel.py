@@ -94,6 +94,7 @@ class TestNewCoreNamesAreProbed:
         'hasattr(core.data_loader, "canonical_catalog_column")',  # excel_io imports it
         'hasattr(core.excel_io, "_is_sku_header")',                # app reads sheet.aliased
         'hasattr(core.excel_io, "reconcile_pending")',             # app imports it
+        'hasattr(core.sku_routing, "seed_facility_routing")',      # app imports it
         'hasattr(core.uploaded_schedule_storage, "names_newest_first")',  # app imports it
     ])
     def test_probed_in_stale_block(self, probe):
@@ -107,3 +108,13 @@ class TestNewCoreNamesAreProbed:
         assert "import core.catalog_source_storage" in SOURCE
         m = re.search(r"for _modname in \((.*?)\):", SOURCE, re.DOTALL)
         assert m and '"core.catalog_source_storage"' in m.group(1)
+
+    def test_sku_routing_module_is_imported_and_reloaded_after_constants(self):
+        # sku_routing imports only core.constants, and app.py pulls names
+        # from it (_machine_family / _machine_class / the seeder), so it must
+        # be bare-imported and reloaded right after constants.
+        assert "import core.sku_routing" in SOURCE
+        m = re.search(r"for _modname in \((.*?)\):", SOURCE, re.DOTALL)
+        order = re.findall(r'"core\.(\w+)"', m.group(1))
+        assert "sku_routing" in order
+        assert order.index("constants") < order.index("sku_routing")

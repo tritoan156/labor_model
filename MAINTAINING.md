@@ -185,6 +185,24 @@ reroute: it moves whatever the Final-Station routing dropped at the
 Undercarriage station on to another team — see
 `core/labor_calculator.compute_unit_labor`.)
 
+**Seeding a new SKU's routing.** The routing columns are the app's own overlay
+— never read from the IE's Excel workbook — so a row added with them blank
+would load as the default team at every plant and miss the custom routing
+above. Every path that adds a SKU (the ➕ add-SKU form, the ➕ XXX-placeholder
+form, the Overview's **➕ Import N missing SKU(s)** button, and the Excel
+import's new rows via `_append_catalog_rows`) therefore seeds the 15 cells with
+`core/sku_routing.RoutingSeeder`: for each facility column it copies the most
+common value among catalog rows of the same family *and* class
+(`machine_family` / `machine_class`, which live in that module), else the same
+family, else the facility column's majority, and only for an empty catalog the
+station default. Blank cells never vote (a never-set group falls through to the
+next tier) and a routing value the sheet does carry is kept. Each add/import
+preview shows what the SKU got (`_routing_seed_preview` /
+`_render_seeded_routing` in `app.py`); the planner can still change it in the
+editor's dropdowns afterwards. `tests/test_sku_routing.py` pins the rule
+against the real catalog; `tests/test_routing_seed_entry_paths.py` pushes a
+row through each path.
+
 **Frozen (pinned) catalog columns — the ~60% gotcha.** The catalog editors
 pin SKU / Description (and a couple of status columns) with
 `st.column_config(..., pinned=True)` so they stay visible while scrolling

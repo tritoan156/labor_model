@@ -50,6 +50,7 @@ import core.data_loader
 import core.labor_calculator
 import core.excel_io
 import core.catalog_source_storage
+import core.sku_routing
 
 # Step 2: detect staleness via sentinels for names/params added in recent pushes.
 #
@@ -81,6 +82,9 @@ _stale = (
     or "Undercarriage" not in getattr(core.constants, "STATION_KEYS", [])
     or not hasattr(core.usage_tracker, "flush_buffer")
     or not hasattr(core.excel_io, "read_catalog_workbook")
+    # Routing seeds for new SKUs (also where _machine_family / _machine_class
+    # now live) — app.py imports these names directly.
+    or not hasattr(core.sku_routing, "seed_facility_routing")
     # Saved-schedule picker: parsed row count + newest-first ordering.
     or not hasattr(core.uploaded_schedule_storage, "names_newest_first")
 )
@@ -91,6 +95,7 @@ if _stale:
     # sys.modules; on a clean deploy nothing is stale and this is skipped.
     for _modname in (
         "core.constants",
+        "core.sku_routing",
         "core.catalog_storage",
         "core.facility_storage",
         "core.facility_settings_storage",
@@ -113,6 +118,15 @@ if _stale:
                 pass
 
 # --- Now bind the specific names (pulled from the freshly reloaded modules) ---
+from core.sku_routing import (
+    # The family / class classifiers keep their app-side names; the routing
+    # seeder keys on them, which is why they live next to it.
+    KNOWN_FAMILIES,
+    machine_family as _machine_family,
+    machine_class as _machine_class,
+    RoutingSeeder, seed_facility_routing, routing_seed_table,
+    routing_columns_in,
+)
 from core.data_loader import (
     load_machine_labor, load_acc_labor, load_schedule, build_manual_schedule,
     build_placeholder_map,
@@ -242,6 +256,21 @@ def _csv_mtime(filename: str) -> float:
     """
     p = DATA_DIR / filename
     return p.stat().st_mtime if p.exists() else 0.0
+
+
+@st.cache_data(show_spinner=False)
+def _raw_catalog_csv_cached(file_path: str, mtime: float) -> pd.DataFrame:
+    """The catalog CSV as it sits on disk — every cell as text, blanks kept —
+    for the routing-seed previews. The loaders fill a blank routing cell with
+    the station's default, which would make a never-set cell look like a
+    deliberate choice; the seeder has to see the blank. Keyed on the file's
+    mtime like the other loaders."""
+    p = Path(file_path)
+    if not p.is_absolute():
+        p = DATA_DIR.parent / file_path
+    if not p.exists():
+        return pd.DataFrame()
+    return pd.read_csv(p, dtype=str, keep_default_na=False)
 
 
 # Cache version — bump this when the loader's OUTPUT SCHEMA changes (column
@@ -8133,10 +8162,19 @@ def _render_catalog_import_section(sheet, source_df, upload_sig: str,
     if diff.new_rows:
         with st.expander(f"➕ {len(diff.new_rows)} new SKU(s)", expanded=True):
             st.dataframe(diff.new_rows_frame(), width="stretch", hide_index=True)
-            st.caption(
-                "Blank labor cells are saved blank (the app reads them as 0); blank "
-                "routing cells use the station's default."
-            )
+            _seed_tbl = _routing_seed_preview(spec.file_path, diff.new_rows)
+            if _seed_tbl is not None:
+                st.caption(
+                    "Blank labor cells are saved blank (the app reads them as 0). "
+                    "Per-facility routing: a value on the sheet is kept; a blank "
+                    "routing cell is seeded from the most similar SKU already in "
+                    "the catalog (same family and class), so the new SKU inherits "
+                    "each plant's custom routing — `defaults` means every station "
+                    "keeps its own team:"
+                )
+                st.dataframe(_seed_tbl, width="stretch", hide_index=True)
+            else:
+                st.caption("Blank labor cells are saved blank (the app reads them as 0).")
     if diff.absent_skus:
         with st.expander(
             f"⏸️ {len(diff.absent_skus)} catalog SKU(s) not on the sheet — left untouched",
@@ -8771,6 +8809,44 @@ def _render_pending_changes(edited, source_df, editable_cols, text_cols=None):
         st.dataframe(pd.DataFrame(diffs), width="stretch", hide_index=True)
 
 
+def _routing_seed_preview(file_path: str, rows) -> "pd.DataFrame | None":
+    """What per-facility routing each new SKU in ``rows`` would get, as
+    :func:`routing_seed_table` — one line per SKU with each plant's reroutes.
+
+    ``rows`` are ``{"SKU": ..., "Description": ...}`` dicts (an Excel import's
+    new rows, or bare SKUs from the missing-SKU banner); a routing cell a row
+    already carries wins over the seed, exactly as the save does. Seeds come
+    from the catalog CSV on disk with its blanks intact. Returns None when the
+    catalog has no routing columns (the accessory catalog) or there is nothing
+    to seed.
+    """
+    rows = [r for r in (rows or []) if str((r or {}).get("SKU", "")).strip()]
+    if not rows:
+        return None
+    catalog = _raw_catalog_csv_cached(file_path, _csv_mtime(Path(file_path).name))
+    seeder = RoutingSeeder(catalog)
+    if not seeder.columns:
+        return None
+    seeds = [
+        seeder.seed(r["SKU"], r.get("Description", "")).with_given(r) for r in rows
+    ]
+    return routing_seed_table(seeds)
+
+
+def _render_seeded_routing(seed) -> None:
+    """After an add-SKU save: the per-facility routing the new row was seeded
+    with, stations × plants. Shows nothing for a catalog without routing
+    columns (the accessory catalog)."""
+    if seed is None or not getattr(seed, "values", None):
+        return
+    st.caption(
+        f"🧭 Per-facility routing seeded from {seed.describe()} — the new SKU "
+        "inherits each plant's custom routing from the most similar SKU already "
+        "in the catalog. Change it in the table above if that isn't right."
+    )
+    st.dataframe(seed.preview_frame(), width="stretch", hide_index=True)
+
+
 def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
     """Quick form to add an estimation placeholder accessory (e.g. `BOSS25 AXXX`).
 
@@ -8856,6 +8932,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
         today = today_local_str()
         new_sku_upper = new_sku.upper()
         response = None
+        seed = None
         for attempt in (1, 2):
             try:
                 with st.spinner(
@@ -8887,6 +8964,10 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
                         if c in new_row:
                             new_row[c] = int(v)
                     new_row["Last Modified"] = today
+                    # Per-facility routing (no-op for a catalog without the
+                    # columns): seed blank cells from the most similar row.
+                    seed = seed_facility_routing(fresh_df, new_sku, new_desc)
+                    seed.fill(new_row)
 
                     merged = pd.concat(
                         [fresh_df, pd.DataFrame([new_row])],
@@ -8922,6 +9003,7 @@ def _render_add_xxx_placeholder(acc_df, editable_cols, file_path):
             + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
             + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
         )
+        _render_seeded_routing(seed)
 
 
 def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_cols=None):
@@ -8941,6 +9023,14 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
             "yet. The new row is committed to GitHub immediately along with today's "
             "date in **Last Modified**."
         )
+        if routing_columns_in(getattr(source_df, "columns", [])):
+            st.caption(
+                "🧭 Per-facility routing (Final / AccKIT / PDI / Wire / "
+                "Undercarriage station at every plant) is seeded from the most "
+                "similar SKU already in the catalog — same family and class — so "
+                "the new SKU inherits each plant's custom routing. You'll see what "
+                "it got right after the save."
+            )
         with st.form(f"add_new_{label}", clear_on_submit=True):
             new_sku = st.text_input(
                 "SKU", help="Must be unique — case-insensitive check against the catalog.",
@@ -9002,6 +9092,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
 
         # Fetch + append + push, with one retry on SHA conflict.
         response = None
+        seed = None
         for attempt in (1, 2):
             try:
                 with st.spinner(
@@ -9039,6 +9130,12 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
                         if c in new_row:
                             new_row[c] = int(v)
                     new_row["Last Modified"] = today
+                    # Per-facility routing: a blank cell would load as the
+                    # station's default team, so seed the row from the most
+                    # similar SKU on the fetched file (no-op for a catalog
+                    # without routing columns).
+                    seed = seed_facility_routing(fresh_df, new_sku, new_desc)
+                    seed.fill(new_row)
 
                     merged = pd.concat(
                         [fresh_df, pd.DataFrame([new_row])],
@@ -9077,6 +9174,7 @@ def _render_add_new_sku(source_df, editable_cols, file_path, label, extra_text_c
             + (f"(commit [`{commit_sha}`]({commit_url}))." if commit_url else "")
             + "  \nIt will appear in the catalog after the app redeploys (~1 min)."
         )
+        _render_seeded_routing(seed)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -9329,7 +9427,10 @@ def _import_missing_skus_to_catalog(
     cells — the loaders coerce blanks to 0, so the SKU enters the catalog with
     zero labor that the planner fills in afterwards. This is the "quick import"
     path: it gets the missing SKU into the system so its units stop being
-    dropped, without forcing the planner to enter labor times up front.
+    dropped, without forcing the planner to enter labor times up front. The
+    per-facility routing cells are **seeded** (:class:`RoutingSeeder`) from
+    the most similar SKU already on the file, so the row inherits each
+    plant's custom routing instead of loading as the default team.
 
     Reuses the same fresh-fetch + SHA-locked push + one-retry pattern as
     :func:`_render_add_new_sku`. SKUs already present on the freshly-fetched
@@ -9352,6 +9453,7 @@ def _import_missing_skus_to_catalog(
             fresh_df["Last Modified"] = ""
 
         existing = set(fresh_df["SKU"].astype(str).str.strip().str.upper())
+        seeder = RoutingSeeder(fresh_df)
 
         added = []
         skipped = []
@@ -9370,6 +9472,7 @@ def _import_missing_skus_to_catalog(
             row = {col: "" for col in fresh_df.columns}
             row["SKU"] = sku
             row["Last Modified"] = today
+            seeder.seed(sku).fill(row)
             new_rows.append(row)
             added.append(sku)
             existing.add(sku.upper())  # guard against dupes within this batch
@@ -9526,10 +9629,14 @@ def _append_catalog_rows(fresh_df, additions):
     catalog frame, matching its column schema.
 
     Each addition is a ``{column: value}`` dict carrying at least ``SKU``;
-    columns the file doesn't have are dropped, columns the addition doesn't
-    mention are left blank (the loaders read a blank labor cell as 0 and a
-    blank routing cell as the station's default), and ``Last Modified`` is
-    stamped with today. A SKU already on the fetched file (someone added it
+    columns the file doesn't have are dropped, labor columns the addition
+    doesn't mention are left blank (the loaders read a blank labor cell as
+    0), and ``Last Modified`` is stamped with today. A per-facility routing
+    cell the addition leaves blank is **seeded** (:class:`RoutingSeeder`)
+    from the most similar SKU already on the fetched file — the sheet never
+    carries routing for the IE's workbook, and a blank would load as the
+    default team; a routing value the sheet does give is kept as-is. A SKU
+    already on the fetched file (someone added it
     since the planner exported), a formula-prefixed SKU (``= + - @``), or a
     repeat within the batch is skipped and reported, never overwritten — the
     same rules as :func:`_import_missing_skus_to_catalog`.
@@ -9548,6 +9655,7 @@ def _append_catalog_rows(fresh_df, additions):
     added: list[str] = []
     skipped: list[str] = []
     rows: list[dict] = []
+    seeder = RoutingSeeder(fresh_df)
     for item in additions:
         sku = str((item or {}).get("SKU", "")).strip()
         if not sku:
@@ -9561,6 +9669,7 @@ def _append_catalog_rows(fresh_df, additions):
                 row[col] = "" if val is None else val
         row["SKU"] = sku
         row["Last Modified"] = today
+        seeder.seed(sku, row.get("Description", "")).fill(row)
         rows.append(row)
         added.append(sku)
         existing.add(sku.upper())
@@ -10678,45 +10787,9 @@ def _accessory_family_hint(sku: str) -> str:
     return re.split(r"-A", s)[0]
 
 
-# Order matters: longest prefixes first so BOSS220HS-002 resolves to BOSS220
-# (not the non-existent BOSS2 or BOSS22).
-KNOWN_FAMILIES = ["BOSS400", "BOSS220", "BOSS125", "BOSS70", "BOSS25", "PDS", "SDG"]
-
-
-def _machine_family(sku: str) -> str:
-    """Map an FG SKU to a high-level product family (BOSS25 / BOSS70 / … / PDS / SDG)."""
-    s = str(sku or "").upper().strip()
-    if not s:
-        return "OTHER"
-    for fam in KNOWN_FAMILIES:
-        if s.startswith(fam):
-            return fam
-    return "OTHER"
-
-
-def _machine_class(sku: str, description: str) -> str:
-    """Classify a machine SKU into one of:
-       ⚠ Placeholder · Hybrid · Power Module · Head Trailer · Standard Trailer · Standard.
-
-    PDS/SDG always classify as 'Standard' (compressor/generator base units).
-    BOSS rules apply in this priority: Placeholder > Hybrid > Power Module > Head Trailer > Standard Trailer.
-    """
-    s = str(sku or "").upper().strip()
-    d = str(description or "").upper()
-    fam = _machine_family(s)
-    if "XXX" in s:
-        return "⚠ Placeholder"
-    if fam in ("PDS", "SDG"):
-        return "Standard"
-    if "HYBRID" in d:
-        return "Hybrid"
-    # "HS" or "PM SKID" / "SKID" indicates a Power Module (head-skid only)
-    if "HS" in s.replace(fam, "", 1) or "PM SKID" in d or " SKID " in f" {d} ":
-        return "Power Module"
-    # "HT" in the SKU after the family prefix indicates a Head + Trailer unit
-    if "HT" in s.replace(fam, "", 1):
-        return "Head Trailer"
-    return "Standard Trailer"
+# KNOWN_FAMILIES, _machine_family and _machine_class are imported from
+# core.sku_routing (top of this file): the routing seeder for new SKUs keys
+# on family + class, so the classifiers live next to it.
 
 
 def _family_battery_count(machine_df, family_prefix: str) -> int:
@@ -11757,6 +11830,27 @@ def main():
             "⚠️ " + "  \n".join(_bits)
             + "  \n→ Quick-import them below, or edit catalogs in **📁 Data & Setup**."
         )
+
+        # The routing each missing FG SKU would be seeded with, so the planner
+        # sees it before clicking import (accessories have no routing).
+        if _skipped_fg:
+            _seed_tbl = _routing_seed_preview(
+                "data/machine_clean.csv", [{"SKU": s} for s in _skipped_fg],
+            )
+            if _seed_tbl is not None:
+                with st.expander(
+                    f"🧭 Per-facility routing the {len(_skipped_fg)} imported "
+                    "FG SKU(s) would get",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "Seeded from the most similar SKU already in the machine "
+                        "catalog (same family and class) so each plant's custom "
+                        "routing carries over; `defaults` means every station keeps "
+                        "its own team. Adjust it afterwards in **📁 Data & Setup → "
+                        "🏭 Machine catalog**."
+                    )
+                    st.dataframe(_seed_tbl, width="stretch", hide_index=True)
 
         # Quick import — one click adds every missing SKU to the catalogs as a
         # placeholder (zero labor, today's date) so its units stop being

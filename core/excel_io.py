@@ -56,7 +56,9 @@ from .facility_settings_storage import load_all_facility_settings
 from .facility_storage import load_all_facility_configs
 from .process_flow_storage import load_process_flow
 from .scenario_storage import load_all_scenarios
-from .uploaded_schedule_storage import load_all_uploaded_schedules
+from .uploaded_schedule_storage import (
+    count_csv_data_rows, load_all_uploaded_schedules,
+)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -365,14 +367,28 @@ def exec_scenarios_table(exec_scenarios: dict | None) -> pd.DataFrame:
 
 
 def saved_schedules_index(uploaded: dict | None) -> pd.DataFrame:
-    """``uploaded_schedules.json`` → one row per saved schedule."""
+    """``uploaded_schedules.json`` → one row per saved schedule.
+
+    ``Rows`` is recounted from the CSV itself (:func:`count_csv_data_rows`),
+    the same number the 📂 picker and the "Loaded N of M rows" pill show.
+    Blocks saved before 2026-10 stored a line-break count that a quoted
+    multi-line cell inflates ("296" for a 288-row file); the stored value is
+    only used when there is no CSV to count."""
     rows = []
     for facility, by_name in (uploaded or {}).items():
         for name, block in (by_name or {}).items():
             block = block or {}
+            csv_text = block.get("csv_content") or ""
+            if isinstance(csv_text, str) and csv_text.strip():
+                try:
+                    n_rows = count_csv_data_rows(csv_text)
+                except Exception:  # noqa: BLE001 — a bad blob keeps its stored count
+                    n_rows = block.get("rows")
+            else:
+                n_rows = block.get("rows")
             rows.append({
                 "Facility": facility, "Schedule": name,
-                "Saved at": block.get("saved_at", ""), "Rows": block.get("rows"),
+                "Saved at": block.get("saved_at", ""), "Rows": n_rows,
             })
     return pd.DataFrame(rows, columns=["Facility", "Schedule", "Saved at", "Rows"])
 

@@ -922,9 +922,15 @@ def _auto_spread_dates(
 
     # Map each working day to its week-of-month bucket so we can balance
     # load at the WEEK level first (so a small schedule doesn't bunch into
-    # the first few days), then break ties at the day level.
+    # the first few days), then break ties at the day level. Week loads are
+    # compared PER WORKING DAY of the week: a month's first or last calendar
+    # week is usually partial (Aug 2026 ends on a lone Monday), and comparing
+    # raw week totals handed such a week a full week's units on its one day.
     day_to_week: dict[date, int] = {d: week_of_month(d) for d in working}
     weeks_set = sorted(set(day_to_week.values()))
+    week_days: dict[int, int] = {
+        w: sum(1 for d in working if day_to_week[d] == w) for w in weeks_set
+    }
 
     # Seed running loads from rows that ARE already dated.
     day_load: dict[date, float] = {d: 0.0 for d in working}
@@ -941,8 +947,8 @@ def _auto_spread_dates(
 
     # Compute labor weights for the blank rows once, then walk them
     # largest-first and drop each into the lightest-loaded (week, day).
-    # The (week_load, day_load) key means a 5-unit plan spreads as
-    # 1-per-week instead of clustering in the first ~5 days.
+    # The (week_load per working day, day_load) key means a 5-unit plan
+    # spreads as 1-per-week instead of clustering in the first ~5 days.
     blank_idxs = list(df.index[blank_mask])
     weights = {idx: _row_labor_weight(df.loc[idx], machine_df, acc_df)
                for idx in blank_idxs}
@@ -952,7 +958,10 @@ def _auto_spread_dates(
     for idx in blank_idxs:
         d = min(
             working,
-            key=lambda x: (week_load[day_to_week[x]], day_load[x]),
+            key=lambda x: (
+                week_load[day_to_week[x]] / week_days[day_to_week[x]],
+                day_load[x],
+            ),
         )
         assigned[idx] = d
         day_load[d] += weights[idx]
@@ -1148,13 +1157,16 @@ def _suggest_schedule_dates(
     if not working:
         return new_df, []
 
-    # ---- Per-station weekly capacity (5-day reference) ------------------
+    # ---- Per-station capacity per WORKING DAY ---------------------------
+    # Scaled to each week's true Mon–Fri count below. A flat 5-day week let a
+    # partial first / last calendar week (1–4 working days) absorb a full
+    # week's units — the Calendar then showed a lone Monday carrying five
+    # days of work and the Overview heatmap lit that week up at 500%.
     from core.constants import STATION_KEY_TO_DISPLAY, UTIL_THRESHOLD_OVER
     crew_config = inputs["crew_config"]
     shift = float(inputs["shift"])
     eff = float(inputs["efficiency"])
     safety = float(inputs["safety"])
-    week_days = 5
 
     station_capacity: dict[str, float] = {}
     for st_key in STATION_KEYS:
@@ -1166,13 +1178,20 @@ def _suggest_schedule_dates(
             hc = int(crew_config.loc[st_disp, "HC"])
         except Exception:
             hc = 0
-        station_capacity[st_key] = (
-            hc * shift * week_days * eff * safety if hc > 0 else 0.0
-        )
+        station_capacity[st_key] = hc * shift * eff * safety if hc > 0 else 0.0
 
-    # Map each working day → its week
+    # Map each working day → its week, and each week → its working days.
     day_to_week = {d: week_of_month(d) for d in working}
     weeks = sorted(set(day_to_week.values()))
+    week_ndays = {w: sum(1 for d in working if day_to_week[d] == w) for w in weeks}
+
+    def _week_cap(st_key: str, w: int) -> float:
+        """A station's labor capacity over the working days of week ``w``."""
+        return station_capacity.get(st_key, 0.0) * week_ndays.get(w, 5)
+
+    def _per_day(w: int) -> float:
+        """Week ``w``'s running load per working day — the balance key."""
+        return week_total_load[w] / week_ndays[w]
 
     # Running per-station-per-week load + total per-day load + total
     # per-week load. The week-level total is what lets us spread a small
@@ -1220,7 +1239,7 @@ def _suggest_schedule_dates(
         # per day, not balance per week.
         candidates = sorted(
             working,
-            key=lambda d: (week_total_load[day_to_week[d]], day_total_load[d]),
+            key=lambda d: (_per_day(day_to_week[d]), day_total_load[d]),
         )
         placed_day = None
         for cand in candidates:
@@ -1229,7 +1248,7 @@ def _suggest_schedule_dates(
             for st_key, cost in breakdown.items():
                 if cost <= 0:
                     continue
-                cap = station_capacity.get(st_key, 0.0)
+                cap = _week_cap(st_key, w)
                 if cap <= 0:
                     # Station doesn't exist here — skip the constraint check
                     # (treat it like infinite capacity for this purpose).
@@ -1248,14 +1267,14 @@ def _suggest_schedule_dates(
             # search, so the fallback respects week-balance too).
             placed_day = min(
                 working,
-                key=lambda d: (week_total_load[day_to_week[d]], day_total_load[d]),
+                key=lambda d: (_per_day(day_to_week[d]), day_total_load[d]),
             )
             w = day_to_week[placed_day]
             offenders = []
             for st_key, cost in breakdown.items():
                 if cost <= 0:
                     continue
-                cap = station_capacity.get(st_key, 0.0)
+                cap = _week_cap(st_key, w)
                 if cap > 0 and (station_load[(st_key, w)] + cost) / cap > UTIL_THRESHOLD_OVER:
                     offenders.append(st_key)
             if offenders:
@@ -2662,6 +2681,13 @@ def _find_customer_suffixed_skus(
         for sku, count in schedule_df[col].astype(str).str.strip().value_counts().items():
             s = str(sku).strip()
             if not s:
+                continue
+            # A catalog SKU that merely ends in a suffix token (BOSS25-018ES
+            # is its own catalog row) is already canonical: the analysis
+            # matches it as-is, so it is neither an orphan nor something to
+            # strip. Flagging it told the planner to "add the base SKU to the
+            # catalog first" for a SKU that was never at risk.
+            if s in valid_bases:
                 continue
             for sfx in CUSTOMER_SUFFIXES:
                 if s.endswith(sfx):
@@ -6178,6 +6204,23 @@ def _exec_summary_rowmap(m: dict) -> dict:
 _EXEC_SECTION_TITLES = frozenset(t for t, _ in _exec_summary_sections({}))
 
 
+def _exec_scenarios_newest_first(location: str) -> list[str]:
+    """The facility's saved executive scenarios, most recent save first.
+
+    ``list_exec_scenarios`` sorts by name, so "Hen Aug 08/04" came before
+    "Henderson October 09/23" and the 📥 Re-apply / 🗑 Delete picker opened on
+    an old save while the side-by-side below it defaulted to the newest. One
+    order for both: ``saved_at`` descending, name as the tie-break."""
+    names = list_exec_scenarios(location)
+    return sorted(
+        names,
+        key=lambda n: (
+            str((get_exec_scenario(location, n) or {}).get("saved_at", "")), str(n),
+        ),
+        reverse=True,
+    )
+
+
 def _exec_rows_with_headers(m: dict) -> list[tuple[str, str]]:
     """Flatten the sections into one ordered (label, value) list, inserting each
     section title as a divider row (blank value) so the whole thing renders as a
@@ -6396,7 +6439,7 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
                     except Exception as e:
                         _show_github_error(e, "Save")
 
-            saved = list_exec_scenarios(location)
+            saved = _exec_scenarios_newest_first(location)
             if saved:
                 pick = st.selectbox("Saved scenarios", saved, key=f"exec_pick_{location}")
                 c1, c2 = st.columns(2)
@@ -6443,18 +6486,11 @@ def tab_exec_summary(units, capacity, inputs, total_units: int = 0):
     fac_cols = st.columns(len(LOCATIONS))
     chosen = {}
     for i, fac in enumerate(LOCATIONS):
-        names = list_exec_scenarios(fac)
+        # Newest save first (same order as the Re-apply picker above) and
+        # default to it — index=1, after "—".
+        names = _exec_scenarios_newest_first(fac)
         with fac_cols[i]:
             if names:
-                # list_exec_scenarios returns names sorted by KEY (alphabetical),
-                # so the old index=len(names) defaulted to the alphabetically-last
-                # name while calling it "most recent". Sort by each block's
-                # saved_at and default to the genuine newest (index=1, after "—").
-                names = sorted(
-                    names,
-                    key=lambda n: str((get_exec_scenario(fac, n) or {}).get("saved_at", "")),
-                    reverse=True,
-                )
                 chosen[fac] = st.selectbox(
                     fac, ["—"] + names, index=1, key=f"exec_cmp_{fac}")
             else:
@@ -9932,6 +9968,29 @@ def _save_catalog_csv(edited, source_df, editable_cols, file_path, label,
     return commit_sha or "saved"
 
 
+def _qty_weighted_means(summary_df: pd.DataFrame) -> "tuple[float, float]":
+    """``(avg labor p-min, avg lead-time days)`` per planned UNIT of the Build
+    Time summary: each pairing's figure weighted by its ``Qty in schedule``.
+    Falls back to the plain mean when the quantities are missing or sum to
+    zero; ``(0.0, 0.0)`` for an empty frame."""
+    if summary_df is None or summary_df.empty:
+        return 0.0, 0.0
+    labor = pd.to_numeric(summary_df["Total Labor (p-min)"], errors="coerce").fillna(0.0)
+    lead = pd.to_numeric(summary_df["Lead Time (days)"], errors="coerce").fillna(0.0)
+    qty = (
+        pd.to_numeric(summary_df["Qty in schedule"], errors="coerce").fillna(0.0)
+        if "Qty in schedule" in summary_df.columns
+        else pd.Series(0.0, index=summary_df.index)
+    )
+    total = float(qty.sum())
+    if total <= 0:
+        return float(labor.mean()), float(lead.mean())
+    return (
+        float((labor * qty).sum() / total),
+        float((lead * qty).sum() / total),
+    )
+
+
 @st.fragment
 def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
     # @st.fragment: this tab's only interactive widget is the per-pairing
@@ -10026,16 +10085,27 @@ def tab_cycle_time(units, inputs, machine_df=None, acc_df=None):
         by="Total Labor (p-min)", ascending=False,
     ).reset_index(drop=True)
 
-    # ---- Top metrics (across all unit pairings) ----
+    # ---- Top metrics (per unit in the schedule) ----
     if not summary_df.empty:
-        avg_labor = summary_df["Total Labor (p-min)"].mean()
-        avg_lead = summary_df["Lead Time (days)"].mean()
+        # Weight each pairing by how many units of it are planned, so the
+        # figure is the schedule's labor per unit (Total work ÷ Units planned
+        # on the Overview, man-hours / unit on the Executive Summary). The
+        # plain mean over pairings counted a one-off and a 60-unit run the
+        # same and disagreed with both.
+        avg_labor, avg_lead = _qty_weighted_means(summary_df)
         slowest = summary_df.iloc[0]
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Unique unit pairings", f"{len(summary_df)}")
-        c2.metric("Avg labor / unit", _fmt_min_hr(avg_labor))
-        c3.metric("Avg lead time / unit", f"{avg_lead:.1f} days")
+        c2.metric(
+            "Avg labor / unit", _fmt_min_hr(avg_labor),
+            help="Weighted by the units planned of each pairing — the schedule's "
+                 "Total work ÷ Units planned.",
+        )
+        c3.metric(
+            "Avg lead time / unit", f"{avg_lead:.1f} days",
+            help="Weighted by the units planned of each pairing.",
+        )
         c4.metric(
             "Slowest unit", f"{slowest['FG SKU']}",
             help=f"{_fmt_min_hr(slowest['Total Labor (p-min)'])} · {slowest['Lead Time (days)']} days",
@@ -10213,6 +10283,63 @@ def _compute_station_depths(nodes, edges):
     return depth
 
 
+def _fg_model_prefix(sku) -> str:
+    """The model part of an FG SKU — what precedes the first ``-`` or space:
+    ``SDG65-005`` → ``SDG65``, ``BOSS70HS-001`` → ``BOSS70HS``,
+    ``SDG65S XXX`` → ``SDG65S``. Upper-cased; ``""`` for a blank SKU."""
+    s = str(sku or "").strip().upper()
+    return re.split(r"[-\s]", s, maxsplit=1)[0] if s else ""
+
+
+def _families_compatible(a: str, b: str) -> bool:
+    """Whether two model prefixes name the same product line: equal, or one
+    extends the other with a non-digit (``BOSS70`` ↔ ``BOSS70HS``, ``PDS185``
+    ↔ ``PDS185EZ``). ``SDG40`` vs ``SDG400`` is NOT a match — the longer one
+    continues with a digit, so it is a different model."""
+    a = str(a or "").strip().upper()
+    b = str(b or "").strip().upper()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return long_.startswith(short) and not long_[len(short)].isdigit()
+
+
+def _flow_accessory_options(fg_choice, acc_df, units_df=None) -> list[str]:
+    """Accessory SKUs the Process Flow tab offers for ``fg_choice``, sorted.
+
+    Every accessory whose family hint (``BOSS25-A016`` → ``BOSS25``,
+    ``SDG65-A035`` → ``SDG65``) is compatible with the FG's own model prefix,
+    plus whatever the loaded schedule actually pairs with this FG (a numeric
+    accessory like ``5000000214`` has no family to match on).
+
+    It used to compare the hint with :func:`_machine_family`, which collapses
+    every SDG and PDS model into ``SDG`` / ``PDS`` and every ``BOSS70HS`` into
+    ``BOSS70`` — so for two thirds of the catalog the dropdown offered nothing
+    but "(none)", and an HS unit could not pick its own HS accessory.
+    """
+    fg_prefix = _fg_model_prefix(fg_choice)
+    found: set[str] = set()
+    if acc_df is not None and "SKU" in getattr(acc_df, "columns", []):
+        for sku in acc_df["SKU"].astype(str):
+            sku = sku.strip()
+            if sku and _families_compatible(fg_prefix, _accessory_family_hint(sku)):
+                found.add(sku)
+    if (
+        units_df is not None and not units_df.empty
+        and "fg_base" in units_df.columns and "acc" in units_df.columns
+    ):
+        paired = units_df.loc[
+            units_df["fg_base"].astype(str) == str(fg_choice), "acc",
+        ]
+        for sku in paired.dropna().astype(str):
+            sku = sku.strip()
+            if sku and sku.lower() not in ("nan", "none"):
+                found.add(sku)
+    return sorted(found)
+
+
 @st.fragment
 def tab_process_flow(units_df, machine_df, acc_df, inputs):
     # @st.fragment: the FG / Accessory selectboxes only change which unit's
@@ -10261,13 +10388,20 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
             "FG SKU", fg_options, index=fg_default_idx, key="flow_fg",
         )
     with c2:
-        family = _machine_family(fg_choice)
-        acc_subset = acc_df[
-            acc_df["SKU"].astype(str).apply(_accessory_family_hint).str.upper()
-            == family.upper()
-        ] if family != "OTHER" else acc_df.iloc[0:0]
-        acc_options = ["(none)"] + sorted(acc_subset["SKU"].astype(str).tolist())
-        acc_choice = st.selectbox("Accessory SKU", acc_options, key="flow_acc")
+        acc_options = ["(none)"] + _flow_accessory_options(fg_choice, acc_df, units_df)
+        # Open on the accessory the schedule pairs with the default unit, so
+        # the first route drawn is a unit that is actually planned.
+        _acc_default = 0
+        if default_fg is not None and fg_choice == default_fg:
+            try:
+                _first_acc = str(units_df.iloc[0].get("acc") or "").strip()
+            except Exception:
+                _first_acc = ""
+            if _first_acc in acc_options:
+                _acc_default = acc_options.index(_first_acc)
+        acc_choice = st.selectbox(
+            "Accessory SKU", acc_options, index=_acc_default, key="flow_acc",
+        )
 
     acc_sku = None if acc_choice == "(none)" else acc_choice
 

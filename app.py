@@ -7237,8 +7237,9 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     if not actions:
         actions.append("✅ **No action needed** — maintain current staffing.")
 
+    # The controls these name (👥 Edit headcount, 🔧 Recommendations) are on
+    # the plan guide's step 4, right above the tabs — not repeated here.
     st.markdown("\n".join(f"{i}. {a}" for i, a in enumerate(actions, 1)))
-    _render_action_jumps(over_stations, no_station_list, near_cap)
 
     # =============================================================
     # Visuals — one on screen at a time
@@ -11762,28 +11763,41 @@ def _render_tab_strip() -> str:
 # =============================================================
 # Five steps in the order a planner works: what's loaded → which month →
 # are the SKUs in the catalogs → does it fit → save it for the team. Each
-# step is ONE line with the fact that matters and only the buttons that act
-# on it; a step with nothing to do is a plain green line. The facts are
-# built by functions that return data (testable without a browser) and
-# drawn by one renderer, so the page shows one thing instead of the stack of
-# independent banners this replaced. Every button here lives in main(),
-# after the sidebar was built, so it may rerun at once (the sidebar's own
-# handlers must not — see _defer_rerun).
+# step is ONE plain line — an icon, the step, the headline fact — with only
+# the buttons that act on it. The rest of the story sits on request: the ⓘ
+# tooltip carries the secondary facts and a small "Why …?" popover the long
+# explanations. Steps with nothing to do fold into one ✅ line, and step 4
+# gives the verdict only: the counts behind it are the Overview's status
+# line and KPIs. The facts are built by functions that return data
+# (testable without a browser) and drawn by one renderer, so the page shows
+# one thing instead of the stack of independent banners this replaced.
+# Every button here lives in main(), after the sidebar was built, so it may
+# rerun at once (the sidebar's own handlers must not — see _defer_rerun).
 _GUIDE_ICON = {"ok": "✅", "info": "ℹ️", "todo": "👉", "warn": "⚠️", "error": "❌"}
+_GUIDE_COLOR = {"info": "blue", "todo": "blue", "warn": "orange", "error": "red"}
 
 
 def _guide_step(n: int, title: str, status: str, fact: str, actions=None,
                 details=None, details_title: "str | None" = None, *,
-                inline_save: bool = False) -> dict:
+                help: "str | None" = None, inline_save: bool = False) -> dict:
     """One row of the guide. ``status`` is ok / info / todo / warn / error;
-    ``actions`` are :func:`_guide_action` dicts (at most three are drawn);
-    ``details`` are markdown lines for a collapsed expander under the row."""
+    ``fact`` is the headline, ``help`` the ⓘ tooltip behind it; ``actions``
+    are :func:`_guide_action` dicts (at most three are drawn); ``details``
+    are markdown lines for a popover titled ``details_title`` on the row."""
     return {
-        "n": n, "title": title, "status": status, "fact": fact,
+        "n": n, "title": title, "status": status, "fact": fact, "help": help,
         "actions": [a for a in (actions or []) if a],
         "details": list(details or []), "details_title": details_title,
         "details_df": None, "inline_save": inline_save,
     }
+
+
+def _guide_headline(note: str) -> str:
+    """The bold lead of a multi-sentence note (``📅 **No units …** in …``),
+    for a guide line whose tooltip carries the whole note."""
+    start = note.find("**")
+    end = note.find("**", start + 2) if start >= 0 else -1
+    return note[:end + 2] if end > 0 else note
 
 
 def _guide_action(label: str, *, key: str, run, type: str = "secondary",
@@ -11803,8 +11817,8 @@ def _guide_schedule_step(inputs: dict, schedule_df_full, schedule_load_error) ->
         if empty:
             return _guide_step(
                 1, "Schedule", "todo",
-                "Type or paste SKUs in the sidebar (**✏️ Paste or type SKUs**) — "
-                "the analysis fills in as you go.",
+                "Type or paste SKUs in the sidebar (**✏️ Paste or type SKUs**)",
+                help="The analysis fills in as you go.",
             )
         n_rows = int(len(schedule_df_full))
         n_units = (
@@ -11849,9 +11863,12 @@ def _guide_schedule_step(inputs: dict, schedule_df_full, schedule_load_error) ->
         has_prev = isinstance(st.session_state.get("_schedule_before_error"), dict)
         return _guide_step(
             1, "Schedule", "error",
-            f"**Couldn't read the upload** — {schedule_load_error} Remove the file "
-            "from the uploader to go back to what was loaded before, or:",
-            [
+            f"**Couldn't read the upload** — {schedule_load_error}",
+            help=(
+                "Remove the file from the uploader to go back to what was loaded "
+                "before, or use one of the buttons."
+            ),
+            actions=[
                 _guide_action(
                     "⏮ Back to the previous schedule", key="recover_prev_btn",
                     run=_run_prev,
@@ -11864,23 +11881,29 @@ def _guide_schedule_step(inputs: dict, schedule_df_full, schedule_load_error) ->
     if empty:
         return _guide_step(
             1, "Schedule", "warn",
-            f"**No rows for {location} in this file.** Upload a file with "
-            f"{location} rows — or, if the file tags them for another plant, tick "
-            "**Count rows tagged for another plant** in the sidebar — or:",
-            [newest_action, sample_action],
+            f"**No rows for {location} in this file**",
+            help=(
+                f"Upload a file with {location} rows — or, if the file tags them for "
+                "another plant, tick **Count rows tagged for another plant** in the "
+                "sidebar — or use one of the buttons."
+            ),
+            actions=[newest_action, sample_action],
         )
 
     summary = st.session_state.get("_last_upload_summary") or {}
     name = summary.get("name")
     source = summary.get("source")
+    help_ = None
     if source == "saved" and name and summary.get("auto_loaded"):
-        who = f"**{name}** — the newest schedule saved for {location}, loaded automatically"
+        who = f"**{name}**"
+        help_ = f"The newest schedule saved for {location}, loaded automatically."
     elif source == "saved" and name:
         who = f"**{name}** (saved schedule)"
     elif source == "upload":
         who = f"**{name or 'Your upload'}** (in this browser only)"
     elif source == "bundled":
-        who = f"**Bundled May 2026 sample** — no saved schedules for {location} yet"
+        who = "**Bundled May 2026 sample**"
+        help_ = f"No saved schedules for {location} yet."
     else:
         who = "**Schedule**"
     rows = summary.get("rows", int(len(schedule_df_full)))
@@ -11895,11 +11918,12 @@ def _guide_schedule_step(inputs: dict, schedule_df_full, schedule_load_error) ->
     n_dropped = int(sum((rec.get("unmatched") or {}).values())) + int(rec.get("no_model") or 0)
     if n_dropped:
         status = "warn"
-        fact += f" · **{n_dropped} unit(s) in the file are not counted**"
+        fact += f" · **{n_dropped} unit(s) not counted**"
     edits = _schedule_edit_count()
     actions = []
     if edits > 0:
-        fact += f" · ✏️ {edits} change(s) since load, not saved"
+        # "not saved" is step 5's line, with the box to save them.
+        fact += f" · ✏️ {edits} change(s) since load"
         undo = st.session_state.get("_schedule_undo")
         if isinstance(undo, dict):
             undo_label = undo.get("label") or "the last change"
@@ -11916,10 +11940,10 @@ def _guide_schedule_step(inputs: dict, schedule_df_full, schedule_load_error) ->
             ))
     details = _schedule_detail_lines(summary, location)
     title = (
-        f"Why {rows} of {src_rows} rows? How this file was read"
+        f"Why {rows} of {src_rows} rows?"
         if isinstance(src_rows, int) and src_rows != rows else "How this file was read"
     )
-    return _guide_step(1, "Schedule", status, fact, actions, details, title)
+    return _guide_step(1, "Schedule", status, fact, actions, details, title, help=help_)
 
 
 def _guide_month_step(inputs: dict, schedule_df_full, machine_df, acc_df,
@@ -11943,40 +11967,42 @@ def _guide_month_step(inputs: dict, schedule_df_full, machine_df, acc_df,
     )
     sched_lbl = _month_label(sched_ym) if offer_switch else ""
 
+    # The line names the month and what is off about it; how the rows got
+    # there and what the totals still count sit in the ⓘ tooltip.
     parts = [f"Planning **{plan_lbl}**"]
+    notes = []
     status = "ok"
     if offer_switch:
         parts.append(f"the file is dated **{sched_lbl}**")
         status = "warn"
     if n_move:
         status = "warn"
-        or_switch = (
-            f", or plan **{sched_lbl}** instead if that is the month this file is for"
-            if offer_switch else
-            ", or switch the **Plan month** in the sidebar to match the data"
-        )
-        parts.append(
-            f"**{n_move} row(s) aren't on the {plan_lbl} calendar** — they're dated "
-            "in another month or carried over from an earlier month, so the Calendar "
-            "and the weekly view leave them out (the totals still count them). Move "
-            f"them in{or_switch}"
+        parts.append(f"**{n_move} row(s) aren't on the calendar**")
+        notes.append(
+            f"{n_move} row(s) are dated in another month or carried over from an "
+            f"earlier month, so the {plan_lbl} Calendar and the weekly view leave "
+            "them out (the totals still count them). Move them in"
+            + (f", or plan {sched_lbl} instead if that is the month this file is for."
+               if offer_switch else
+               ", or switch the **Plan month** in the sidebar to match the data.")
         )
     elif carry_total:
-        parts.append(f"{carry_total} carryover row(s) are scheduled in {plan_lbl}")
+        notes.append(f"{carry_total} carryover row(s) are scheduled in {plan_lbl}.")
     auto = (
         schedule_df_full.attrs.get("auto_spread")
         if hasattr(schedule_df_full, "attrs") else None
     )
     if isinstance(auto, dict) and auto.get("count"):
-        parts.append(
+        notes.append(
             f"{auto['count']} of {auto['total_rows']} rows had no PRODUCTION DAY and "
-            f"were auto-leveled across {auto.get('target_month_label', plan_lbl)}"
+            f"were auto-leveled across {auto.get('target_month_label', plan_lbl)}."
         )
     if window_note:
-        parts.append(window_note)
+        parts.append(_guide_headline(window_note))
+        notes.append(window_note)
         if status == "ok":
             status = "warn"
-    fact = " · ".join(parts) + "."
+    fact = " · ".join(parts)
 
     def _run_switch():
         st.session_state[PLAN_MONTH_SEED_KEY] = (int(sched_ym[0]), int(sched_ym[1]))
@@ -12024,7 +12050,7 @@ def _guide_month_step(inputs: dict, schedule_df_full, machine_df, acc_df,
                 "month, so they stay flagged and are built first. ↩️ Undo is in step 1."
             ),
         ))
-    return _guide_step(2, "Month", status, fact, actions)
+    return _guide_step(2, "Month", status, fact, actions, help="\n\n".join(notes) or None)
 
 
 def _import_missing_skus_now(fg: list, acc: list, token: str) -> None:
@@ -12100,42 +12126,53 @@ def _guide_catalog_step(schedule_df_full, machine_df, acc_df, inputs: dict) -> d
         help="📁 Data & Setup → 🔌 Accessory catalog, where labor times are edited.",
     )
 
+    # An estimation placeholder is a caveat, not a to-do: the step stays ok.
+    est_note = (
+        f"{est} unit(s) run on an estimation placeholder (their labor is an estimate)"
+        if est else None
+    )
     if not _skipped_fg and not _unknown_acc:
-        fact = "Every SKU in this plan is in the catalogs"
-        actions = []
-        status = "ok"
-        if est:
-            fact += f" · {est} unit(s) run on an estimation placeholder (their labor is an estimate)"
-            status = "info"
         if imported:
-            fact += (
-                f" · **{len(imported)} placeholder(s) imported this session still have "
-                "zero labor** — set their labor times"
+            return _guide_step(
+                3, "Catalog", "info",
+                f"**{len(imported)} placeholder(s) imported this session still have "
+                "zero labor**",
+                [_guide_action(
+                    "✏️ Set their labor times", key="guide_set_labor_btn",
+                    run=lambda: _jump_to(TAB_DATA_SETUP, "🏭 Machine catalog"),
+                )],
+                help="Every SKU in this plan is in the catalogs."
+                     + (f" {est_note}." if est_note else ""),
             )
-            status = "info"
-            actions.append(_guide_action(
-                "✏️ Set their labor times", key="guide_set_labor_btn",
-                run=lambda: _jump_to(TAB_DATA_SETUP, "🏭 Machine catalog"),
-            ))
-        return _guide_step(3, "Catalog", status, fact + ".", actions)
+        fact = "Every SKU in this plan is in the catalogs"
+        return _guide_step(3, "Catalog", "ok", fact + (f" · {est_note}" if est_note else ""))
 
-    def _preview(skus):
-        return ", ".join(f"`{s}`" for s in skus[:5]) + (
-            f" (+{len(skus) - 5} more)" if len(skus) > 5 else ""
-        )
-
-    bits = []
+    # The line counts them; which SKUs, and what each gap costs, is on request.
+    kinds = []
+    why = []
+    details = []
     if _skipped_fg:
-        bits.append(
+        kinds.append(f"**{len(_skipped_fg)} FG**")
+        why.append(
             f"**{len(_skipped_fg)} FG SKU(s)** aren't in the machine catalog, so their "
-            f"rows are **dropped**: {_preview(_skipped_fg)}"
+            "rows are **dropped**."
+        )
+        details.append(
+            "**Not in the machine catalog** (rows dropped): "
+            + ", ".join(f"`{s}`" for s in _skipped_fg)
         )
     if _unknown_acc:
-        bits.append(
+        kinds.append(f"**{len(_unknown_acc)} accessory**")
+        why.append(
             f"**{len(_unknown_acc)} accessory SKU(s)** aren't in the accessory catalog, "
-            f"so those units build with **zero accessory labor**: {_preview(_unknown_acc)}"
+            "so those units build with **zero accessory labor**."
         )
-    fact = "; ".join(bits) + ". Import them as zero-labor placeholders, then set their labor times."
+        details.append(
+            "**Not in the accessory catalog** (zero accessory labor): "
+            + ", ".join(f"`{s}`" for s in _unknown_acc)
+        )
+    fact = " and ".join(kinds) + " SKU(s) aren't in the catalogs"
+    why.append("Import them as zero-labor placeholders, then set their labor times.")
     token = _github_token()
     n_missing = len(_skipped_fg) + len(_unknown_acc)
     actions = [
@@ -12152,11 +12189,10 @@ def _guide_catalog_step(schedule_df_full, machine_df, acc_df, inputs: dict) -> d
         ),
         open_machine if _skipped_fg else open_acc,
     ]
-    details = []
     if not token:
         details.append("🔒 Importing needs the GitHub token (`github_token` in Streamlit Secrets).")
-    step = _guide_step(3, "Catalog", "warn", fact, actions, details,
-                       "The missing SKUs, and the routing the imported ones would get")
+    step = _guide_step(3, "Catalog", "warn", fact, actions, details, "Which SKUs?",
+                       help=" ".join(why))
     if _skipped_fg:
         # The routing each missing FG SKU would be seeded with, so the planner
         # sees it before clicking import (accessories have no routing).
@@ -12182,8 +12218,11 @@ def _request_proposal() -> None:
 
 
 def _guide_capacity_step(capacity, inputs: dict, weekly_util, units) -> dict:
-    """Step 4 — the verdict: stations over / unstaffed / near capacity, people
-    needed vs. on hand, the busiest week — and the controls that fix it."""
+    """Step 4 — the verdict and the controls that fix it. The line says only
+    whether the plan fits: the Overview's status line and KPIs carry the
+    stations over / unstaffed / near capacity and the people needed vs. on
+    hand, so those (and the busiest week) ride in the ⓘ tooltip here, for a
+    planner on another tab."""
     location = inputs.get("location", "this facility")
     if units is None or units.empty or capacity is None or capacity.empty:
         return _guide_step(4, "Capacity", "info", "Load a schedule to see whether it fits.")
@@ -12194,40 +12233,36 @@ def _guide_capacity_step(capacity, inputs: dict, weekly_util, units) -> dict:
     prod_hc, _supp_hc, _total_hc = _split_crew_hc(inputs["crew_config"])
     need = int(capacity["required_hc"].sum())
     gap = need - prod_hc
-    people = f"need **{need}** people, have **{prod_hc}**" + (f" (short {gap})" if gap > 0 else "")
-
-    def _names(lst):
-        return ", ".join(lst[:3]) + (f" +{len(lst) - 3} more" if len(lst) > 3 else "")
-
-    if over or missing:
-        status = "error"
-        bits = []
-        if over:
-            bits.append(f"**{len(over)} station(s) over capacity** ({_names(over)})")
-        if missing:
-            bits.append(f"**{len(missing)} not staffed here** ({_names(missing)})")
-        fact = " · ".join(bits) + f" · {people}"
-    elif near:
-        status = "warn"
-        fact = f"**{len(near)} station(s) near capacity** ({_names(near)}) · {people}"
-    else:
-        status = "ok"
-        fact = f"Every station is within capacity · {people}"
+    why = []
+    if over:
+        why.append(f"**{len(over)} station(s) over capacity** ({', '.join(over)})")
+    if missing:
+        why.append(f"**{len(missing)} not staffed here** ({', '.join(missing)})")
+    if near and not (over or missing):
+        why.append(f"**{len(near)} station(s) near capacity** ({', '.join(near)})")
+    why.append(f"need **{need}** people, have **{prod_hc}**" + (f" (short {gap})" if gap > 0 else ""))
     if isinstance(weekly_util, pd.DataFrame) and not weekly_util.empty and weekly_util.shape[1] > 1:
         try:
             peak = float(weekly_util.max().max())
             week = str(weekly_util.max().idxmax())
             if peak > 1.0:
-                fact += f" · busiest week **{week}** at {peak:.0%}"
+                why.append(f"busiest week **{week}** at {peak:.0%}")
         except Exception:
             pass
+
+    if over or missing:
+        status, fact = "error", "**Doesn't fit yet**"
+    elif near:
+        status, fact = "warn", "**Fits, but tight**"
+    else:
+        status, fact = "ok", "Every station is within capacity"
     draft = st.session_state.get(f"_crew_draft_{location}")
     has_draft = isinstance(draft, pd.DataFrame)
     if has_draft:
         fact += " · 👥 crew edited, not saved"
 
     actions = []
-    if over or missing or has_draft:
+    if over or missing or near or has_draft:
         actions.append(_guide_action(
             "👥 Save crew (sidebar)" if has_draft else "👥 Edit headcount",
             key="guide_edit_crew_btn", run=lambda: _jump_to(None, open_crew=True),
@@ -12251,7 +12286,8 @@ def _guide_capacity_step(capacity, inputs: dict, weekly_util, units) -> dict:
                 "values are overridden in the proposal."
             ),
         ))
-    return _guide_step(4, "Capacity", status, fact + ".", actions)
+    return _guide_step(4, "Capacity", status, fact, actions,
+                       help=" · ".join(why) + ". The 🏠 Overview breaks it down.")
 
 
 def _guide_save_step(inputs: dict) -> "dict | None":
@@ -12270,28 +12306,73 @@ def _guide_save_step(inputs: dict) -> "dict | None":
     elif source == "upload":
         what = "This upload lives in this browser only"
     elif edits:
-        what = f"{edits} change(s) since this schedule was loaded aren't saved"
+        what = f"{edits} change(s) since load aren't saved"
     else:
         return None
-    return _guide_step(5, "Save", "todo", f"{what} — name it and save it for the team:",
-                       inline_save=True)
+    return _guide_step(5, "Save", "todo", what, inline_save=True,
+                       help="Name it and save it for the team (the sidebar's 📂 panel "
+                            "does the same).")
+
+
+def _guide_head(step: dict) -> str:
+    """``⚠️ **2. Month** — fact``, the step colored when it needs attention."""
+    status = step.get("status", "ok")
+    title = f"**{step['n']}. {step['title']}**"
+    if status in _GUIDE_COLOR:
+        title = f":{_GUIDE_COLOR[status]}[{title}]"
+    return f"{_GUIDE_ICON.get(status, '')} {title} — {step['fact']}"
+
+
+def _guide_has_details(step: dict) -> bool:
+    return bool(step.get("details")) or step.get("details_df") is not None
+
+
+def _render_guide_row(head: str, help: "str | None", actions: list, detailed: list) -> None:
+    """One guide line: the headline with its ⓘ tooltip, a "Why …?" popover
+    for each step in ``detailed``, then the buttons. A flex row, so each
+    control is as wide as its label and the headline takes the rest."""
+    row = st.container(horizontal=True, vertical_alignment="center")
+    row.markdown(head, help=help, width="stretch")
+    for step in detailed:
+        with row.popover(step.get("details_title") or "Details", type="tertiary",
+                         key=f"guide_details_{step['n']}"):
+            for line in step.get("details") or []:
+                st.markdown(line)
+            if step.get("details_df") is not None:
+                st.dataframe(step["details_df"], width="stretch", hide_index=True)
+    for act in actions:
+        kwargs = {"type": act.get("type") or "secondary", "disabled": bool(act.get("disabled"))}
+        if act.get("help"):
+            kwargs["help"] = act["help"]
+        if row.button(act["label"], key=act["key"], **kwargs):
+            act["run"]()
+
+
+def _render_guide_done(done: list) -> None:
+    """The steps with nothing to do, as one ✅ line. A lone one keeps its
+    fact on the line; several are named, their facts in the tooltip."""
+    detailed = [s for s in done if _guide_has_details(s)]
+    if len(done) == 1:
+        _render_guide_row(_guide_head(done[0]), done[0].get("help"), [], detailed)
+        return
+    head = "✅ " + " · ".join(f"**{s['n']}. {s['title']}**" for s in done) + " — all set"
+    help = "\n\n".join(
+        f"**{s['n']}. {s['title']}** — {s['fact']}" + (f". {s['help']}" if s.get("help") else "")
+        for s in done
+    )
+    _render_guide_row(head, help, [], detailed)
 
 
 def _render_guide_step(step: dict, inputs: dict, uploaded) -> None:
-    """Draw one guide row: the fact (a colored box when it needs attention, a
-    plain line otherwise), up to three buttons, an optional details expander."""
-    status = step.get("status", "ok")
-    head = f"**{step['n']}. {step['title']}** — {step['fact']}"
-    actions = list(step.get("actions") or [])[:3]
+    """Draw one guide row: a plain line — the icon and a colored step name
+    say how urgent it is — with up to three buttons and an optional popover."""
     location = inputs.get("location", "Henderson")
-
     if step.get("inline_save"):
         c_fact, c_name, c_btn = st.columns([4, 3, 2], vertical_alignment="center")
-        with c_fact:
-            st.info(head)
+        c_fact.markdown(_guide_head(step), help=step.get("help"))
         name = c_name.text_input(
             "Schedule name", key=f"_guide_save_name_{location}",
-            placeholder="e.g. October plan", label_visibility="collapsed",
+            placeholder="Name it, e.g. October plan", label_visibility="collapsed",
         )
         if c_btn.button("💾 Save plan", key="guide_save_plan_btn", width="stretch",
                         type="primary"):
@@ -12300,37 +12381,10 @@ def _render_guide_step(step: dict, inputs: dict, uploaded) -> None:
             names = sorted(by_loc.keys()) if isinstance(by_loc, dict) else []
             _uploaded_schedule_save(location, name, uploaded, names, rerun=st.rerun)
         return
-
-    if actions:
-        # The fact gives way as buttons are added, so three labels still fit
-        # on one line at a laptop width instead of wrapping mid-word.
-        fact_width = {1: 6, 2: 5, 3: 3.6}[len(actions)]
-        cols = st.columns([fact_width] + [2] * len(actions), vertical_alignment="center")
-        c_fact = cols[0]
-    else:
-        cols = []
-        c_fact = st.container()
-    with c_fact:
-        if status == "warn":
-            st.warning(head)
-        elif status == "error":
-            st.error(head)
-        elif status == "todo":
-            st.info(head)
-        else:
-            st.markdown(f"{_GUIDE_ICON.get(status, '')} {head}")
-    for col, act in zip(cols[1:], actions):
-        kwargs = {"type": act.get("type") or "secondary", "disabled": bool(act.get("disabled"))}
-        if act.get("help"):
-            kwargs["help"] = act["help"]
-        if col.button(act["label"], key=act["key"], width="stretch", **kwargs):
-            act["run"]()
-    if step.get("details") or step.get("details_df") is not None:
-        with st.expander(step.get("details_title") or "Details", expanded=False):
-            for line in step.get("details") or []:
-                st.markdown(line)
-            if step.get("details_df") is not None:
-                st.dataframe(step["details_df"], width="stretch", hide_index=True)
+    _render_guide_row(
+        _guide_head(step), step.get("help"), list(step.get("actions") or [])[:3],
+        [step] if _guide_has_details(step) else [],
+    )
 
 
 def _render_plan_guide(*, inputs: dict, schedule_df_full, units, capacity, weekly_util,
@@ -12339,7 +12393,7 @@ def _render_plan_guide(*, inputs: dict, schedule_df_full, units, capacity, weekl
     """The panel at the top of the page. Drawn by main() once every frame the
     tabs use is known, into the slot reserved above the Sequencer's proposal
     panel; replays the one-shot toasts the reshape / import handlers left."""
-    with st.container(border=True):
+    with st.container(border=True, gap="xsmall"):
         st.markdown("##### 🧭 Plan guide")
         for key in ("_schedule_toast", "_import_toast"):
             toast = st.session_state.pop(key, None)
@@ -12363,22 +12417,14 @@ def _render_plan_guide(*, inputs: dict, schedule_df_full, units, capacity, weekl
             and steps[2]["status"] == "ok"
         ):
             st.info(empty_banner_msg)
+        # Steps with nothing to do fold into one ✅ line, where the first sits.
+        done = [s for s in steps
+                if s["status"] == "ok" and not s["actions"] and not s["inline_save"]]
         for step in steps:
-            _render_guide_step(step, inputs, uploaded)
-
-
-def _render_action_jumps(over, missing, near) -> None:
-    """Under the Overview's recommended actions: the controls they name."""
-    if not (over or missing or near):
-        return
-    c1, c2, _ = st.columns([2, 2, 4])
-    if c1.button(
-        "👥 Edit headcount", key="overview_edit_crew_btn", width="stretch",
-        help="Opens 👥 Station headcount in the sidebar.",
-    ):
-        _jump_to(None, open_crew=True)
-    if c2.button("🔧 Recommendations", key="overview_recommendations_btn", width="stretch"):
-        _jump_to(TAB_RECOMMENDATIONS)
+            if not any(step is d for d in done):
+                _render_guide_step(step, inputs, uploaded)
+            elif step is done[0]:
+                _render_guide_done(done)
 
 
 def main():

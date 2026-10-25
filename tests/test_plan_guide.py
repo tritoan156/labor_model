@@ -97,9 +97,9 @@ class TestScheduleStep:
         }
         step = app._guide_schedule_step(inputs, df, None)
         assert step["status"] == "warn"
-        assert "**Hen Aug**" in step["fact"] and "loaded automatically" in step["fact"]
+        assert "**Hen Aug**" in step["fact"] and "loaded automatically" in step["help"]
         assert "277 of 288 rows counted" in step["fact"]
-        assert "**162 unit(s) in the file are not counted**" in step["fact"]
+        assert "**162 unit(s) not counted**" in step["fact"]
         assert step["details_title"].startswith("Why 277 of 288 rows?")
         assert any("11 row(s) had no BUILD QTY" in line for line in step["details"])
         assert any("162" not in line and "160 unit(s) are not counted" in line for line in step["details"])
@@ -145,8 +145,10 @@ class TestMonthStep:
         step = app._guide_month_step(inputs, df, *catalogs)
         assert step["status"] == "warn"
         assert "the file is dated **August 2026**" in step["fact"]
-        assert "3 row(s) aren't on the October 2026 calendar" in step["fact"]
-        assert "plan **August 2026** instead" in step["fact"]
+        assert "**3 row(s) aren't on the calendar**" in step["fact"]
+        # why they're off it, and the way out, are behind the ⓘ
+        assert "leave them out (the totals still count them)" in step["help"]
+        assert "plan August 2026 instead" in step["help"]
         labels = _labels(step)
         assert labels == ["📆 Plan August 2026 instead", "📅 Move 3 row(s) into October 2026"]
         assert [a["key"] for a in step["actions"]] == ["plan_schedule_month_btn", "move_into_plan_month_btn"]
@@ -155,8 +157,9 @@ class TestMonthStep:
         df = _sched("Oct-26", "2026-10-06")
         df.attrs["auto_spread"] = {"count": 3, "total_rows": 3, "target_month_label": "October 2026", "working_days": 22}
         step = app._guide_month_step(inputs, df, *catalogs, window_note="📅 **No units scheduled for week 4** in the plan.")
-        assert "3 of 3 rows had no PRODUCTION DAY" in step["fact"]
-        assert "No units scheduled for week 4" in step["fact"]
+        assert "3 of 3 rows had no PRODUCTION DAY" in step["help"]
+        assert step["fact"].endswith("📅 **No units scheduled for week 4**")
+        assert "in the plan." in step["help"], "the whole note is in the tooltip"
         assert step["status"] == "warn"
 
     def test_the_switch_button_seeds_the_picker(self, inputs, catalogs):
@@ -184,8 +187,10 @@ class TestCatalogStep:
         monkeypatch.setattr(app, "_github_token", lambda: "tok")
         step = app._guide_catalog_step(df, *catalogs, inputs)
         assert step["status"] == "warn"
-        assert "**1 FG SKU(s)** aren't in the machine catalog" in step["fact"]
-        assert "**1 accessory SKU(s)** aren't in the accessory catalog" in step["fact"]
+        assert step["fact"] == "**1 FG** and **1 accessory** SKU(s) aren't in the catalogs"
+        assert "**1 FG SKU(s)** aren't in the machine catalog" in step["help"]
+        assert "**1 accessory SKU(s)** aren't in the accessory catalog" in step["help"]
+        assert any("`NOPE-001`" in line for line in step["details"]), "the SKUs are in the popover"
         assert _labels(step) == ["➕ Import 2 missing SKU(s) into the catalogs", "🏭 Open Machine catalog"]
         assert step["actions"][0]["disabled"] is False
         assert step["details_df"] is not None, "the routing preview rides in the details"
@@ -234,10 +239,13 @@ class TestCapacityStep:
         weekly = pd.DataFrame({"Wk 1": [0.9, 1.3], "Wk 2": [0.8, 0.7]}, index=["PDI", "ETO"])
         step = app._guide_capacity_step(cap, inputs, weekly, units)
         assert step["status"] == "error"
-        assert "**2 station(s) over capacity** (PDI, ETO)" in step["fact"]
-        assert "**1 not staffed here** (Accessories KIT)" in step["fact"]
-        assert "need **10** people" in step["fact"]
-        assert "busiest week **Wk 1** at 130%" in step["fact"]
+        # The line is the verdict; the counts the Overview's status line and
+        # KPIs show sit in the tooltip, for a planner on another tab.
+        assert step["fact"] == "**Doesn't fit yet**"
+        assert "**2 station(s) over capacity** (PDI, ETO)" in step["help"]
+        assert "**1 not staffed here** (Accessories KIT)" in step["help"]
+        assert "need **10** people" in step["help"]
+        assert "busiest week **Wk 1** at 130%" in step["help"]
         assert _labels(step) == ["👥 Edit headcount", "🔧 Recommendations", "💡 Level-load the month"]
 
     def test_all_clear_offers_only_level_loading(self, inputs):
@@ -274,6 +282,37 @@ class TestSaveStep:
         assert "lives in this browser only" in app._guide_save_step(inputs)["fact"]
         inputs["schedule_mode"] = app.SCHEDULE_MODE_MANUAL
         assert app._guide_save_step(inputs) is None
+
+
+# ---------------------------------------------------------------------------
+# Steps with nothing to do fold into one ✅ line
+# ---------------------------------------------------------------------------
+def _draw_done(*facts):
+    """Run _render_guide_done on ok steps with these facts, in a bare app."""
+    AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
+
+    def script(facts):
+        import app
+        app._render_guide_done([
+            app._guide_step(n, title, "ok", fact)
+            for (n, title), fact in zip(((1, "Schedule"), (3, "Catalog")), facts)
+        ])
+
+    at = AppTest.from_function(script, args=(facts,)).run()
+    assert not at.exception
+    return list(at.markdown)
+
+
+def test_several_done_steps_are_one_line_with_their_facts_in_the_tooltip():
+    (line,) = _draw_done("**Hen Aug** · 3 rows", "Every SKU in this plan is in the catalogs")
+    assert line.value == "✅ **1. Schedule** · **3. Catalog** — all set"
+    assert "**1. Schedule** — **Hen Aug** · 3 rows" in line.proto.help
+    assert "**3. Catalog** — Every SKU in this plan is in the catalogs" in line.proto.help
+
+
+def test_a_lone_done_step_keeps_its_fact_on_the_line():
+    (line,) = _draw_done("**Hen Aug** · 3 rows")
+    assert line.value == "✅ **1. Schedule** — **Hen Aug** · 3 rows"
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +381,20 @@ def test_the_guide_renders_once_with_its_steps(at):
     # the sidebar keeps one pill line and no warnings
     assert any(str(s.value).startswith("Loaded **") for s in at.sidebar.success)
     assert list(at.sidebar.warning) == []
+
+
+def test_the_guide_is_plain_lines_and_the_overview_does_not_repeat_step_4(at):
+    # Calm: every step is a plain line, none a colored alert box.
+    boxes = [str(x.value) for x in list(at.main.warning) + list(at.main.error) + list(at.main.info)]
+    assert not any(f"**{n}. " in b for b in boxes for n in range(1, 6)), boxes
+    step4 = [str(m.value) for m in at.main.markdown if "**4. Capacity**" in str(m.value)]
+    assert len(step4) == 1, step4
+    # The verdict only: the counts are the Overview's status line and KPIs.
+    for said_by_the_overview in ("over capacity", "people", "not staffed"):
+        assert said_by_the_overview not in step4[0], step4[0]
+    # Its buttons are not drawn a second time under the Overview's actions.
+    for label in ("👥 Edit headcount", "🔧 Recommendations"):
+        assert sum((b.label or "").startswith(label) for b in at.main.button) <= 1, label
 
 
 def test_jump_to_the_recommendations_tab(at):

@@ -206,3 +206,5 @@ PDS400S XXX,PDS400S ESTIMATION ASSEMBLY,5.0,0.0,0.0,335.0,15.0,30.0,30.0,0.0,0.0
 10250,,,,,,,,,,,2026-09-03,,,,,,,,,,,,,,,
 10269,,,,,,,,,,,2026-09-03,,,,,,,,,,,,,,,
 PDSF375DPC XXX,PDSF375DPC ESTIMATION ASSEMBLY,5.0,0.0,0.0,355.0,15.0,30.0,30.0,0.0,0.0,2026-09-03,,,,,,,,,,,,,,,
+6000000003,,,,,,,,,,,2026-10-28,Final,Final,Final,GenAcc,AccKIT,GenAcc,PDI,PDI,GenAcc,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
+BOSS220-002,,,,,,,,,,,2026-10-28,Final,Final,Final,GenAcc,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage

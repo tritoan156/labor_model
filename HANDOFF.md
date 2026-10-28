@@ -88,7 +88,11 @@ against per-station headcount + throughput capacity.
 - **The plan guide:** `_render_plan_guide` in `app.py` is the one panel above
   the tab strip (schedule → month → catalog → capacity → save). Each step is
   built by a `_guide_*_step` function that returns data (fact, status,
-  action descriptors) and drawn by `_render_guide_step`; `main()` renders it
+  action descriptors, an ⓘ `help` and popover `details`) and drawn by
+  `_render_guide_step` as one plain line; ok steps without buttons fold into
+  one ✅ line (`_render_guide_done`). Step 4 states the verdict only — its
+  counts are the Overview's status line and KPIs, and the Overview doesn't
+  repeat step 4's buttons. `main()` renders it
   into a slot reserved above the Sequencer's proposal panel once every frame
   the tabs use is known. Main-panel buttons may `st.rerun()` (the sidebar is
   already built); jumps to a tab / Data & Setup view / the crew expander go

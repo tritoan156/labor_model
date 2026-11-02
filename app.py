@@ -11,6 +11,7 @@ import calendar
 import csv
 import hashlib
 import io
+import math
 import re
 from datetime import date
 from pathlib import Path
@@ -305,7 +306,7 @@ def _fmt_min_hr(value, *, with_thousands: bool = True, hr_decimals: int = 1) -> 
     # Guard NaN / Inf: float() above accepts them, but int(round(nan)) raises
     # ValueError and int(round(inf)) raises OverflowError. Treat non-finite as 0
     # so a malformed upstream aggregate degrades gracefully instead of crashing
-    # the metric render. (math isn't imported in this module — use comparisons.)
+    # the metric render.
     if v != v or v in (float("inf"), float("-inf")):
         v = 0.0
     mins = int(round(v))
@@ -6351,6 +6352,21 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
     }
 
 
+def _headline_max_units(mu: dict, bl: dict, total_units: int) -> int:
+    """The Capacity tab's headline "Max units" figure: the sum of the parallel
+    lines' caps when the plan spans more than one line (and any line can
+    build), else the tighter of the labor / throughput caps for the mix.
+
+    ``mu`` is :func:`_max_units_at_current_mix`, ``bl`` is
+    ``buildable_by_line`` — the 🧪 What-if simulator quotes the same number."""
+    bl_total = int(bl.get("total", 0) or 0)
+    if len(bl.get("lines", [])) > 1 and bl_total > 0:
+        return bl_total
+    if float(mu.get("potential_util_safe", 0) or 0) > 0:
+        return int(mu.get("potential_max_units", 0) or 0)
+    return int(total_units)
+
+
 def _area_space_cap(sub: pd.DataFrame, total_units: int,
                     excluded_stations=None) -> dict | None:
     """Throughput (space) cap for a group of stations — independent of HC.
@@ -7457,13 +7473,11 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                     "what would be possible once those stations are staffed."
                 )
             cP, cL, cT = st.columns(3)
-            _pm = int(_mu.get("potential_max_units", 0) or 0)
             _pb = _mu.get("potential_bottleneck", "") or "—"
             _pu = float(_mu.get("potential_util_safe", 0) or 0)
             cP.metric(
                 "Max units (all lines)" if _multi_line else "Max units (tighter cap)",
-                f"{_bl_total:,}" if (_multi_line and _bl_total > 0)
-                else (f"{_pm:,}" if _pu > 0 else f"{total_units:,}"),
+                f"{_headline_max_units(_mu, _bl, total_units):,}",
                 help=(
                     "Sum of the parallel production lines' caps — each line "
                     "(Compressor/Generator/EBOSS/PM) scaled to its OWN bottleneck, "
@@ -7910,7 +7924,8 @@ def tab_battery_throughput(batt_sku, batt_type, capacity, inputs):
     )
 
 
-def tab_mitigation(capacity, batt_sku, units, inputs):
+def tab_mitigation(capacity, batt_sku, units, inputs, *, schedule_df_full=None,
+                   machine_df=None, acc_df=None):
     st.header("🔧 Recommendations")
     st.markdown(
         "**Where to find slack and how to close gaps.** "
@@ -8043,7 +8058,391 @@ def tab_mitigation(capacity, batt_sku, units, inputs):
     st.info(
         "**Tip for planners:** Combine a short-term move (rotation or overtime) "
         "with a structural decision (hiring or scheduling change) so you handle "
-        "this month *and* set up the next one for success."
+        "this month *and* set up the next one for success. Try the numbers in "
+        "**🧪 What-if** below before you commit to one."
+    )
+
+    st.markdown("---")
+    _render_whatif_simulator(
+        units, inputs, schedule_df_full=schedule_df_full,
+        machine_df=machine_df, acc_df=acc_df,
+    )
+
+
+# =============================================================
+# 🧪 What-if — headcount / cell / working-day scenarios
+# =============================================================
+# The scenario is a copy of the production rows of the crew (People,
+# Stations/Cells, Crew per unit) plus a working-day count, priced with the
+# same calculators the 📊 Capacity tab uses. It lives in session state per
+# facility until 📋 Apply copies it into the sidebar's crew draft — which is
+# still only saved for everyone by 💾 Save crew.
+_WHATIF_DISPLAY_COLS = {"HC": "People", "Conc": "Stations/Cells", "Crew": "Crew per unit"}
+_WHATIF_INTERNAL_COLS = {v: k for k, v in _WHATIF_DISPLAY_COLS.items()}
+
+
+def _whatif_keys(location: str) -> dict:
+    return {
+        "base": f"_whatif_crew_{location}",      # the editor's data (edits baked in)
+        "ver": f"_whatif_ver_{location}",        # bumped when a button rewrites it
+        "days": f"whatif_days_{location}",       # the working-days widget
+        "note": f"_whatif_note_{location}",      # what the last helper did
+        "applied": f"_whatif_applied_{location}",  # 📋 Apply's confirmation
+    }
+
+
+def _whatif_display(crew_config: pd.DataFrame) -> pd.DataFrame:
+    """The production rows of a crew, in the editor's column names."""
+    prod = crew_config.loc[~crew_config.index.isin(SUPPORT_ROLES), ["HC", "Conc", "Crew"]]
+    return prod.rename(columns=_WHATIF_DISPLAY_COLS).astype(int)
+
+
+def _whatif_crew(scenario: pd.DataFrame, crew_config: pd.DataFrame) -> pd.DataFrame:
+    """The full crew_config for a scenario: its production rows over the
+    current crew (support roles — Lead / Other — carried over unchanged).
+    Cleared cells fall back the way the sidebar editor's do (Crew ≥ 1)."""
+    out = crew_config.copy()
+    scn = scenario.rename(columns=_WHATIF_INTERNAL_COLS)
+    rows = [s for s in scn.index if s in out.index]
+    for col, fill, floor in (("HC", 0, 0), ("Conc", 0, 0), ("Crew", 1, 1)):
+        vals = pd.to_numeric(scn.loc[rows, col], errors="coerce").fillna(fill)
+        out.loc[rows, col] = vals.clip(lower=floor).astype(int)
+    return out.astype({c: int for c in ("HC", "Conc", "Crew")})
+
+
+def _whatif_capacity(units: pd.DataFrame, crew_config: pd.DataFrame,
+                     days: int, inputs: dict) -> pd.DataFrame:
+    """The capacity table for a crew + working-day count, every other setting
+    from the sidebar — through the same cache the Capacity tab uses."""
+    return _build_capacity_table_cached(
+        units, crew_config, inputs["shift"], int(days),
+        inputs["safety"], inputs["efficiency"],
+        inputs.get("new_hire_pct", 0.0),
+        inputs.get("new_hire_productivity", 1.0),
+        inputs.get("absenteeism", 0.0),
+        inputs.get("overtime", 0.0),
+    )
+
+
+def _whatif_outcome(units: pd.DataFrame, crew_config: pd.DataFrame, days: int,
+                    inputs: dict, weekly_ctx: "tuple | None" = None) -> dict:
+    """Everything the Current-vs-Scenario comparison shows for one crew +
+    working-day count. ``weekly_ctx`` is ``(schedule_df_full, machine_df,
+    acc_df)`` for the busiest week (labor, per-week working days — so the
+    working-day override doesn't move it); None skips it."""
+    cap = _whatif_capacity(units, crew_config, days, inputs)
+    excluded = inputs.get("excluded_stations") or []
+    total = int(len(units))
+    mu = _max_units_at_current_mix(cap, total, excluded_stations=excluded)
+    bl = buildable_by_line(units, cap, excluded_stations=excluded)
+    max_units = _headline_max_units(mu, bl, total)
+    people, support, _total_hc = _split_crew_hc(crew_config)
+    busiest = None
+    if weekly_ctx is not None and all(x is not None for x in weekly_ctx):
+        weekly = _weekly_utilization_for(*weekly_ctx, {**inputs, "crew_config": crew_config})
+        if isinstance(weekly, pd.DataFrame) and not weekly.empty:
+            peaks = weekly.max()
+            week = str(peaks.idxmax())
+            busiest = {"week": week, "util": float(peaks.max()),
+                       "station": str(weekly[week].idxmax())}
+    return {
+        "capacity": cap,
+        "days": int(days),
+        "people": int(people),
+        "support": int(support),
+        "need": int(cap["required_hc"].sum()),
+        "max_units": int(max_units),
+        "units_per_day": (max_units / days) if days else 0.0,
+        "labor_units": int(mu.get("labor_max_units", 0) or 0),
+        "labor_util": float(mu.get("labor_max_util_safe", 0) or 0),
+        "labor_bottleneck": mu.get("labor_bottleneck", "") or "—",
+        "thru_units": int(mu.get("thru_max_units", 0) or 0),
+        "thru_util": float(mu.get("thru_max_util_safe", 0) or 0),
+        "thru_bottleneck": mu.get("thru_bottleneck", "") or "—",
+        "lines": bl.get("lines", []),
+        "over": cap.index[cap["overall_status"] == "🔴 OVER"].tolist(),
+        "near": cap.index[cap["overall_status"] == "🟠 NEAR-CAP"].tolist(),
+        "busiest": busiest,
+    }
+
+
+def _whatif_staff_to_need(scenario: pd.DataFrame, capacity: pd.DataFrame) -> pd.DataFrame:
+    """People = Required HC at every station the capacity table prices."""
+    out = scenario.copy()
+    rows = [s for s in out.index if s in capacity.index]
+    out.loc[rows, "People"] = capacity.loc[rows, "required_hc"].astype(int)
+    return out
+
+
+def _whatif_cells_to_fit(scenario: pd.DataFrame, capacity: pd.DataFrame) -> pd.DataFrame:
+    """Cells = ⌈Cells × throughput used⌉ at every station over 100 %."""
+    out = scenario.copy()
+    for station in out.index:
+        if station not in capacity.index:
+            continue
+        util = float(capacity.loc[station, "thru_util_safe"] or 0)
+        cells = int(out.loc[station, "Stations/Cells"] or 0)
+        if util > 1.0 and cells > 0:
+            # Rounded first so 8 × 1.5000000001 asks for 12 cells, not 13.
+            out.loc[station, "Stations/Cells"] = int(math.ceil(round(cells * util, 6)))
+    return out
+
+
+def _whatif_understaffed(scenario: pd.DataFrame, capacity: pd.DataFrame) -> list[str]:
+    """Stations whose throughput assumes more people than the scenario has:
+    every cell running at once needs Cells × Crew per unit."""
+    out = []
+    for station, row in scenario.iterrows():
+        people = int(row["People"] or 0)
+        cells = int(row["Stations/Cells"] or 0)
+        crew = int(row["Crew per unit"] or 0)
+        busy = station in capacity.index and float(capacity.loc[station, "labor_demand"] or 0) > 0
+        if busy and people == 0:
+            out.append(f"**{station}** (no people)")
+        elif busy and 0 < people < cells * crew:
+            out.append(f"**{station}** ({people} people < {cells} cells × {crew})")
+    return out
+
+
+def _whatif_button(location: str, units: pd.DataFrame, inputs: dict, action: str) -> None:
+    """on_click for the helper buttons. Runs before the next script run, so it
+    may rewrite the days widget's state and the editor's data; the version
+    bump gives the editor a fresh key."""
+    keys = _whatif_keys(location)
+    current = _whatif_display(inputs["crew_config"])
+    scenario = st.session_state.get(keys["base"])
+    if not isinstance(scenario, pd.DataFrame):
+        scenario = current
+    if action == "reset":
+        scenario = current
+        st.session_state[keys["days"]] = int(inputs["days"])
+        note = "↩️ Scenario reset to the current crew and working days."
+    else:
+        days = int(st.session_state.get(keys["days"]) or inputs["days"])
+        cap = _whatif_capacity(units, _whatif_crew(scenario, inputs["crew_config"]), days, inputs)
+        if action == "staff":
+            scenario = _whatif_staff_to_need(scenario, cap)
+            note = f"👥 People set to Required HC at {days} working days."
+        else:
+            before = scenario
+            scenario = _whatif_cells_to_fit(scenario, cap)
+            grew = [s for s in scenario.index
+                    if int(scenario.loc[s, "Stations/Cells"]) != int(before.loc[s, "Stations/Cells"])]
+            note = (f"🏭 Cells added at {', '.join(grew)}." if grew
+                    else "🏭 No station is over 100 % throughput — no cells added.")
+    st.session_state[keys["base"]] = scenario.copy()
+    st.session_state[keys["ver"]] = int(st.session_state.get(keys["ver"], 0)) + 1
+    st.session_state[keys["note"]] = note
+    _track_and_flush("whatif_helper", facility=location, action=action)
+
+
+def _whatif_apply(location: str, crew_config: pd.DataFrame) -> None:
+    """on_click for 📋 Apply: the scenario becomes the sidebar's crew draft
+    (the sidebar seeds its editor from the draft on the next run) and the
+    👥 Station headcount expander opens. Nothing is saved."""
+    keys = _whatif_keys(location)
+    scenario = st.session_state.get(keys["base"])
+    if not isinstance(scenario, pd.DataFrame):
+        return
+    st.session_state[f"_crew_draft_{location}"] = (
+        _whatif_crew(scenario, crew_config).rename(columns=_WHATIF_DISPLAY_COLS)
+    )
+    st.session_state[CREW_EXPANDER_SEED_KEY] = True
+    st.session_state[keys["applied"]] = (
+        "📋 Copied into the sidebar's 👥 Station headcount — the whole app now "
+        "uses it. **💾 Save crew** there to keep it for everyone."
+    )
+    _track_and_flush("whatif_apply", facility=location)
+
+
+def _render_whatif_simulator(units: pd.DataFrame, inputs: dict, *,
+                             schedule_df_full=None, machine_df=None,
+                             acc_df=None) -> None:
+    """🧪 What-if: edit People / Cells / working days and compare the plan's
+    caps against the current crew, side by side."""
+    location = inputs.get("location", "Henderson")
+    keys = _whatif_keys(location)
+    crew_config = inputs["crew_config"]
+    current = _whatif_display(crew_config)
+
+    st.markdown("#### 🧪 What-if: people, cells and working days")
+    st.caption(
+        "Try a staffing or cell change before you make it. The scenario starts "
+        "from the sidebar's crew (unsaved edits included) and is priced with the "
+        "same settings — shift, buffer, productive time, workforce, overtime, "
+        "excluded stations. **People** move labor capacity; **Stations/Cells** "
+        "move throughput. Nothing here changes the rest of the app until you "
+        "click **📋 Apply to sidebar crew**."
+    )
+
+    scenario = st.session_state.get(keys["base"])
+    if (not isinstance(scenario, pd.DataFrame)
+            or list(scenario.index) != list(current.index)
+            or list(scenario.columns) != list(current.columns)):
+        scenario = current.copy()
+        st.session_state[keys["base"]] = scenario
+    if keys["days"] not in st.session_state:
+        st.session_state[keys["days"]] = int(inputs["days"])
+
+    b1, b2, b3 = st.columns(3)
+    b1.button("👥 Staff to need", key=f"whatif_staff_{location}", width="stretch",
+              on_click=_whatif_button, args=(location, units, inputs, "staff"),
+              help="People = Required HC at each station, at the scenario's "
+                   "working days.")
+    b2.button("🏭 Add cells to fit", key=f"whatif_cells_{location}", width="stretch",
+              on_click=_whatif_button, args=(location, units, inputs, "cells"),
+              help="Every station over 100 % throughput gets ⌈cells × throughput "
+                   "used⌉ cells. Run 👥 Staff to need after it — more cells "
+                   "don't add people.")
+    b3.button("↩️ Reset to current", key=f"whatif_reset_{location}", width="stretch",
+              on_click=_whatif_button, args=(location, units, inputs, "reset"),
+              help="Back to the sidebar's crew and working days.")
+    note = st.session_state.pop(keys["note"], None)
+    if note:
+        st.caption(note)
+
+    days = st.number_input(
+        "Working days in the scenario", min_value=1, max_value=31, step=1,
+        key=keys["days"],
+        help=f"The sidebar says {inputs['days']}. Fewer days raise Required HC "
+             "and cut what the cells can push through.",
+    )
+    edited = st.data_editor(
+        scenario,
+        width="stretch",
+        num_rows="fixed",
+        key=f"whatif_editor_{location}_{st.session_state.get(keys['ver'], 0)}",
+        disabled=["Crew per unit"],
+        column_config={
+            "People": st.column_config.NumberColumn("People", min_value=0, step=1),
+            "Stations/Cells": st.column_config.NumberColumn(
+                "Stations/Cells", min_value=0, step=1),
+            "Crew per unit": st.column_config.NumberColumn(
+                "Crew per unit", help="Change it in the sidebar's 👥 Station headcount."),
+        },
+    )
+    # Bake the edits into the stored scenario (as the sidebar does with its
+    # draft) so the buttons above price what's on screen.
+    if not edited.equals(scenario):
+        st.session_state[keys["base"]] = edited.copy()
+    scn_crew = _whatif_crew(edited, crew_config)
+
+    weekly_ctx = (schedule_df_full, machine_df, acc_df)
+    cur = _whatif_outcome(units, crew_config, inputs["days"], inputs, weekly_ctx)
+    scn = _whatif_outcome(units, scn_crew, days, inputs, weekly_ctx)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Scenario max units", f"{scn['max_units']:,}",
+              delta=f"{scn['max_units'] - cur['max_units']:+,} vs current",
+              help="Same figure as 📊 Capacity's Max units, for the scenario.")
+    m2.metric("Scenario units/day", f"{scn['units_per_day']:.1f}",
+              delta=f"{scn['units_per_day'] - cur['units_per_day']:+.1f} vs current")
+    m3.metric("Scenario people", f"{scn['people']:,}",
+              delta=f"{scn['people'] - scn['need']:+,} vs need {scn['need']}",
+              delta_color="normal",
+              help="Production people (Lead / Other aren't counted). Need = "
+                   "Required HC summed over the stations at the scenario's days.")
+
+    understaffed = _whatif_understaffed(edited, scn["capacity"])
+    if understaffed:
+        st.warning(
+            "⚠️ **Can't confirm every cell can be staffed at once** — "
+            + ", ".join(understaffed)
+            + ". Throughput assumes all cells run together with a full crew "
+            "each; with fewer people, the real output there is lower than shown."
+        )
+
+    def _cap_cell(units_cap: int, util: float, station: str) -> str:
+        return f"{units_cap:,} ({station})" if util > 0 else "—"
+
+    def _names(stations: list) -> str:
+        if not stations:
+            return "0"
+        more = f" +{len(stations) - 3} more" if len(stations) > 3 else ""
+        return f"{len(stations)} — {', '.join(stations[:3])}{more}"
+
+    def _week(o: dict) -> str:
+        b = o["busiest"]
+        return f"{b['week']} · {b['station']} {b['util']:.0%}" if b else "—"
+
+    st.markdown("##### Current vs Scenario")
+    compare = pd.DataFrame(
+        [
+            ("Working days", f"{cur['days']}", f"{scn['days']}"),
+            ("People (production)", f"{cur['people']}", f"{scn['people']}"),
+            ("Need (Required HC)", f"{cur['need']}", f"{scn['need']}"),
+            ("Max units (all lines)", f"{cur['max_units']:,}", f"{scn['max_units']:,}"),
+            ("Units/day", f"{cur['units_per_day']:.1f}", f"{scn['units_per_day']:.1f}"),
+            ("Labor-capped units",
+             _cap_cell(cur["labor_units"], cur["labor_util"], cur["labor_bottleneck"]),
+             _cap_cell(scn["labor_units"], scn["labor_util"], scn["labor_bottleneck"])),
+            ("Throughput-capped units",
+             _cap_cell(cur["thru_units"], cur["thru_util"], cur["thru_bottleneck"]),
+             _cap_cell(scn["thru_units"], scn["thru_util"], scn["thru_bottleneck"])),
+            ("Stations over capacity", _names(cur["over"]), _names(scn["over"])),
+            ("Stations near capacity", _names(cur["near"]), _names(scn["near"])),
+            ("Busiest week (labor)", _week(cur), _week(scn)),
+        ],
+        columns=["", "Current", "Scenario"],
+    )
+    st.dataframe(compare, width="stretch", hide_index=True)
+
+    scn_lines = {r["line"]: r for r in scn["lines"]}
+    line_rows = []
+    for r in cur["lines"]:
+        s = scn_lines.get(r["line"], {})
+        line_rows.append({
+            "Line": r["line"],
+            "Units planned": int(r["planned"]),
+            "Buildable now": int(r["buildable"]),
+            "Binding now": r["binding_station"],
+            "Buildable in scenario": int(s.get("buildable", 0)),
+            "Binding in scenario": s.get("binding_station", "—"),
+        })
+    if line_rows:
+        st.dataframe(pd.DataFrame(line_rows), width="stretch", hide_index=True)
+
+    sc = scn["capacity"]
+    station_rows = []
+    for station in sc.index:
+        row = sc.loc[station]
+        if int(row["HC"]) == 0 and float(row["labor_demand"]) <= 0:
+            continue
+        station_rows.append({
+            "Station": station,
+            "People": int(row["HC"]),
+            "Need": int(row["required_hc"]),
+            "Gap": int(row["hc_gap"]),
+            "Cells": int(row["Conc"]),
+            "Labor used %": float(row["labor_util_safe"]) * 100,
+            "Throughput used %": float(row["thru_util_safe"]) * 100,
+            "Status": row["overall_status"],
+        })
+    if station_rows:
+        with st.expander("Scenario by station", expanded=False):
+            st.dataframe(
+                pd.DataFrame(station_rows), width="stretch", hide_index=True,
+                column_config={
+                    "Labor used %": st.column_config.NumberColumn(format="%.0f%%"),
+                    "Throughput used %": st.column_config.NumberColumn(format="%.0f%%"),
+                },
+            )
+
+    st.button(
+        "📋 Apply to sidebar crew", key=f"whatif_apply_{location}",
+        on_click=_whatif_apply, args=(location, crew_config),
+        disabled=edited.equals(current),
+        help="Copies People and Stations/Cells into the sidebar's 👥 Station "
+             "headcount as an unsaved edit. Working days stay as the sidebar "
+             "sets them.",
+    )
+    applied = st.session_state.pop(keys["applied"], None)
+    if applied:
+        st.success(applied)
+    st.caption(
+        "Not saved until **💾 Save crew** in the sidebar. The busiest week is "
+        "priced on each week's own working days, so the scenario's working-day "
+        "override doesn't move it."
     )
 
 
@@ -12818,7 +13217,10 @@ def main():
         if units.empty:
             _empty_state("Recommendations")
         else:
-            tab_mitigation(capacity, batt_sku, units, inputs)
+            tab_mitigation(
+                capacity, batt_sku, units, inputs, schedule_df_full=schedule_df_full,
+                machine_df=machine_df, acc_df=acc_df,
+            )
     elif active_tab == TAB_BUILD_TIME:
         if units.empty:
             _empty_state("Build Time")

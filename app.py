@@ -92,6 +92,10 @@ _stale = (
     or not hasattr(core.catalog_storage, "mirror_csv_locally")
     # An unreadable CSV upload is a ScheduleColumnError, not a crash.
     or not hasattr(core.data_loader, "_read_schedule_table")
+    # Excel date serials in PRODUCTION MONTH (Henderson_Combined) parse.
+    or not hasattr(core.data_loader, "_excel_serial_month")
+    # A workbook upload picks the whole-plan sheet and names the others.
+    or not hasattr(core.excel_io, "read_schedule_workbook")
 )
 if _stale:
     # Reload in DEPENDENCY ORDER: constants first (every other module imports
@@ -141,6 +145,8 @@ from core.data_loader import (
 )
 from core.excel_io import (
     upload_to_schedule_csv,
+    is_excel_filename,
+    read_schedule_workbook,
     build_workbook as build_excel_workbook,
     database_tables as database_excel_tables,
     database_readme as database_excel_readme,
@@ -2037,6 +2043,7 @@ def _load_schedule_df(
                               unscheduled=_unscheduled, location_recovered=_location,
                               foreign_location=_foreign,
                               sheet=st.session_state.get("_active_schedule_sheet"),
+                              sheet_note=_active_sheet_note(),
                               row_counts=_row_counts,
                               name=st.session_state.get("_active_schedule_name"),
                               auto_loaded=bool(
@@ -2136,9 +2143,17 @@ def _load_schedule_df(
             # schedule, Sequence / Calendar) keeps seeing plain CSV. A CSV
             # passes through untouched.
             try:
-                csv_bytes, sheet = upload_to_schedule_csv(
-                    getattr(uploaded_file, "name", ""), uploaded_file.getvalue(),
-                )
+                # A workbook with several schedule-shaped sheets is read from
+                # the whole-plan one; the note says which, and which not.
+                _file_name = getattr(uploaded_file, "name", "")
+                sheet_note = ""
+                if is_excel_filename(_file_name):
+                    _wb = read_schedule_workbook(uploaded_file.getvalue(), _file_name)
+                    csv_bytes, sheet, sheet_note = _wb.csv_bytes, _wb.sheet.name, _wb.note
+                else:
+                    csv_bytes, sheet = upload_to_schedule_csv(
+                        _file_name, uploaded_file.getvalue(),
+                    )
                 # Parse before promoting: bytes the loader can't read never
                 # become the active schedule (they used to, and the same
                 # exception then came back on every rerun).
@@ -2178,6 +2193,11 @@ def _load_schedule_df(
             st.session_state["_active_schedule_sheet"] = sheet
             _upload_name = getattr(uploaded_file, "name", None) or None
             st.session_state["_active_schedule_name"] = _upload_name
+            # Keyed by sheet + file so an undo / restore to some other
+            # schedule never shows this workbook's note.
+            st.session_state["_active_schedule_sheet_note"] = {
+                "sheet": sheet, "name": _upload_name, "note": sheet_note,
+            }
             st.session_state.pop("_active_schedule_auto_for", None)
             st.session_state.pop("_schedule_undo", None)
             st.session_state["_schedule_edit_count"] = 0
@@ -2292,12 +2312,25 @@ def _newest_saved_schedule(location: str) -> "tuple[str, str] | None":
     return None
 
 
+def _active_sheet_note() -> str:
+    """The other-sheets note of the workbook the active schedule was read
+    from — only while that upload (same sheet, same file) is still active."""
+    rec = st.session_state.get("_active_schedule_sheet_note")
+    sheet = st.session_state.get("_active_schedule_sheet")
+    if (not isinstance(rec, dict) or not sheet
+            or rec.get("sheet") != sheet
+            or rec.get("name") != st.session_state.get("_active_schedule_name")):
+        return ""
+    return rec.get("note") or ""
+
+
 def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
                           plan_month_label: str = "", recovered: dict | None = None,
                           unscheduled: dict | None = None,
                           location_recovered: dict | None = None,
                           foreign_location: dict | None = None,
                           sheet: str | None = None,
+                          sheet_note: str = "",
                           row_counts: dict | None = None,
                           name: str | None = None,
                           auto_loaded: bool = False) -> None:
@@ -2361,6 +2394,9 @@ def _stash_upload_summary(df: pd.DataFrame, location: str, source: str,
             # Workbook sheet the upload was read from (None for a CSV) — shown
             # on the confirmation pill so the planner can spot a wrong tab.
             "sheet": sheet,
+            # Which other sheets also had the schedule columns and were not
+            # read ("" when the workbook had only one).
+            "sheet_note": sheet_note or "",
             "name": str(name) if name else None,
             "auto_loaded": bool(auto_loaded),
         }
@@ -5447,6 +5483,8 @@ def _render_upload_summary(slot, location: str, uploaded) -> None:
                     _which = f"  \n📂 _Saved schedule **{_name}**._"
             elif _summary.get("source") == "upload" and _name:
                 _which = f"  \n📄 _**{_name}**_"
+                if _summary.get("sheet_note"):
+                    _which += f"  \n📑 {_summary['sheet_note']}"
             elif _summary.get("source") == "bundled":
                 _which = (
                     f"  \nℹ️ _No saved schedules for "
@@ -5516,10 +5554,12 @@ def render_sidebar() -> dict:
             help=(
                 "Until you upload a file, the newest schedule saved for this "
                 "facility is loaded (see the 📂 panel below). "
-                "CSV or Excel (.xlsx / .xlsm). For a workbook, the first sheet "
+                "CSV or Excel (.xlsx / .xlsm). For a workbook, the sheet "
                 "whose header row carries the required columns is used — a "
                 "title row above the header, or the plan living on a later "
-                "tab, is fine. Required columns (any of these names will "
+                "tab, is fine. When several sheets have them, a sheet named "
+                "…Combined / All is read, else the one with the most units "
+                "(archive sheets last); the confirmation names the others. Required columns (any of these names will "
                 "match): LOCATION / Facility, FG SKU ID / FG SKU, FG ACCRY SKU "
                 "ID / Accessory SKU, BUILD QTY / Qty, PRODUCTION MONTH / "
                 "Month. Extra columns are ignored. Optional: CUSTOMER NAME, "

@@ -646,14 +646,35 @@ def _resolve_schedule_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=rename_map) if rename_map else df
 
 
+#: Excel stores a date as days since 1899-12-30. A month column that lost its
+#: date format (Henderson_Combined's PRODUCTION MONTH) arrives as ``46296`` /
+#: ``46296.0``. Only serials between 1990-01-01 and 2099-12-31 are read as
+#: dates, so a stray quantity or SKU number can't become a month.
+_EXCEL_EPOCH = pd.Timestamp("1899-12-30")
+_EXCEL_SERIAL_MIN = 32874   # 1990-01-01
+_EXCEL_SERIAL_MAX = 73050   # 2099-12-31
+_EXCEL_SERIAL_RE = re.compile(r"^\d{5}(\.\d+)?$")
+
+
+def _excel_serial_month(val: str) -> str | None:
+    """``Mon-YY`` for an Excel date serial in the plausible range, else None."""
+    if not _EXCEL_SERIAL_RE.match(val):
+        return None
+    serial = float(val)
+    if not _EXCEL_SERIAL_MIN <= serial <= _EXCEL_SERIAL_MAX:
+        return None
+    return (_EXCEL_EPOCH + pd.Timedelta(days=int(serial))).strftime("%b-%y")
+
+
 def _coerce_production_month(s: pd.Series) -> pd.Series:
     """Normalize a `PRODUCTION MONTH` column to the canonical ``Mon-YY``
     format (e.g. ``May-26``) where possible.
 
     Accepts the original formats (``Mon-YY``, ``YY-Mon``) plus US-slash
-    (``5/8/2026``), ISO (``2026-05-08``), and any value pandas can coerce
-    via ``pd.to_datetime``. Unrecognized values pass through unchanged so
-    the planner can still see the literal text in error contexts.
+    (``5/8/2026``), ISO (``2026-05-08``), Excel date serials (``46296`` →
+    ``Oct-26``), and any value pandas can coerce via ``pd.to_datetime``.
+    Unrecognized values pass through unchanged so the planner can still see
+    the literal text in error contexts.
 
     Carryover rows (``YY-Mon``) are intentionally left alone so the
     downstream ``CARRYOVER`` flag still fires correctly.
@@ -668,6 +689,9 @@ def _coerce_production_month(s: pd.Series) -> pd.Series:
             return ""
         if carryover_re.match(val) or current_re.match(val):
             return val  # already canonical
+        serial = _excel_serial_month(val)
+        if serial is not None:
+            return serial
         # Try parsing as a date — pd.to_datetime accepts most common formats.
         ts = pd.to_datetime(val, errors="coerce")
         if pd.notna(ts):

@@ -90,7 +90,7 @@ If a required column truly isn't there, the upload UI shows a yellow banner nami
 
 ### Excel workbooks
 
-Upload the `.xlsx` / `.xlsm` straight from the planner — no Save-As-CSV step. The app uses the first sheet whose header row carries the required columns, so a title row above the header or the plan living on a later tab both work. Date cells become `YYYY-MM-DD`, whole-number quantities stay whole, and what **💾 Save schedule** stores is the converted CSV. The sidebar confirmation pill names the sheet it read. (`.xls`, the pre-2007 format, isn't supported — save it as `.xlsx`.)
+Upload the `.xlsx` / `.xlsm` straight from the planner — no Save-As-CSV step. The app reads the sheet whose header row carries the required columns, so a title row above the header or the plan living on a later tab both work. When several sheets carry them (Henderson's workbook has a tab per family plus `Henderson_Combined` and an archive), it reads the one named as the whole plan (`…Combined`, `All …`), else the one with the most units, never an archive while a live sheet exists — and the confirmation pill lists the sheets it left out with their unit counts. A month column that lost its date format (Excel serials like `46296`) is read as the month it stands for (`Oct-26`). Date cells become `YYYY-MM-DD`, whole-number quantities stay whole, and what **💾 Save schedule** stores is the converted CSV. The sidebar confirmation pill names the sheet it read. (`.xls`, the pre-2007 format, isn't supported — save it as `.xlsx`.)
 
 ### Don't have a CSV yet?
 

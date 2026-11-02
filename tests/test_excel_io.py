@@ -122,6 +122,94 @@ class TestExcelToScheduleCsv:
         assert pd.isna(df["PRODUCTION DAY"].iloc[1])
 
 
+def _plan_rows(n: int, sku: str = "BOSS25-010", qty=1) -> list[list]:
+    """A header plus ``n`` one-unit data rows — a schedule-shaped sheet."""
+    return [HEADER] + [["HENDERSON", sku, None, qty, "Oct-26", None] for _ in range(n)]
+
+
+class TestSheetChoice:
+    """Henderson's workbook carries the schedule header on six tabs: one per
+    family, a CarryOver tab, an Archive, and ``Henderson_Combined`` (the sum
+    of the family tabs). Reading the first match took the Generators tab — a
+    fifth of the month — with no warning."""
+
+    def test_combined_sheet_beats_family_sheets_that_come_first(self):
+        book = _workbook({
+            "Dashboard": [["totals"]],
+            "Plant_Generators_2026": _plan_rows(2, "SDG65-006UR"),
+            "Plant_EBOSS_2026": _plan_rows(5),
+            "Plant_Archive": _plan_rows(9),
+            "Plant_Combined": _plan_rows(7),
+        })
+        wb = excel_io.read_schedule_workbook(book, "plan.xlsx")
+        assert wb.sheet.name == "Plant_Combined"
+        assert len(_csv_frame(wb.csv_bytes)) == 7
+        assert [s.name for s in wb.skipped] == [
+            "Plant_Generators_2026", "Plant_EBOSS_2026", "Plant_Archive",
+        ]
+
+    def test_whole_plan_name_wins_over_a_bigger_sheet(self):
+        book = _workbook({"Big": _plan_rows(9), "All Units": _plan_rows(3)})
+        assert excel_io.read_schedule_workbook(book).sheet.name == "All Units"
+
+    @pytest.mark.parametrize("name", ["Install", "Ball park", "Uncombined"])
+    def test_whole_plan_words_match_whole_words_only(self, name):
+        book = _workbook({name: _plan_rows(1), "Bigger": _plan_rows(4)})
+        assert excel_io.read_schedule_workbook(book).sheet.name == "Bigger"
+
+    def test_without_a_named_sheet_the_most_units_wins(self):
+        book = _workbook({
+            "Gens": _plan_rows(2),
+            "EBOSS": _plan_rows(1, qty=6),
+            "Comps": _plan_rows(4),
+        })
+        wb = excel_io.read_schedule_workbook(book)
+        assert wb.sheet.name == "EBOSS"
+        assert (wb.sheet.rows, wb.sheet.units) == (1, 6)
+
+    def test_units_count_only_rows_the_loader_would_keep(self):
+        rows = _plan_rows(2) + [
+            ["HENDERSON", "BOSS25-010", None, 0, "Oct-26", None],
+            ["HENDERSON", "BOSS25-010", None, None, "Oct-26", None],
+            ["HENDERSON", "BOSS25-010", None, "TBD", "Oct-26", None],
+        ]
+        wb = excel_io.read_schedule_workbook(_workbook({"S": rows, "T": _plan_rows(3)}))
+        assert wb.sheet.name == "T"
+        assert (wb.skipped[0].rows, wb.skipped[0].units) == (2, 2)
+
+    def test_archive_is_read_only_when_nothing_else_matches(self):
+        book = _workbook({"Live": _plan_rows(1), "Archive 2025": _plan_rows(9)})
+        assert excel_io.read_schedule_workbook(book).sheet.name == "Live"
+        only = _workbook({"Cover": [["x"]], "Old plan": _plan_rows(2)})
+        wb = excel_io.read_schedule_workbook(only)
+        assert wb.sheet.name == "Old plan" and wb.skipped == ()
+
+    def test_ties_go_to_workbook_order(self):
+        book = _workbook({"First": _plan_rows(2), "Second": _plan_rows(2)})
+        assert excel_io.read_schedule_workbook(book).sheet.name == "First"
+
+    def test_note_names_the_read_sheet_and_every_skipped_one(self):
+        book = _workbook({
+            "Gens": _plan_rows(2), "Old_Archive": _plan_rows(3), "Combined": _plan_rows(5),
+        })
+        note = excel_io.read_schedule_workbook(book).note
+        assert "`Combined` (5 units in 5 rows)" in note
+        assert "whole plan" in note
+        assert "`Gens` (2 units)" in note
+        assert "`Old_Archive` (3 units, archive)" in note
+
+    def test_single_matching_sheet_has_no_note(self):
+        book = _workbook({"Cover": [["x"]], "Plan": _plan_rows(2)})
+        wb = excel_io.read_schedule_workbook(book)
+        assert wb.skipped == () and wb.note == ""
+
+    def test_excel_to_schedule_csv_returns_the_chosen_sheet(self):
+        book = _workbook({"Gens": _plan_rows(1), "Combined": _plan_rows(3)})
+        csv_bytes, sheet = excel_io.excel_to_schedule_csv(book)
+        assert sheet == "Combined"
+        assert len(_csv_frame(csv_bytes)) == 3
+
+
 class TestUploadToScheduleCsv:
     def test_csv_passes_through_byte_for_byte(self):
         raw = b"\xef\xbb\xbfLOCATION,FG SKU ID\r\nHENDERSON,BOSS25-010\r\n"

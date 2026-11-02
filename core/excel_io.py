@@ -6,8 +6,12 @@ Two jobs, both Streamlit-free so they're unit-testable:
    ``.xlsm`` workbook into the CSV bytes the schedule loader already
    understands. It scans every sheet for the first header row that carries
    the five required schedule columns (so a title row above the header, or
-   the schedule living on the third tab, both just work) and normalizes Excel
-   cell types (dates → ``YYYY-MM-DD``, ``5.0`` → ``5``) on the way through.
+   the schedule living on the third tab, both just work). When several
+   sheets match, :func:`read_schedule_workbook` reads the one named as the
+   whole plan (``…Combined``) or else the one with the most units, never an
+   archive while a live sheet exists, and says which others it left out. It
+   normalizes Excel cell types (dates → ``YYYY-MM-DD``, ``5.0`` → ``5``) on
+   the way through.
    A ``.csv`` passes straight through untouched, so every downstream path —
    the session's active schedule, the 💾 Save schedule button, the saved
    schedule JSON — keeps seeing CSV and nothing else has to change.
@@ -166,11 +170,111 @@ def _sheet_to_csv_bytes(raw: pd.DataFrame, header_row: int) -> bytes:
     return body.to_csv(index=False).encode("utf-8")
 
 
-def excel_to_schedule_csv(raw_bytes: bytes, filename: str = "") -> tuple[bytes, str]:
+#: Sheet-name words that mark the whole plan in a workbook that also splits
+#: it by family (Henderson's ``Henderson_Combined`` = Generators + Compressors
+#: + EBOSS + CarryOver tabs). Matched as whole words of the sheet name.
+_WHOLE_PLAN_SHEET_WORDS = frozenset({"combined", "all"})
+#: Words that mark a sheet as history rather than the live plan — it carries
+#: the schedule header too, but is read only when nothing else matches.
+_STALE_SHEET_WORDS = frozenset({"archive", "archived", "backup", "old", "history"})
+
+
+def _sheet_name_words(name: str) -> set[str]:
+    return {w for w in re.split(r"[^a-z0-9]+", str(name).lower()) if w}
+
+
+@dataclass(frozen=True)
+class ScheduleSheet:
+    """One sheet whose header row carries the required schedule columns.
+
+    ``rows`` / ``units`` count the data rows with a positive BUILD QTY and
+    the sum of those quantities — what the loader would keep, before the
+    location filter."""
+    name: str
+    header_row: int
+    rows: int
+    units: int
+
+    @property
+    def whole_plan(self) -> bool:
+        return bool(_sheet_name_words(self.name) & _WHOLE_PLAN_SHEET_WORDS)
+
+    @property
+    def stale(self) -> bool:
+        return bool(_sheet_name_words(self.name) & _STALE_SHEET_WORDS)
+
+
+@dataclass(frozen=True)
+class WorkbookSchedule:
+    """What :func:`read_schedule_workbook` read: the CSV bytes of the chosen
+    sheet, the sheet itself, and every other matching sheet it left out."""
+    csv_bytes: bytes
+    sheet: ScheduleSheet
+    skipped: tuple[ScheduleSheet, ...] = ()
+
+    @property
+    def note(self) -> str:
+        """Markdown for the planner — which sheet was read and why, and which
+        other schedule-shaped sheets were not. ``""`` when only one sheet
+        matched (nothing was chosen, so there is nothing to explain)."""
+        if not self.skipped:
+            return ""
+        s = self.sheet
+        why = ("its name marks it as the whole plan" if s.whole_plan
+               else "it has the most units")
+        others = ", ".join(
+            f"`{o.name}` ({o.units:,} units{', archive' if o.stale else ''})"
+            for o in self.skipped
+        )
+        return (
+            f"Read sheet `{s.name}` ({s.units:,} units in {s.rows:,} rows) — "
+            f"{why}. Also has the schedule columns, not read: {others}. "
+            "To plan from one of those, upload a workbook (or CSV) with just "
+            "that sheet."
+        )
+
+
+def _qty_bearing(raw: pd.DataFrame, header_row: int) -> tuple[int, int]:
+    """(rows with a positive BUILD QTY, sum of those quantities) under
+    ``header_row`` — the loader's own no-qty drop, so sheets compare on what
+    would actually be planned."""
+    names = [_cell_to_text(c) for c in raw.iloc[header_row].tolist()]
+    qty_name = _find_column([n for n in names if n], *next(
+        patterns for canonical, patterns, _label in _REQUIRED_SCHEDULE_COLUMNS
+        if canonical == "BUILD QTY"
+    ))
+    if qty_name is None:
+        return 0, 0
+    qty = pd.to_numeric(raw.iloc[header_row + 1:, names.index(qty_name)],
+                        errors="coerce")
+    qty = qty[qty > 0]
+    return int(len(qty)), int(qty.sum())
+
+
+def _pick_schedule_sheet(sheets: list[ScheduleSheet]) -> ScheduleSheet:
+    """The sheet that holds the plan, out of every schedule-shaped one.
+
+    A workbook that splits the plan by family (Generators / Compressors /
+    EBOSS tabs) next to a combined tab used to be read from whichever came
+    first — one family, a fraction of the month, with no warning. So:
+
+    1. archive / backup / old sheets only when nothing else matches;
+    2. a sheet named as the whole plan (``…Combined``, ``All …``);
+    3. otherwise the one with the most units, then most rows;
+    4. ties go to workbook order.
+    """
+    live = [s for s in sheets if not s.stale] or sheets
+    named = [s for s in live if s.whole_plan]
+    pool = named or live
+    return max(pool, key=lambda s: (s.units, s.rows, -sheets.index(s)))
+
+
+def read_schedule_workbook(raw_bytes: bytes, filename: str = "") -> WorkbookSchedule:
     """Convert an ``.xlsx`` / ``.xlsm`` workbook to schedule CSV bytes.
 
-    Returns ``(csv_bytes, sheet_name)`` for the first sheet, in workbook order,
-    that has a header row carrying all five required schedule columns.
+    Every sheet whose header row carries all five required schedule columns
+    is a candidate; :func:`_pick_schedule_sheet` chooses one and the rest are
+    reported in :attr:`WorkbookSchedule.skipped` so the planner can see them.
 
     Raises :class:`ScheduleColumnError` (the same planner-friendly error the
     CSV loader raises, so the upload UI surfaces it the same way) when the
@@ -194,21 +298,37 @@ def excel_to_schedule_csv(raw_bytes: bytes, filename: str = "") -> tuple[bytes, 
     if not book:
         raise ScheduleColumnError(f"{label} has no sheets.")
 
-    skipped: list[str] = []
+    candidates: list[ScheduleSheet] = []
+    tried: list[str] = []
     for sheet_name, raw in book.items():
         header_row = find_schedule_header_row(raw)
         if header_row is None:
-            skipped.append(str(sheet_name))
+            tried.append(str(sheet_name))
             continue
-        return _sheet_to_csv_bytes(raw, header_row), str(sheet_name)
+        rows, units = _qty_bearing(raw, header_row)
+        candidates.append(ScheduleSheet(str(sheet_name), header_row, rows, units))
 
-    tried = ", ".join(f"`{s}`" for s in skipped) or "—"
-    raise ScheduleColumnError(
-        f"None of the sheets in {label} ({tried}) has a header row with the "
-        "columns we need: **Location, FG SKU ID, Accessory SKU ID, Build Qty, "
-        "Production Month** (any of their usual spellings). Put those column "
-        "names in a single row on the schedule sheet and re-upload."
+    if not candidates:
+        tried_text = ", ".join(f"`{s}`" for s in tried) or "—"
+        raise ScheduleColumnError(
+            f"None of the sheets in {label} ({tried_text}) has a header row with "
+            "the columns we need: **Location, FG SKU ID, Accessory SKU ID, Build "
+            "Qty, Production Month** (any of their usual spellings). Put those "
+            "column names in a single row on the schedule sheet and re-upload."
+        )
+    chosen = _pick_schedule_sheet(candidates)
+    return WorkbookSchedule(
+        csv_bytes=_sheet_to_csv_bytes(book[chosen.name], chosen.header_row),
+        sheet=chosen,
+        skipped=tuple(s for s in candidates if s is not chosen),
     )
+
+
+def excel_to_schedule_csv(raw_bytes: bytes, filename: str = "") -> tuple[bytes, str]:
+    """``(csv_bytes, sheet_name)`` of the sheet :func:`read_schedule_workbook`
+    picks."""
+    wb = read_schedule_workbook(raw_bytes, filename)
+    return wb.csv_bytes, wb.sheet.name
 
 
 def upload_to_schedule_csv(filename: str, raw_bytes: bytes) -> tuple[bytes, str | None]:

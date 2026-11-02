@@ -485,7 +485,7 @@ class TestWeekFilters:
 
     def test_weekly_heatmap_buckets_by_month_and_week(self, monkeypatch):
         calls = []
-        monkeypatch.setattr(app, "_expand_schedule", lambda slice_df, m, a: slice_df.copy())
+        monkeypatch.setattr(app, "_expand_schedule", lambda slice_df, m, a, *_support: slice_df.copy())
 
         def fake_cap(units, crew, shift, days, *rest):
             calls.append((len(units), days))

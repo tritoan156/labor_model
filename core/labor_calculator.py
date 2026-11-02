@@ -10,7 +10,8 @@ import numpy as np
 from .constants import (
     FINAL_LABOR, HS_FINAL_CREW, DEFAULT_NAMEPLATE_PREP, DEFAULT_BATT_RAW,
     ETO_LABOR_PER_UNIT, STATION_KEY_TO_DISPLAY, STATION_KEYS,
-    BATTERY_CYCLE_MINUTES, LABOR_ONLY_STATIONS, get_battery_type,
+    BATTERY_CYCLE_MINUTES, LABOR_ONLY_STATIONS, MH_FOLDABLE_STATIONS,
+    get_battery_type,
     UTIL_THRESHOLD_OVER, UTIL_THRESHOLD_NEAR, UTIL_THRESHOLD_TIGHT,
 )
 
@@ -364,7 +365,8 @@ def unit_labor_split(fg_base: str, acc_sku: str | None,
 def expand_schedule(schedule_df: pd.DataFrame,
                      machine_df: pd.DataFrame,
                      acc_df: pd.DataFrame,
-                     support_minutes_per_unit: float = 0.0) -> pd.DataFrame:
+                     support_minutes_per_unit: float = 0.0,
+                     mh_folded_stations=()) -> pd.DataFrame:
     """Expand schedule rows into per-unit records with labor attached.
 
     Returns DataFrame with one row per individual unit (qty=1 each), columns
@@ -376,6 +378,11 @@ def expand_schedule(schedule_df: pd.DataFrame,
     inventory counts, internal moves …) charged to every unit at the
     Material Handling station. It isn't in the catalogs: it's the same for
     every SKU and comes from the facility's saved settings.
+
+    ``mh_folded_stations`` names stations (keys from ``MH_FOLDABLE_STATIONS``)
+    the facility's Material Handling team also does: each unit's catalog
+    minutes there move to ``MatHandling`` and the station keeps none.
+    ``total_labor`` is unchanged by the move.
 
     Two helper lists are attached to the returned DataFrame as attributes so
     callers can surface data-quality warnings without breaking the existing
@@ -402,6 +409,7 @@ def expand_schedule(schedule_df: pd.DataFrame,
         support = 0.0
     if support != support:  # NaN
         support = 0.0
+    folded = [s for s in MH_FOLDABLE_STATIONS if s in set(mh_folded_stations or ())]
     for _, r in schedule_df.iterrows():
         qty = int(r["BUILD QTY"])
         fg_base = r.get("FG_BASE")
@@ -412,6 +420,9 @@ def expand_schedule(schedule_df: pd.DataFrame,
                 skipped_fg.add(str(fg_base))
             continue
         labor = dict(labor, MatHandling=support)
+        for st in folded:
+            labor["MatHandling"] += float(labor.get(st, 0) or 0)
+            labor[st] = 0.0
         # The unit kept — note any accessory we couldn't resolve so the
         # planner knows the labor at PMAcc/GenAcc/ComAcc/AccKIT/Battery is
         # zero by default, not measured.

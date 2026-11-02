@@ -160,7 +160,9 @@ Every save — catalog cells, added SKUs, imports, crew, settings, schedules —
 
 Receiving, inventory counting, internal movement and other support work isn't in the catalogs, so it's sized as **minutes per unit** in the sidebar (**⏱️ Working-time settings → 📦 Material handling**), one number per function, saved per facility with **💾 Save planning assumptions**. Every unit carries the total at the **Material Handling** station, which you staff in **👥 Station headcount** like any other station: the Capacity tab shows its people needed, gap and labor used %, and it counts in "need N people, have M". It is labor only — Stations/Cells never limit it. A facility with no minutes saved puts no load on it; one with minutes but nobody on the station can build nothing, the same as any unstaffed station.
 
-Henderson (Nov 2026): 15 receiving + 5 counting + 15 internal movement + 15 other = 50 min/unit, staffed by the 6 people who were listed as **Other**.
+**Material Handling also does** (same place, saved the same way) hands **Warehouse (Pick)** and/or **Ship** to the Material Handling team: their catalog minutes per unit move to Material Handling and those stations carry no load — move their people over in 👥 Station headcount.
+
+Henderson (Nov 2026): 15 receiving + 5 counting + 15 internal movement + 15 other = 50 min/unit, plus Warehouse (Pick) and Ship, staffed by 10 people — the 6 listed as **Other** plus the 2 pickers and 2 shippers.
 
 ---
 

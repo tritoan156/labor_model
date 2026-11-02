@@ -129,6 +129,22 @@ class TestExpandCarriesSupportMinutes:
         units = expand_schedule(_schedule(), m, a, support_minutes_per_unit=bad)
         assert (units["MatHandling"] == 0).all()
 
+    def test_folded_stations_move_to_material_handling(self):
+        m, a = _catalog()
+        base = expand_schedule(_schedule(), m, a, support_minutes_per_unit=50)
+        folded = expand_schedule(_schedule(), m, a, support_minutes_per_unit=50,
+                                 mh_folded_stations=("Warehouse", "Ship"))
+        assert (folded["Warehouse"] == 0).all() and (folded["Ship"] == 0).all()
+        moved = base["Warehouse"] + base["Ship"]
+        assert (folded["MatHandling"] == 50 + moved).all()
+        assert (folded["total_labor"] == base["total_labor"]).all()
+
+    def test_only_foldable_stations_fold(self):
+        m, a = _catalog()
+        units = expand_schedule(_schedule(), m, a, mh_folded_stations=("QC", "Bogus"))
+        base = expand_schedule(_schedule(), m, a)
+        assert units[["QC", "MatHandling"]].equals(base[["QC", "MatHandling"]])
+
     def test_demand_table_tolerates_a_unit_table_without_the_column(self):
         m, a = _catalog()
         units = expand_schedule(_schedule(), m, a).drop(columns=["MatHandling"])
@@ -220,13 +236,21 @@ class TestSupportMinutesSettings:
         assert get_facility_settings("Henderson")["support_minutes"] == {
             k: float(v) for k, v in HENDERSON_MINUTES.items()}
 
+    def test_folded_stations_are_cleaned(self):
+        assert fss.clean_mh_folded(["Ship", "QC", "Warehouse (Pick)", "Ship"]) == [
+            "Warehouse (Pick)", "Ship"]
+        assert fss.clean_mh_folded("Ship") == []
+        assert fss.mh_folded_station_keys(["Ship"]) == ("Ship",)
+        assert fss.mh_folded_station_keys(None) == ()
+
     def test_get_defaults_to_zero(self, monkeypatch):
         monkeypatch.setattr(fss, "load_all_facility_settings", lambda: {})
         assert support_minutes_per_unit(get_facility_settings("Cypress")) == 0
 
     @pytest.fixture
     def github(self, monkeypatch, tmp_path):
-        store = {"Henderson": {"safety": 1.0, "support_minutes": HENDERSON_MINUTES}}
+        store = {"Henderson": {"safety": 1.0, "support_minutes": HENDERSON_MINUTES,
+                               "mh_folded_stations": ["Warehouse (Pick)", "Ship"]}}
         pushed = []
         monkeypatch.setattr(fss, "_fetch_existing_from_github",
                             lambda token: (json.loads(json.dumps(store)), "sha"))
@@ -245,6 +269,12 @@ class TestSupportMinutesSettings:
         fss.save_facility_settings_to_github("Henderson", {"safety": 0.9}, "tok")
         assert github[-1]["Henderson"]["support_minutes"] == {
             k: float(v) for k, v in HENDERSON_MINUTES.items()}
+        assert github[-1]["Henderson"]["mh_folded_stations"] == ["Warehouse (Pick)", "Ship"]
+
+    def test_save_writes_folded_stations(self, github):
+        fss.save_facility_settings_to_github(
+            "Henderson", {"mh_folded_stations": ["Ship"]}, "tok")
+        assert github[-1]["Henderson"]["mh_folded_stations"] == ["Ship"]
 
 
 # ---------------------------------------------------------------------------
@@ -286,12 +316,29 @@ class TestSidebarDrivesCapacity:
         assert row is not None, "Material Handling missing from the staffing table"
         assert int(row["Need"]) > 0
 
-    def test_zero_minutes_leave_it_idle(self, at):
+    def test_zero_minutes_and_nothing_folded_leave_it_idle(self, at):
         loc = at.sidebar.selectbox[0].value
         for fn in SUPPORT_FUNCTIONS:
             box = next(n for n in at.sidebar.number_input
                        if n.key == f"support_min_{fn}_{loc}")
             box.set_value(0.0)
+        next(m for m in at.sidebar.multiselect
+             if m.key == f"mh_folded_stations_{loc}").set_value([])
         at.run()
         row = self._mh_row(at)
         assert row is None or int(row["Need"]) == 0
+
+    def test_folded_stations_load_material_handling_not_themselves(self, at):
+        loc = at.sidebar.selectbox[0].value
+        for fn in SUPPORT_FUNCTIONS:
+            next(n for n in at.sidebar.number_input
+                 if n.key == f"support_min_{fn}_{loc}").set_value(0.0)
+        next(m for m in at.sidebar.multiselect
+             if m.key == f"mh_folded_stations_{loc}").set_value(["Warehouse (Pick)", "Ship"])
+        at.run()
+        assert not at.exception, [str(e.value)[:300] for e in at.exception]
+        staff = next(d.value for d in at.main.dataframe
+                     if "Labor used %" in d.value.columns and MH in d.value.index)
+        assert int(staff.loc[MH, "Need"]) > 0
+        for st in ("Warehouse (Pick)", "Ship"):
+            assert int(staff.loc[st, "Need"]) == 0

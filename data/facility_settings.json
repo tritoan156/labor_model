@@ -26,6 +26,10 @@
       "Inventory counting": 5.0,
       "Internal movement": 15.0,
       "Other support": 15.0
-    }
+    },
+    "mh_folded_stations": [
+      "Warehouse (Pick)",
+      "Ship"
+    ]
   }
 }

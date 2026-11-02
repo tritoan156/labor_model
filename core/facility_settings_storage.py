@@ -12,6 +12,9 @@ sessions for each facility — currently the workforce-availability assumptions:
                                    per ``SUPPORT_FUNCTIONS`` name (receiving,
                                    inventory counting …), charged to every unit
                                    at the Material Handling station
+    * ``mh_folded_stations``     — station display names (Warehouse (Pick),
+                                   Ship) whose work the Material Handling team
+                                   does at this facility
 
 Persists to ``data/facility_settings.json`` on GitHub so every user / browser
 sees the same values. Same concurrency pattern as the catalog / scenario saves:
@@ -38,7 +41,8 @@ from .catalog_storage import (
     GitHubConflict,
 )
 from .constants import (
-    DEFAULT_EFFICIENCY_FACTOR, DEFAULT_SAFETY_FACTOR, SUPPORT_FUNCTIONS,
+    DEFAULT_EFFICIENCY_FACTOR, DEFAULT_SAFETY_FACTOR, MH_FOLDABLE_STATIONS,
+    STATION_KEY_TO_DISPLAY, SUPPORT_FUNCTIONS,
 )
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -114,6 +118,26 @@ def clean_support_minutes(value) -> dict:
     return out
 
 
+#: Display names of the stations Material Handling can take over, in order.
+MH_FOLDABLE_DISPLAY = tuple(STATION_KEY_TO_DISPLAY[k] for k in MH_FOLDABLE_STATIONS)
+
+
+def clean_mh_folded(value) -> list:
+    """Coerce a saved ``mh_folded_stations`` value to the foldable station
+    display names it names, in ``MH_FOLDABLE_DISPLAY`` order. Junk → []."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    named = {str(v).strip() for v in value if v is not None}
+    return [d for d in MH_FOLDABLE_DISPLAY if d in named]
+
+
+def mh_folded_station_keys(folded_display) -> tuple:
+    """Station keys for a list of foldable display names (what
+    ``expand_schedule(mh_folded_stations=)`` takes)."""
+    names = set(clean_mh_folded(folded_display))
+    return tuple(k for k in MH_FOLDABLE_STATIONS if STATION_KEY_TO_DISPLAY[k] in names)
+
+
 def support_minutes_per_unit(settings: dict | None) -> float:
     """Total support minutes per unit from a facility's settings dict."""
     return float(sum(clean_support_minutes(
@@ -148,6 +172,7 @@ def get_facility_settings(location: str) -> dict:
     # Non-clamped list field — station display names excluded from buildable sizing.
     out["excluded_stations"] = _clean_excluded(block.get("excluded_stations", []))
     out["support_minutes"] = clean_support_minutes(block.get("support_minutes"))
+    out["mh_folded_stations"] = clean_mh_folded(block.get("mh_folded_stations"))
     return out
 
 
@@ -205,13 +230,13 @@ def save_facility_settings_to_github(
 
     for attempt in (1, 2):
         existing, sha = _fetch_existing_from_github(token)
-        # A caller that doesn't send support minutes keeps the saved ones
-        # rather than wiping them.
-        if "support_minutes" in (settings or {}):
-            clean["support_minutes"] = clean_support_minutes(settings["support_minutes"])
-        else:
-            prev = existing.get(location) if isinstance(existing.get(location), dict) else {}
-            clean["support_minutes"] = clean_support_minutes(prev.get("support_minutes"))
+        # A caller that doesn't send the Material Handling fields keeps the
+        # saved ones rather than wiping them.
+        prev = existing.get(location) if isinstance(existing.get(location), dict) else {}
+        for key, clean_fn in (("support_minutes", clean_support_minutes),
+                              ("mh_folded_stations", clean_mh_folded)):
+            src = settings if key in (settings or {}) else prev
+            clean[key] = clean_fn(src.get(key))
         existing[location] = clean
         new_content = json.dumps(existing, indent=2)
         try:

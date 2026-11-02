@@ -177,6 +177,11 @@ SUPPORT_FUNCTIONS = (
     "Receiving", "Inventory counting", "Internal movement", "Other support",
 )
 
+# Stations a facility may hand to its Material Handling team (facility setting
+# "mh_folded_stations", by display name): their catalog minutes then land at
+# MatHandling and the station itself carries no load.
+MH_FOLDABLE_STATIONS = ("Warehouse", "Ship")
+
 # Non-production support roles shown in the headcount editor (e.g. leads;
 # material handlers whose work is sized per unit belong at the Material
 # Handling station instead). They are deliberately NOT stations (not in STATION_KEYS /

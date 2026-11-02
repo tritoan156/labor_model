@@ -79,13 +79,14 @@ _stale = (
         core.data_loader.load_schedule).parameters
     or "efficiency" not in getattr(
         core.facility_settings_storage, "DEFAULT_SETTINGS", {})
-    # Material Handling station + per-facility support minutes: a new station
-    # key and SUPPORT_FUNCTIONS (constants), the settings helpers that read
-    # them, and the expand_schedule parameter app.py passes by keyword.
+    # Material Handling station + per-facility support minutes and folded
+    # stations: a new station key and MH_FOLDABLE_STATIONS (constants), the
+    # settings helpers that read them, and the expand_schedule parameter
+    # app.py passes by keyword.
     or "MatHandling" not in getattr(core.constants, "STATION_KEYS", [])
-    or not hasattr(core.constants, "SUPPORT_FUNCTIONS")
-    or not hasattr(core.facility_settings_storage, "SUPPORT_MINUTES_MAX")
-    or "support_minutes_per_unit" not in _inspect.signature(
+    or not hasattr(core.constants, "MH_FOLDABLE_STATIONS")
+    or not hasattr(core.facility_settings_storage, "mh_folded_station_keys")
+    or "mh_folded_stations" not in _inspect.signature(
         core.labor_calculator.expand_schedule).parameters
     or not hasattr(core.usage_tracker, "flush_buffer")
     or not hasattr(core.excel_io, "read_catalog_workbook")
@@ -180,7 +181,7 @@ from core.facility_storage import (
 )
 from core.facility_settings_storage import (
     get_facility_settings, save_facility_settings_to_github,
-    SUPPORT_MINUTES_MAX,
+    SUPPORT_MINUTES_MAX, MH_FOLDABLE_DISPLAY, mh_folded_station_keys,
 )
 from core.exec_scenario_storage import (
     list_exec_scenarios, get_exec_scenario,
@@ -588,14 +589,16 @@ def _clear_catalog_cache(*file_paths: str) -> None:
 # would serve the first schedule it ever saw to every later one).
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, max_entries=32)
-def _expand_schedule_cached(schedule_df, machine_df, acc_df, support_minutes):
+def _expand_schedule_cached(schedule_df, machine_df, acc_df, support_minutes,
+                            mh_folded):
     """Cached expand_schedule. expand_schedule attaches .attrs
     (skipped_fg / unknown_acc) that don't reliably survive st.cache_data's
     pickle round-trip, so return them separately; the wrapper reattaches.
-    ``support_minutes`` has no default on purpose: a default is never part of
-    the cache key, so every caller passes it."""
+    ``support_minutes`` / ``mh_folded`` have no defaults on purpose: a default
+    is never part of the cache key, so every caller passes them."""
     units = expand_schedule(schedule_df, machine_df, acc_df,
-                            support_minutes_per_unit=support_minutes)
+                            support_minutes_per_unit=support_minutes,
+                            mh_folded_stations=mh_folded)
     attrs = {
         "skipped_fg": list(units.attrs.get("skipped_fg", []) or []),
         "unknown_acc": list(units.attrs.get("unknown_acc", []) or []),
@@ -603,16 +606,20 @@ def _expand_schedule_cached(schedule_df, machine_df, acc_df, support_minutes):
     return units, attrs
 
 
-def _expand_schedule(schedule_df, machine_df, acc_df, support_minutes=0.0):
+def _expand_schedule(schedule_df, machine_df, acc_df, support_minutes=0.0,
+                     mh_folded=()):
     """Call the cached expansion and reattach the data-quality .attrs.
 
     ``support_minutes`` is the facility's support minutes per unit (Material
-    Handling); 0 leaves that station without demand.
+    Handling); 0 leaves that station without demand. ``mh_folded`` lists the
+    station display names the Material Handling team also does (Warehouse
+    (Pick), Ship): their minutes move there.
 
     st.cache_data returns a fresh copy on each access, so setting .attrs here
     never mutates the cached value."""
     units, attrs = _expand_schedule_cached(
-        schedule_df, machine_df, acc_df, float(support_minutes or 0.0))
+        schedule_df, machine_df, acc_df, float(support_minutes or 0.0),
+        mh_folded_station_keys(mh_folded))
     units.attrs["skipped_fg"] = attrs["skipped_fg"]
     units.attrs["unknown_acc"] = attrs["unknown_acc"]
     return units
@@ -5933,11 +5940,27 @@ def render_sidebar() -> dict:
                 step=1.0, key=_sm_key,
             ))
         support_minutes_per_unit = float(sum(support_minutes.values()))
-        if support_minutes_per_unit > 0:
+        _mhf_key = f"mh_folded_stations_{location}"
+        if _mhf_key not in st.session_state:
+            st.session_state[_mhf_key] = list(_fs_saved.get("mh_folded_stations") or [])
+        mh_folded_stations = st.multiselect(
+            "Material Handling also does",
+            options=list(MH_FOLDABLE_DISPLAY),
+            key=_mhf_key,
+            help=(
+                "Stations whose work this facility's Material Handling team "
+                "does. Their catalog minutes per unit move to Material "
+                "Handling, and the station itself carries no load — move its "
+                "people to Material Handling in 👥 Station headcount."
+            ),
+        )
+        if support_minutes_per_unit > 0 or mh_folded_stations:
+            _also = (f" + **{' & '.join(mh_folded_stations)}** work"
+                     if mh_folded_stations else "")
             st.caption(
-                f"**{support_minutes_per_unit:g} min** of support work per unit "
-                "at the **Material Handling** station — staff it in 👥 Station "
-                "headcount below."
+                f"**{support_minutes_per_unit:g} min** of support work per unit"
+                f"{_also} at the **Material Handling** station — staff it in "
+                "👥 Station headcount below."
             )
         else:
             st.caption("No support work charged — Material Handling carries no load.")
@@ -5996,6 +6019,7 @@ def render_sidebar() -> dict:
                             "safety": safety,
                             "excluded_stations": excluded_stations,
                             "support_minutes": support_minutes,
+                            "mh_folded_stations": mh_folded_stations,
                         }, token)
                     _track_and_flush("assumptions_save", facility=location)
                     st.success(f"✅ Saved planning assumptions for {location}.")
@@ -6163,6 +6187,7 @@ def render_sidebar() -> dict:
         "excluded_stations": excluded_stations,
         "support_minutes": support_minutes,
         "support_minutes_per_unit": support_minutes_per_unit,
+        "mh_folded_stations": tuple(mh_folded_stations),
     }
 
 
@@ -6220,6 +6245,7 @@ def _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, inputs):
             units_w = _expand_schedule(
                 slice_df, machine_df, acc_df,
                 inputs.get("support_minutes_per_unit", 0.0),
+                inputs.get("mh_folded_stations", ()),
             )
         except Exception:
             continue
@@ -12733,6 +12759,7 @@ def main():
         units = _expand_schedule(
             schedule_df, machine_df, acc_df,
             inputs.get("support_minutes_per_unit", 0.0),
+            inputs.get("mh_folded_stations", ()),
         )
         if units.empty:
             empty_banner_msg = (

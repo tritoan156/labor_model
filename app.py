@@ -12618,7 +12618,7 @@ def _guide_schedule_step(inputs: dict, schedule_df_full, schedule_load_error) ->
     rows = summary.get("rows", int(len(schedule_df_full)))
     src_rows = summary.get("source_rows")
     counts = (
-        f"{rows} of {src_rows} rows counted"
+        f"{rows} of {src_rows} rows"
         if isinstance(src_rows, int) and src_rows != rows else f"{rows} rows"
     )
     status = "ok"
@@ -12886,7 +12886,7 @@ def _guide_catalog_step(schedule_df_full, machine_df, acc_df, inputs: dict) -> d
     n_missing = len(_skipped_fg) + len(_unknown_acc)
     actions = [
         _guide_action(
-            f"➕ Import {n_missing} missing SKU(s) into the catalogs",
+            f"➕ Import {n_missing} SKU(s)",
             key="guide_import_missing_btn",
             run=lambda: _import_missing_skus_now(_skipped_fg, _unknown_acc, token),
             type="primary", disabled=not token,
@@ -13039,12 +13039,18 @@ def _guide_has_details(step: dict) -> bool:
 def _render_guide_row(head: str, help: "str | None", actions: list, detailed: list) -> None:
     """One guide line: the headline with its ⓘ tooltip, a "Why …?" popover
     for each step in ``detailed``, then the buttons. A flex row, so each
-    control is as wide as its label and the headline takes the rest."""
+    control is as wide as its label and the headline takes the rest; the
+    controls are one group, so on a narrow screen they drop under the
+    headline together instead of wrapping one by one."""
     row = st.container(horizontal=True, vertical_alignment="center")
     row.markdown(head, help=help, width="stretch")
+    if not (detailed or actions):
+        return
+    group = row.container(horizontal=True, vertical_alignment="center", width="content",
+                          gap="xsmall")
     for step in detailed:
-        with row.popover(step.get("details_title") or "Details", type="tertiary",
-                         key=f"guide_details_{step['n']}"):
+        with group.popover(step.get("details_title") or "Details", type="tertiary",
+                           key=f"guide_details_{step['n']}"):
             for line in step.get("details") or []:
                 st.markdown(line)
             if step.get("details_df") is not None:
@@ -13053,7 +13059,7 @@ def _render_guide_row(head: str, help: "str | None", actions: list, detailed: li
         kwargs = {"type": act.get("type") or "secondary", "disabled": bool(act.get("disabled"))}
         if act.get("help"):
             kwargs["help"] = act["help"]
-        if row.button(act["label"], key=act["key"], **kwargs):
+        if group.button(act["label"], key=act["key"], **kwargs):
             act["run"]()
 
 

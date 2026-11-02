@@ -82,7 +82,7 @@ against per-station headcount + throughput capacity.
   cells **seeded** by `core/sku_routing.RoutingSeeder` from the most similar
   catalog row (same family + class → same family → the facility column's
   majority → the station default), on every add path — the add-SKU form, the
-  XXX-placeholder form, the Overview's "Import N missing SKU(s)" button and
+  XXX-placeholder form, the plan guide's "➕ Import N SKU(s)" button and
   the Excel import's new rows — and each preview shows what the SKU got.
   `_machine_family` / `_machine_class` live in that module too.
 - **The plan guide:** `_render_plan_guide` in `app.py` is the one panel above

@@ -208,7 +208,7 @@ Undercarriage station on to another team — see
 — never read from the IE's Excel workbook — so a row added with them blank
 would load as the default team at every plant and miss the custom routing
 above. Every path that adds a SKU (the ➕ add-SKU form, the ➕ XXX-placeholder
-form, the Overview's **➕ Import N missing SKU(s)** button, and the Excel
+form, the plan guide's **➕ Import N SKU(s)** button, and the Excel
 import's new rows via `_append_catalog_rows`) therefore seeds the 15 cells with
 `core/sku_routing.RoutingSeeder`: for each facility column it copies the most
 common value among catalog rows of the same family *and* class

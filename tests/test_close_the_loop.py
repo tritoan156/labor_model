@@ -1,7 +1,7 @@
 """A save is in use the moment it lands, and nothing stale rides along.
 
 Catalog CSV saves (the machine / accessory editors, the add-SKU and XXX
-forms, ➕ Import N missing SKU(s), Reconciliation apply, the Excel import)
+forms, ➕ Import N SKU(s), Reconciliation apply, the Excel import)
 used to push to GitHub only: the session kept analysing the deployed copy
 until the Streamlit Cloud rebuild, while the copy promised the values were
 "in use now" and a 🔄 Refresh banner that never fires for one's own commit.

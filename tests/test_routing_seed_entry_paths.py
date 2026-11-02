@@ -3,7 +3,7 @@
 Four entry points append rows to ``data/machine_clean.csv``: the ➕ Add-SKU
 form, the ➕ XXX-placeholder form (it builds its row the same way; the
 accessory catalog it writes has no routing columns, so there the seed is a
-no-op), the Overview's **➕ Import N missing SKU(s)** button, and the Excel
+no-op), the plan guide's **➕ Import N SKU(s)** button, and the Excel
 import's new rows (``_append_catalog_rows`` under ``_save_catalog_csv``). Each
 used to write the 15 per-facility routing cells blank, so the SKU loaded as
 the default team everywhere. These tests push a row through each path with
@@ -119,7 +119,7 @@ class TestExcelImportNewRows:
 
 
 # ---------------------------------------------------------------------------
-# 2. Overview — ➕ Import N missing SKU(s)
+# 2. Plan guide — ➕ Import N SKU(s)
 # ---------------------------------------------------------------------------
 class TestImportMissingSkus:
     @pytest.fixture

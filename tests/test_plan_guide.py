@@ -98,7 +98,7 @@ class TestScheduleStep:
         step = app._guide_schedule_step(inputs, df, None)
         assert step["status"] == "warn"
         assert "**Hen Aug**" in step["fact"] and "loaded automatically" in step["help"]
-        assert "277 of 288 rows counted" in step["fact"]
+        assert "· 277 of 288 rows ·" in step["fact"]
         assert "**162 unit(s) not counted**" in step["fact"]
         assert step["details_title"].startswith("Why 277 of 288 rows?")
         assert any("11 row(s) had no BUILD QTY" in line for line in step["details"])
@@ -191,7 +191,7 @@ class TestCatalogStep:
         assert "**1 FG SKU(s)** aren't in the machine catalog" in step["help"]
         assert "**1 accessory SKU(s)** aren't in the accessory catalog" in step["help"]
         assert any("`NOPE-001`" in line for line in step["details"]), "the SKUs are in the popover"
-        assert _labels(step) == ["➕ Import 2 missing SKU(s) into the catalogs", "🏭 Open Machine catalog"]
+        assert _labels(step) == ["➕ Import 2 SKU(s)", "🏭 Open Machine catalog"]
         assert step["actions"][0]["disabled"] is False
         assert step["details_df"] is not None, "the routing preview rides in the details"
 

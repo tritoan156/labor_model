@@ -8,6 +8,10 @@ sessions for each facility — currently the workforce-availability assumptions:
     * ``absenteeism``            — share of paid time not worked (0..1)
     * ``excluded_stations``      — list of station display names to skip when
                                    sizing buildable units (not a fraction)
+    * ``support_minutes``        — minutes per unit of support work, one entry
+                                   per ``SUPPORT_FUNCTIONS`` name (receiving,
+                                   inventory counting …), charged to every unit
+                                   at the Material Handling station
 
 Persists to ``data/facility_settings.json`` on GitHub so every user / browser
 sees the same values. Same concurrency pattern as the catalog / scenario saves:
@@ -33,7 +37,9 @@ from .catalog_storage import (
     save_catalog_to_github,
     GitHubConflict,
 )
-from .constants import DEFAULT_EFFICIENCY_FACTOR, DEFAULT_SAFETY_FACTOR
+from .constants import (
+    DEFAULT_EFFICIENCY_FACTOR, DEFAULT_SAFETY_FACTOR, SUPPORT_FUNCTIONS,
+)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SETTINGS_PATH = DATA_DIR / "facility_settings.json"
@@ -86,6 +92,34 @@ def _clean_excluded(value) -> list:
     return out
 
 
+#: Upper bound for one support function's minutes per unit — a typo guard
+#: (a whole shift per unit), not a planning limit.
+SUPPORT_MINUTES_MAX = 480.0
+
+
+def clean_support_minutes(value) -> dict:
+    """Coerce a saved ``support_minutes`` value to ``{function: minutes}`` with
+    one non-negative float per ``SUPPORT_FUNCTIONS`` name (missing → 0, values
+    capped at ``SUPPORT_MINUTES_MAX``). Unknown keys and junk are dropped."""
+    src = value if isinstance(value, dict) else {}
+    out = {}
+    for name in SUPPORT_FUNCTIONS:
+        try:
+            v = float(src.get(name, 0.0))
+        except (TypeError, ValueError):
+            v = 0.0
+        if v != v or v < 0.0:  # NaN / negative
+            v = 0.0
+        out[name] = min(v, SUPPORT_MINUTES_MAX)
+    return out
+
+
+def support_minutes_per_unit(settings: dict | None) -> float:
+    """Total support minutes per unit from a facility's settings dict."""
+    return float(sum(clean_support_minutes(
+        (settings or {}).get("support_minutes")).values()))
+
+
 def load_all_facility_settings() -> dict:
     """Read facility_settings.json from local disk. Returns {} if missing/bad."""
     if not SETTINGS_PATH.exists():
@@ -113,6 +147,7 @@ def get_facility_settings(location: str) -> dict:
             out[k] = _clamp01(block[k])
     # Non-clamped list field — station display names excluded from buildable sizing.
     out["excluded_stations"] = _clean_excluded(block.get("excluded_stations", []))
+    out["support_minutes"] = clean_support_minutes(block.get("support_minutes"))
     return out
 
 
@@ -170,6 +205,13 @@ def save_facility_settings_to_github(
 
     for attempt in (1, 2):
         existing, sha = _fetch_existing_from_github(token)
+        # A caller that doesn't send support minutes keeps the saved ones
+        # rather than wiping them.
+        if "support_minutes" in (settings or {}):
+            clean["support_minutes"] = clean_support_minutes(settings["support_minutes"])
+        else:
+            prev = existing.get(location) if isinstance(existing.get(location), dict) else {}
+            clean["support_minutes"] = clean_support_minutes(prev.get("support_minutes"))
         existing[location] = clean
         new_content = json.dumps(existing, indent=2)
         try:

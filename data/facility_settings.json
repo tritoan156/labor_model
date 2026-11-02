@@ -20,6 +20,12 @@
     "overtime": 0.0,
     "efficiency": 0.5,
     "safety": 1.0,
-    "excluded_stations": []
+    "excluded_stations": [],
+    "support_minutes": {
+      "Receiving": 15.0,
+      "Inventory counting": 5.0,
+      "Internal movement": 15.0,
+      "Other support": 15.0
+    }
   }
 }

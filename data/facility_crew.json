@@ -76,9 +76,14 @@
       "Crew": 0
     },
     "Other": {
-      "HC": 6,
+      "HC": 0,
       "Conc": 0,
       "Crew": 0
+    },
+    "Material Handling": {
+      "HC": 6,
+      "Conc": 1,
+      "Crew": 1
     }
   },
   "Spartanburg": {

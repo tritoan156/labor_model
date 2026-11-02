@@ -153,16 +153,33 @@ STATION_DEFAULTS = {
     "PDI":                   (2, 2, 1),
     "QC":                    (4, 4, 1),
     "Ship":                  (1, 1, 1),
+    # Material Handling: receiving, inventory counts, internal moves and other
+    # support work, sized from the facility's support minutes per unit (see
+    # SUPPORT_FUNCTIONS). Labor-only — it has no cells, so it never carries a
+    # throughput limit. Ships unstaffed; with no support minutes saved for a
+    # facility it carries no demand and changes nothing.
+    "Material Handling":     (0, 1, 1),
 }
 
 # Internal station keys (used in code, not display)
 STATION_KEYS = [
     "Warehouse", "Wire", "Battery", "PMAcc", "GenAcc", "Undercarriage", "ComAcc",
-    "Trailer", "AccKIT", "Final", "PDI", "QC", "Ship", "ETO",
+    "Trailer", "AccKIT", "Final", "PDI", "QC", "Ship", "ETO", "MatHandling",
 ]
 
-# Non-production support roles shown in the headcount editor (e.g. leads,
-# material handlers). They are deliberately NOT stations (not in STATION_KEYS /
+# Stations whose capacity is people only. build_capacity_table skips their
+# throughput (cells) check, so Stations/Cells never limits them.
+LABOR_ONLY_STATIONS = ("MatHandling",)
+
+# Support work charged to every unit at the Material Handling station, in
+# minutes per unit, saved per facility (facility_settings.json "support_minutes").
+SUPPORT_FUNCTIONS = (
+    "Receiving", "Inventory counting", "Internal movement", "Other support",
+)
+
+# Non-production support roles shown in the headcount editor (e.g. leads;
+# material handlers whose work is sized per unit belong at the Material
+# Handling station instead). They are deliberately NOT stations (not in STATION_KEYS /
 # STATION_DEFAULTS), so build_capacity_table ignores them — they carry no labor
 # demand, throughput, or required-HC. They count only toward TOTAL headcount and
 # total available labor-hours (a cost / staffing view), never production
@@ -187,6 +204,7 @@ STATION_AREA_GROUPS = {
     "ETO":                ["ETO"],
     "Final / PDI / QC":   ["Final Assembly", "PDI", "QC"],
     "Shipping":           ["Ship"],
+    "Material handling":  ["Material Handling"],
 }
 
 # Map internal key → display name
@@ -205,6 +223,7 @@ STATION_KEY_TO_DISPLAY = {
     "QC": "QC",
     "Ship": "Ship",
     "ETO": "ETO",
+    "MatHandling": "Material Handling",
 }
 
 # === Battery type assignments ===

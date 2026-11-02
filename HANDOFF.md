@@ -82,13 +82,17 @@ against per-station headcount + throughput capacity.
   cells **seeded** by `core/sku_routing.RoutingSeeder` from the most similar
   catalog row (same family + class → same family → the facility column's
   majority → the station default), on every add path — the add-SKU form, the
-  XXX-placeholder form, the Overview's "Import N missing SKU(s)" button and
+  XXX-placeholder form, the plan guide's "➕ Import N SKU(s)" button and
   the Excel import's new rows — and each preview shows what the SKU got.
   `_machine_family` / `_machine_class` live in that module too.
 - **The plan guide:** `_render_plan_guide` in `app.py` is the one panel above
   the tab strip (schedule → month → catalog → capacity → save). Each step is
   built by a `_guide_*_step` function that returns data (fact, status,
-  action descriptors) and drawn by `_render_guide_step`; `main()` renders it
+  action descriptors, an ⓘ `help` and popover `details`) and drawn by
+  `_render_guide_step` as one plain line; ok steps without buttons fold into
+  one ✅ line (`_render_guide_done`). Step 4 states the verdict only — its
+  counts are the Overview's status line and KPIs, and the Overview doesn't
+  repeat step 4's buttons. `main()` renders it
   into a slot reserved above the Sequencer's proposal panel once every frame
   the tabs use is known. Main-panel buttons may `st.rerun()` (the sidebar is
   already built); jumps to a tab / Data & Setup view / the crew expander go

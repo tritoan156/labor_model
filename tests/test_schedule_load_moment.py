@@ -217,7 +217,7 @@ def test_pill_says_loaded_n_of_m_and_accounts_for_rows_with_no_qty(at):
     else:
         assert f"Loaded **{summary['rows']}** rows" in pill
     # The pill is one line; the skipped rows are explained once, in the plan
-    # guide's "How this file was read" expander on the main panel.
+    # guide's "Why N of M rows?" popover on the main panel.
     assert "had no BUILD QTY" not in pill
     details = " ".join(str(m.value) for m in at.main.markdown)
     if no_qty:
@@ -427,8 +427,8 @@ def test_switch_button_sits_beside_move_and_makes_an_older_month_selectable(at):
     switch = _main_button(at, "📆 Plan ")
     assert move is not None and switch is not None, [b.label for b in at.main.button]
     assert switch.label == f"📆 Plan {label} instead"
-    warning = next(w.value for w in at.main.warning if "calendar" in str(w.value))
-    assert f"plan **{label}** instead" in warning
+    line = next(str(m.value) for m in at.main.markdown if "aren't on the calendar" in str(m.value))
+    assert f"the file is dated **{label}**" in line
 
     # The sidebar builds the picker before main() loads the schedule, so the
     # schedule's own months join the list from the NEXT run on (the button

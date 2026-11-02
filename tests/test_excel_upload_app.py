@@ -70,6 +70,29 @@ class TestExcelUploadThroughApp:
         assert summary["source"] == "upload" and summary["sheet"] == "Plan"
         assert summary["rows"] == 2
 
+    def test_skipped_sheets_reach_the_pill_and_leave_with_the_upload(self):
+        family = [HEADER, ROW_B]
+        book = _workbook({
+            "Plant_Generators": family, "Plant_Archive": family,
+            "Plant_Combined": [HEADER, ROW_A, ROW_B],
+        })
+        app._load_schedule_df(
+            _upload("plan.xlsx", book, "file-n1"), location="Henderson",
+            target_month_hint=(2026, 5),
+        )
+        summary = st.session_state["_last_upload_summary"]
+        assert summary["sheet"] == "Plant_Combined"
+        assert "`Plant_Generators` (2 units)" in summary["sheet_note"]
+        assert "`Plant_Archive` (2 units, archive)" in summary["sheet_note"]
+        # A later CSV upload has no sheet, so the workbook's note goes too.
+        csv = (b"LOCATION,FG SKU ID,FG ACCRY SKU ID,BUILD QTY,PRODUCTION MONTH\n"
+               b"HENDERSON,BOSS25-010,,3,May-26\n")
+        app._load_schedule_df(
+            _upload("plan.csv", csv, "file-n2"), location="Henderson",
+            target_month_hint=(2026, 5),
+        )
+        assert st.session_state["_last_upload_summary"]["sheet_note"] == ""
+
     def test_same_workbook_on_rerun_falls_through_to_active_csv(self):
         book = _workbook({"Plan": [HEADER, ROW_A]})
         up = _upload("plan.xlsx", book, "file-2")

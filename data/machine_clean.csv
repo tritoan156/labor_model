@@ -1,7 +1,7 @@
 SKU,Description,Warehouse,Wire,Trailer,FN_Assy,PDI,QC,Ship,ETO,Bat,Last Modified,Final Station HND,Final Station SPB,Final Station CYP,AccKIT Station HND,AccKIT Station SPB,AccKIT Station CYP,PDI Station HND,PDI Station SPB,PDI Station CYP,Wire Station HND,Wire Station SPB,Wire Station CYP,Undercarriage Station HND,Undercarriage Station SPB,Undercarriage Station CYP
 BOSS125-001,"ENERGY BOSS 125 TRIPLE AXLE ELEC TRAILER 2"" BALL HITCH ASSEMBLY",10.0,60.0,210.0,45.0,60.0,60.0,30.0,0.0,1.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS125-003,"ENERGY BOSS 125 TRIPLE AXLE ELEC TRAILER 3"" RING HITCH ASSEMBLY",10.0,60.0,210.0,0.0,60.0,60.0,30.0,0.0,1.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
-BOSS125-004,"ENERGY BOSS 125 TRIPLE AXLE ELEC TRAILER 3"" BALL HITCH ASSEMBLY PROTOTYPE",10.0,60.0,210.0,120.0,90.0,60.0,30.0,0.0,1.0,2026-08-04,Final,Final,Final,GenAcc,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
+BOSS125-004,"ENERGY BOSS 125 TRIPLE AXLE ELEC TRAILER 3"" BALL HITCH ASSEMBLY PROTOTYPE",10.0,60.0,210.0,120.0,90.0,60.0,30.0,480.0,1.0,2026-11-02,Final,Final,Final,GenAcc,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS125-50,ENERGY BOSS 125KVA 100KW OUTPUT 50KWH ASSEMBLY,10.0,60.0,210.0,0.0,60.0,60.0,30.0,0.0,1.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS125HS-001,ENERGY BOSS 125 HEAD SKID ASSEMBLY,10.0,60.0,0.0,0.0,60.0,60.0,30.0,0.0,1.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
 BOSS125HT-001,"ENERGY BOSS 125 HEAD DUAL AXLE TRAILER 2"" BALL HITCH ASSEMBLY",10.0,60.0,180.0,0.0,60.0,60.0,30.0,0.0,1.0,2026-05-26,Final,Final,Final,AccKIT,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
@@ -206,3 +206,5 @@ PDS400S XXX,PDS400S ESTIMATION ASSEMBLY,5.0,0.0,0.0,335.0,15.0,30.0,30.0,0.0,0.0
 10250,,,,,,,,,,,2026-09-03,,,,,,,,,,,,,,,
 10269,,,,,,,,,,,2026-09-03,,,,,,,,,,,,,,,
 PDSF375DPC XXX,PDSF375DPC ESTIMATION ASSEMBLY,5.0,0.0,0.0,355.0,15.0,30.0,30.0,0.0,0.0,2026-09-03,,,,,,,,,,,,,,,
+6000000003,,,,,,,,,,,2026-10-28,Final,Final,Final,GenAcc,AccKIT,GenAcc,PDI,PDI,GenAcc,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage
+BOSS220-002,,,,,,,,,,,2026-10-28,Final,Final,Final,GenAcc,AccKIT,AccKIT,PDI,PDI,PDI,Wire,Wire,Wire,Undercarriage,Undercarriage,Undercarriage

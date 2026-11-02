@@ -1,7 +1,7 @@
 {
   "Henderson": {
     "Warehouse (Pick)": {
-      "HC": 2,
+      "HC": 0,
       "Conc": 3,
       "Crew": 1
     },
@@ -66,7 +66,7 @@
       "Crew": 1
     },
     "Ship": {
-      "HC": 2,
+      "HC": 0,
       "Conc": 3,
       "Crew": 1
     },
@@ -76,9 +76,14 @@
       "Crew": 0
     },
     "Other": {
-      "HC": 6,
+      "HC": 0,
       "Conc": 0,
       "Crew": 0
+    },
+    "Material Handling": {
+      "HC": 10,
+      "Conc": 1,
+      "Crew": 1
     }
   },
   "Spartanburg": {

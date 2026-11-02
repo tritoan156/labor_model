@@ -156,6 +156,16 @@ Every save — catalog cells, added SKUs, imports, crew, settings, schedules —
 
 ---
 
+## Material handling (support work)
+
+Receiving, inventory counting, internal movement and other support work isn't in the catalogs, so it's sized as **minutes per unit** in the sidebar (**⏱️ Working-time settings → 📦 Material handling**), one number per function, saved per facility with **💾 Save planning assumptions**. Every unit carries the total at the **Material Handling** station, which you staff in **👥 Station headcount** like any other station: the Capacity tab shows its people needed, gap and labor used %, and it counts in "need N people, have M". It is labor only — Stations/Cells never limit it. A facility with no minutes saved puts no load on it; one with minutes but nobody on the station can build nothing, the same as any unstaffed station.
+
+**Material Handling also does** (same place, saved the same way) hands **Warehouse (Pick)** and/or **Ship** to the Material Handling team: their catalog minutes per unit move to Material Handling and those stations carry no load — move their people over in 👥 Station headcount.
+
+Henderson (Nov 2026): 15 receiving + 5 counting + 15 internal movement + 15 other = 50 min/unit, plus Warehouse (Pick) and Ship, staffed by 10 people — the 6 listed as **Other** plus the 2 pickers and 2 shippers.
+
+---
+
 ## Export & link to Excel
 
 **📁 Data & Setup → 📤 Export & Excel link** gives three ways to get the data out:
@@ -189,7 +199,7 @@ The reader and the diff live in `core/excel_io.py` (`read_catalog_workbook`, `di
 | `item_master.csv` | Items catalog — defaults + family variants + per-accessory entries |
 | `item_packages.csv` | Named bundles (CWP / NE / AWP) |
 | `facility_crew.json` | Per-facility station headcount (HC / Stations / Crew) |
-| `facility_settings.json` | Per-facility planning assumptions (new-hire share & productivity, absenteeism, overtime, efficiency, safety, excluded stations) |
+| `facility_settings.json` | Per-facility planning assumptions (new-hire share & productivity, absenteeism, overtime, efficiency, safety, excluded stations, material-handling minutes per unit) |
 | `scenarios.json` | Saved manual-entry build plans |
 | `exec_scenarios.json` | Saved Executive Summary snapshots (assumptions + computed metrics, per facility) |
 | `uploaded_schedules.json` | Saved uploaded CSVs (per facility) |

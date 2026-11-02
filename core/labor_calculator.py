@@ -10,7 +10,8 @@ import numpy as np
 from .constants import (
     FINAL_LABOR, HS_FINAL_CREW, DEFAULT_NAMEPLATE_PREP, DEFAULT_BATT_RAW,
     ETO_LABOR_PER_UNIT, STATION_KEY_TO_DISPLAY, STATION_KEYS,
-    BATTERY_CYCLE_MINUTES, get_battery_type,
+    BATTERY_CYCLE_MINUTES, LABOR_ONLY_STATIONS, MH_FOLDABLE_STATIONS,
+    get_battery_type,
     UTIL_THRESHOLD_OVER, UTIL_THRESHOLD_NEAR, UTIL_THRESHOLD_TIGHT,
 )
 
@@ -363,12 +364,25 @@ def unit_labor_split(fg_base: str, acc_sku: str | None,
 
 def expand_schedule(schedule_df: pd.DataFrame,
                      machine_df: pd.DataFrame,
-                     acc_df: pd.DataFrame) -> pd.DataFrame:
+                     acc_df: pd.DataFrame,
+                     support_minutes_per_unit: float = 0.0,
+                     mh_folded_stations=()) -> pd.DataFrame:
     """Expand schedule rows into per-unit records with labor attached.
 
     Returns DataFrame with one row per individual unit (qty=1 each), columns
     include: unit_id, fg_base, fg_raw, decal, acc, customer, carryover,
-    Class, Bat, Warehouse..., Final, PDI, QC, Ship, ETO, total_labor.
+    Class, Bat, Warehouse..., Final, PDI, QC, Ship, ETO, MatHandling,
+    total_labor.
+
+    ``support_minutes_per_unit`` is the facility's support work (receiving,
+    inventory counts, internal moves …) charged to every unit at the
+    Material Handling station. It isn't in the catalogs: it's the same for
+    every SKU and comes from the facility's saved settings.
+
+    ``mh_folded_stations`` names stations (keys from ``MH_FOLDABLE_STATIONS``)
+    the facility's Material Handling team also does: each unit's catalog
+    minutes there move to ``MatHandling`` and the station keeps none.
+    ``total_labor`` is unchanged by the move.
 
     Two helper lists are attached to the returned DataFrame as attributes so
     callers can surface data-quality warnings without breaking the existing
@@ -389,6 +403,13 @@ def expand_schedule(schedule_df: pd.DataFrame,
     skipped_fg: set[str] = set()
     unknown_acc: set[str] = set()
     acc_index = set(acc_df.index) if acc_df is not None else set()
+    try:
+        support = max(0.0, float(support_minutes_per_unit or 0.0))
+    except (TypeError, ValueError):
+        support = 0.0
+    if support != support:  # NaN
+        support = 0.0
+    folded = [s for s in MH_FOLDABLE_STATIONS if s in set(mh_folded_stations or ())]
     for _, r in schedule_df.iterrows():
         qty = int(r["BUILD QTY"])
         fg_base = r.get("FG_BASE")
@@ -398,6 +419,10 @@ def expand_schedule(schedule_df: pd.DataFrame,
             if fg_base:
                 skipped_fg.add(str(fg_base))
             continue
+        labor = dict(labor, MatHandling=support)
+        for st in folded:
+            labor["MatHandling"] += float(labor.get(st, 0) or 0)
+            labor[st] = 0.0
         # The unit kept — note any accessory we couldn't resolve so the
         # planner knows the labor at PMAcc/GenAcc/ComAcc/AccKIT/Battery is
         # zero by default, not measured.
@@ -433,6 +458,11 @@ def station_demand_table(units_df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for st in STATION_KEYS:
         col = st
+        if col not in units_df.columns:
+            # A unit table built before Material Handling existed (or by hand
+            # in a test) simply has no support labor.
+            rows.append({"station": st, "demand": 0.0, "units_touching": 0})
+            continue
         demand = float(units_df[col].sum())
         units_touching = int((units_df[col] > 0).sum())
         rows.append({"station": st, "demand": demand, "units_touching": units_touching})
@@ -551,15 +581,20 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
             # Total batteries = sum of Bat counts for units that route through Battery
             batt_count = int((units_df.loc[units_df["Battery"] > 0, "Bat"]).sum())
             count_for_table = batt_count
-        else:
+        elif st_key in units_df.columns:
             avg_cycle = weighted_avg_cycle(units_df, st_key, crew)
             count_for_table = units_touching
+        else:
+            avg_cycle = 0.0
+            count_for_table = units_touching
 
+        labor_only = st_key in LABOR_ONLY_STATIONS
         need_per_day = count_for_table / working_days if working_days > 0 else 0
-        if avg_cycle > 0:
+        if avg_cycle > 0 and not labor_only:
             thru_cap_raw = conc * (effective_shift / avg_cycle)
             thru_cap_safe = thru_cap_raw * efficiency_factor * safety_factor
         else:
+            # No cells to fill (or no work here): throughput never limits it.
             thru_cap_raw = thru_cap_safe = 0
 
         labor_util_safe = labor_demand / labor_cap_safe if labor_cap_safe > 0 else 0
@@ -576,7 +611,8 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
         # 🟢. Flag it 🔴, mirroring the "missing station + demand" rule. This
         # happens when Conc=0 (no concurrent bays — user-editable down to 0 in
         # the crew panel) or avg_cycle<=0 (e.g. an invalid Crew=0 config).
-        thru_blocked = ((conc == 0 or avg_cycle <= 0) and need_per_day > 0)
+        thru_blocked = ((conc == 0 or avg_cycle <= 0) and need_per_day > 0
+                        and not labor_only)
 
         rows.append({
             "station_display": st_disp,
@@ -709,7 +745,8 @@ def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame,
         need_per_day = float(row.get("need_per_day", 0) or 0)
         conc = int(row.get("Conc", 0) or 0)
         avg_cycle = float(row.get("avg_cycle", 0) or 0)
-        if need_per_day > 0 and (conc <= 0 or avg_cycle <= 0):
+        labor_only = row.get("station_key") in LABOR_ONLY_STATIONS
+        if need_per_day > 0 and (conc <= 0 or avg_cycle <= 0) and not labor_only:
             return float("inf"), "throughput"
         lu = float(row.get("labor_util_safe", 0) or 0)
         tu = float(row.get("thru_util_safe", 0) or 0)

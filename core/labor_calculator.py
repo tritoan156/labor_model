@@ -796,6 +796,169 @@ def buildable_by_line(units_df: pd.DataFrame, capacity: pd.DataFrame,
 
 
 # ---------------------------------------------------------------
+# Priority staffing — spread a fixed headcount for the most output
+# ---------------------------------------------------------------
+
+def balance_headcount(units_df: pd.DataFrame, crew_config: pd.DataFrame,
+                      total_people: int, shift_minutes: int, working_days: int,
+                      safety_factor: float, efficiency_factor: float = 1.0,
+                      new_hire_pct: float = 0.0,
+                      new_hire_productivity: float = 1.0,
+                      absenteeism: float = 0.0, overtime: float = 0.0,
+                      priority_lines=("EBOSS", "PM"),
+                      excluded_stations=None) -> dict:
+    """Spread ``total_people`` over the stations for the most output, priority
+    lines first.
+
+    Each production line (see :func:`classify_fg_category`) keeps its planned
+    SKU mix and is built at a *share* of its plan. Shares rise together,
+    priority lines first: every priority line climbs at the same pace until
+    something stops it — the people run out, or a station's cells can't
+    push more through — and is then held there while the rest keep
+    climbing (up to 100 % of plan). Only then do the other lines climb the
+    same way with whoever is left. So a line is never held back by a limit
+    that only another line has.
+
+    A station needs ``ceil(minutes / minutes per person)`` people for the
+    work routed to it — the same minutes per person
+    :func:`build_capacity_table` uses — and its cells must push the units
+    through each day (labor-only stations have no such limit). Cells are
+    taken from ``crew_config`` as they are. People left over once every
+    line has stopped (cells full, or the plan covered) go one at a time to
+    the station working hardest.
+
+    ``excluded_stations`` (display names) still get people for their work,
+    but their cells never stop a line — the meaning they have in
+    :func:`buildable_by_line`.
+
+    Returns ``{"hc": {station: people}, "lines": [{line, planned, units,
+    share, priority, limit}], "used", "spare", "spare_at": {station: n}}``.
+    ``limit`` says what stopped a line short of its plan: ``"people"`` or
+    the station whose cells are full ("" when the line is fully covered).
+    """
+    total_people = max(0, int(total_people or 0))
+    excluded = {str(s).strip() for s in (excluded_stations or [])}
+    priority = {str(p) for p in (priority_lines or ())}
+    empty = {"hc": {}, "lines": [], "used": 0, "spare": total_people, "spare_at": {}}
+    if (units_df is None or units_df.empty or crew_config is None
+            or crew_config.empty or working_days <= 0):
+        return empty
+
+    # Cells and cycle times don't depend on headcount, so one capacity table
+    # at any crew gives every station's units/day ceiling.
+    cap = build_capacity_table(
+        units_df, crew_config, shift_minutes, working_days, safety_factor,
+        efficiency_factor, new_hire_pct=new_hire_pct,
+        new_hire_productivity=new_hire_productivity, absenteeism=absenteeism,
+        overtime=overtime)
+    effective_shift = shift_minutes * (1.0 + max(0.0, float(overtime or 0.0)))
+    per_person = (effective_shift * working_days * efficiency_factor * safety_factor
+                  * labor_availability_factor(new_hire_pct, new_hire_productivity,
+                                              absenteeism))
+    if per_person <= 0:
+        return empty
+
+    line_of = units_df["fg_base"].map(classify_fg_category)
+    lines = sorted(set(line_of))
+    planned = {ln: int((line_of == ln).sum()) for ln in lines}
+    # Per station: minutes and units (batteries at Battery) each line sends
+    # there at its full plan, and the cells' units/day ceiling (None = none).
+    stations = []
+    for st_key in STATION_KEYS:
+        disp = STATION_KEY_TO_DISPLAY[st_key]
+        if disp not in crew_config.index or st_key not in units_df.columns:
+            continue
+        mins = units_df[st_key].astype(float)
+        if mins.sum() <= 0:
+            continue
+        if st_key == "Battery":
+            count = units_df["Bat"].where(mins > 0, 0).astype(float)
+        else:
+            count = (mins > 0).astype(float)
+        demand = {ln: float(mins[line_of == ln].sum()) for ln in lines}
+        flow = {ln: float(count[line_of == ln].sum()) for ln in lines}
+        ceiling = None
+        if st_key not in LABOR_ONLY_STATIONS and disp not in excluded and disp in cap.index:
+            ceiling = float(cap.loc[disp, "thru_cap_safe"] or 0.0)
+        stations.append((disp, demand, flow, ceiling))
+
+    def people_at(shares):
+        return {d: int(math.ceil(round(sum(shares[ln] * dm[ln] for ln in lines)
+                                       / per_person, 9)))
+                for d, dm, _f, _c in stations}
+
+    def full_cells(shares):
+        """First station whose cells can't push ``shares`` through, else ""."""
+        for d, _dm, fl, ceiling in stations:
+            if ceiling is None:
+                continue
+            per_day = sum(shares[ln] * fl[ln] for ln in lines) / working_days
+            if per_day > ceiling * (1 + 1e-9) + 1e-12:
+                return d
+        return ""
+
+    def fits(shares):
+        return not full_cells(shares) and sum(people_at(shares).values()) <= total_people
+
+    shares = {ln: 0.0 for ln in lines}
+    limit = {ln: "" for ln in lines}
+    nudge = 1e-6
+    for tier in ([ln for ln in lines if ln in priority],
+                 [ln for ln in lines if ln not in priority]):
+        active = list(tier)
+        level = 0.0
+        while active:
+            def at(t, _active=tuple(active)):
+                return {**shares, **{ln: t for ln in _active}}
+            if fits(at(1.0)):
+                level = 1.0
+            else:
+                lo, hi = level, 1.0
+                for _ in range(50):
+                    mid = (lo + hi) / 2
+                    lo, hi = (mid, hi) if fits(at(mid)) else (lo, mid)
+                level = lo
+            shares.update(at(level))
+            stopped = []
+            for ln in active:
+                if shares[ln] >= 1.0:
+                    stopped.append(ln)
+                    continue
+                trial = {**shares, ln: min(1.0, shares[ln] + nudge)}
+                if not fits(trial):
+                    limit[ln] = full_cells(trial) or "people"
+                    stopped.append(ln)
+            active = [ln for ln in active if ln not in stopped] if stopped else []
+
+    hc = people_at(shares)
+    used = sum(hc.values())
+
+    # Leftover people: one at a time to the station working hardest.
+    spare_at: dict = {}
+    load = {d: sum(shares[ln] * dm[ln] for ln in lines) for d, dm, _f, _c in stations}
+    busy = [d for d in hc if load[d] > 0]
+    for _ in range(total_people - used if busy else 0):
+        d = max(busy, key=lambda s: load[s] / ((hc[s] or 1e-9) * per_person))
+        hc[d] += 1
+        spare_at[d] = spare_at.get(d, 0) + 1
+    for disp in crew_config.index:
+        if disp not in hc and disp in cap.index:
+            hc[disp] = 0
+
+    return {
+        "hc": hc,
+        "lines": [{"line": ln, "planned": planned[ln],
+                   "units": int(math.floor(round(shares[ln] * planned[ln], 9))),
+                   "share": shares[ln], "priority": ln in priority,
+                   "limit": limit[ln]}
+                  for ln in lines],
+        "used": used,
+        "spare": total_people - used,
+        "spare_at": spare_at,
+    }
+
+
+# ---------------------------------------------------------------
 # Executive summary (monthly labor roll-up, mirrors legacy spreadsheet)
 # ---------------------------------------------------------------
 

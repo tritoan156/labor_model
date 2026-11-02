@@ -105,6 +105,8 @@ _stale = (
     or not hasattr(core.data_loader, "_excel_serial_month")
     # A workbook upload picks the whole-plan sheet and names the others.
     or not hasattr(core.excel_io, "read_schedule_workbook")
+    # What-if ⚖️ Balance people — app.py imports it directly.
+    or not hasattr(core.labor_calculator, "balance_headcount")
 )
 if _stale:
     # Reload in DEPENDENCY ORDER: constants first (every other module imports
@@ -174,7 +176,7 @@ from core.labor_calculator import (
     expand_schedule, build_capacity_table,
     battery_demand_by_sku, battery_demand_by_type,
     compute_unit_labor, unit_labor_split,
-    buildable_by_line,
+    buildable_by_line, balance_headcount, classify_fg_category,
     executive_summary, adjusted_efficiency,
 )
 from core.constants import (
@@ -8204,7 +8206,27 @@ def _whatif_keys(location: str) -> dict:
         "days": f"whatif_days_{location}",       # the working-days widget
         "note": f"_whatif_note_{location}",      # what the last helper did
         "applied": f"_whatif_applied_{location}",  # 📋 Apply's confirmation
+        "people": f"whatif_people_{location}",   # ⚖️ Balance: total people widget
+        "priority": f"whatif_priority_{location}",  # ⚖️ Balance: lines first
+        "plan": f"_whatif_plan_{location}",      # ⚖️ Balance: the last result
     }
+
+
+#: How the ⚖️ Balance controls name the production lines
+#: (core.labor_calculator.classify_fg_category); EBOSS carries the hybrids and
+#: the ETO-built EBOSS125-CAT, Power Module carries most of the ETO work.
+_WHATIF_LINE_LABELS = {
+    "EBOSS": "EBOSS (Hybrid, ETO CAT)",
+    "PM": "Power Module",
+    "Generator": "Generator",
+    "Compressor": "Compressor",
+    "Other": "Other",
+}
+_WHATIF_DEFAULT_PRIORITY = ("EBOSS", "PM")
+
+
+def _whatif_line_label(line: str) -> str:
+    return _WHATIF_LINE_LABELS.get(line, line)
 
 
 def _whatif_display(crew_config: pd.DataFrame) -> pd.DataFrame:
@@ -8304,6 +8326,48 @@ def _whatif_cells_to_fit(scenario: pd.DataFrame, capacity: pd.DataFrame) -> pd.D
     return out
 
 
+def _whatif_balance(scenario: pd.DataFrame, crew_config: pd.DataFrame,
+                    units: pd.DataFrame, days: int, inputs: dict,
+                    total_people: int, priority_lines) -> "tuple[pd.DataFrame, dict]":
+    """⚖️ Balance: spread ``total_people`` over the scenario's stations for the
+    most output, ``priority_lines`` first, with the scenario's cells and
+    working days and every other setting from the sidebar. Returns the
+    scenario with People rewritten and the plan
+    (:func:`core.labor_calculator.balance_headcount`)."""
+    crew = _whatif_crew(scenario, crew_config)
+    plan = balance_headcount(
+        units, crew, int(total_people), inputs["shift"], int(days),
+        inputs["safety"], inputs["efficiency"],
+        new_hire_pct=inputs.get("new_hire_pct", 0.0),
+        new_hire_productivity=inputs.get("new_hire_productivity", 1.0),
+        absenteeism=inputs.get("absenteeism", 0.0),
+        overtime=inputs.get("overtime", 0.0),
+        priority_lines=tuple(priority_lines or ()),
+        excluded_stations=inputs.get("excluded_stations") or [],
+    )
+    out = scenario.copy()
+    for station in out.index:
+        out.loc[station, "People"] = int(plan["hc"].get(station, 0))
+    return out, plan
+
+
+def _whatif_plan_table(plan: dict) -> pd.DataFrame:
+    """The ⚖️ Balance result, one row per line, priority lines first."""
+    rows = []
+    for r in sorted(plan.get("lines", []), key=lambda r: (not r["priority"], r["line"])):
+        limit = r.get("limit") or ""
+        rows.append({
+            "Line": _whatif_line_label(r["line"]),
+            "First": "⭐" if r["priority"] else "",
+            "Units planned": int(r["planned"]),
+            "Units built": int(r["units"]),
+            "% of plan": round(100 * float(r["share"])),
+            "Stopped by": ("people" if limit == "people"
+                           else f"{limit} cells" if limit else "— (plan covered)"),
+        })
+    return pd.DataFrame(rows)
+
+
 def _whatif_understaffed(scenario: pd.DataFrame, capacity: pd.DataFrame) -> list[str]:
     """Stations whose throughput assumes more people than the scenario has:
     every cell running at once needs Cells × Crew per unit."""
@@ -8332,8 +8396,27 @@ def _whatif_button(location: str, units: pd.DataFrame, inputs: dict, action: str
     if action == "reset":
         scenario = current
         st.session_state[keys["days"]] = int(inputs["days"])
+        st.session_state.pop(keys["plan"], None)
         note = "↩️ Scenario reset to the current crew and working days."
+    elif action == "balance":
+        days = int(st.session_state.get(keys["days"]) or inputs["days"])
+        total = int(st.session_state.get(keys["people"]) or 0)
+        first = list(st.session_state.get(keys["priority"]) or [])
+        scenario, plan = _whatif_balance(scenario, inputs["crew_config"], units,
+                                         days, inputs, total, first)
+        built = sum(r["units"] for r in plan["lines"])
+        st.session_state[keys["plan"]] = {
+            "plan": plan, "people": total, "days": days, "priority": first,
+        }
+        spare = int(plan["spare"])
+        note = (f"⚖️ {total} people spread for the most output at {days} working "
+                f"days{' — ' + ', '.join(_whatif_line_label(x) for x in first) + ' first' if first else ''}: "
+                f"**{built:,} units**. "
+                + (f"{spare} of them have nothing to add (cells are full or the "
+                   "plan is covered) and went to the busiest stations as buffer."
+                   if spare > 0 else "Every person is used."))
     else:
+        st.session_state.pop(keys["plan"], None)
         days = int(st.session_state.get(keys["days"]) or inputs["days"])
         cap = _whatif_capacity(units, _whatif_crew(scenario, inputs["crew_config"]), days, inputs)
         if action == "staff":
@@ -8413,9 +8496,50 @@ def _render_whatif_simulator(units: pd.DataFrame, inputs: dict, *,
     b3.button("↩️ Reset to current", key=f"whatif_reset_{location}", width="stretch",
               on_click=_whatif_button, args=(location, units, inputs, "reset"),
               help="Back to the sidebar's crew and working days.")
+
+    # ⚖️ Balance — a fixed headcount spread over the stations for the most
+    # output, chosen lines first (core.labor_calculator.balance_headcount).
+    lines_here = sorted({classify_fg_category(f) for f in units["fg_base"]}) \
+        if "fg_base" in units.columns else []
+    if keys["people"] not in st.session_state:
+        st.session_state[keys["people"]] = int(current["People"].sum())
+    if keys["priority"] not in st.session_state:
+        st.session_state[keys["priority"]] = [
+            x for x in _WHATIF_DEFAULT_PRIORITY if x in lines_here]
+    else:
+        st.session_state[keys["priority"]] = [
+            x for x in st.session_state[keys["priority"]] if x in lines_here]
+    p1, p2, p3 = st.columns([1, 2, 1])
+    p1.number_input(
+        "Total people", min_value=0, max_value=999, step=1, key=keys["people"],
+        help="Everyone on the stations, Material Handling included (Lead / "
+             "Other aren't stations and aren't spread).")
+    p2.multiselect(
+        "Build these lines first", options=lines_here, key=keys["priority"],
+        format_func=_whatif_line_label,
+        help="These lines get people until they're fully covered or something "
+             "stops them; the other lines share whoever is left. Leave empty to "
+             "raise every line together.")
+    p3.button("⚖️ Balance people", key=f"whatif_balance_{location}", width="stretch",
+              on_click=_whatif_button, args=(location, units, inputs, "balance"),
+              help="Rewrites People in the scenario below for the most output "
+                   "with these people, the scenario's cells and working days.")
+
     note = st.session_state.pop(keys["note"], None)
     if note:
         st.caption(note)
+    last = st.session_state.get(keys["plan"])
+    if isinstance(last, dict) and last.get("plan", {}).get("lines"):
+        st.markdown(
+            f"**⚖️ Build plan — {last['people']} people, {last['days']} working "
+            "days.** Units each line gets when people go to the starred lines "
+            "first; a line stops at its plan, at full cells, or when the people "
+            "run out.")
+        st.dataframe(_whatif_plan_table(last["plan"]), width="stretch", hide_index=True,
+                     column_config={"% of plan": st.column_config.NumberColumn(format="%d%%")})
+        st.caption(
+            "Max units and the line table further down keep every line at its "
+            "planned mix, so they can differ from this plan.")
 
     days = st.number_input(
         "Working days in the scenario", min_value=1, max_value=31, step=1,

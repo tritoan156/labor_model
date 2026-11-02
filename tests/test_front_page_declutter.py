@@ -69,6 +69,49 @@ def test_overview_visuals_are_one_at_a_time(at):
 
 
 # ---------------------------------------------------------------------------
+# The By week heatmap
+# ---------------------------------------------------------------------------
+def test_weekly_heatmap_prices_material_handling_like_the_month():
+    """The cached wrapper rebuilt the helper's inputs without the Material
+    Handling pair, so every week ran with no support minutes: the heatmap
+    showed Material Handling at 0% while its station card said 82%."""
+    from core.constants import week_of_month
+    machine_df = app._load_machine_df(0.0)
+    acc_df = app._load_acc_df(0.0)
+    rows = []
+    for day in ("2026-11-03", "2026-11-10"):
+        ts = pd.Timestamp(day)
+        rows += [{
+            "FG_RAW": "BOSS25-010", "FG_BASE": "BOSS25-010", "ACC": "BOSS25-A016",
+            "BUILD QTY": 1, "CARRYOVER": False, "DECAL": "", "CUSTOMER NAME": "",
+            "PRODUCTION DAY": ts, "WEEK_OF_MONTH": week_of_month(ts.date()),
+        }] * 5
+    full = pd.DataFrame(rows)
+    crew = pd.DataFrame(
+        {"HC": [4, 2], "Conc": [4, 0], "Crew": [1, 1]},
+        index=["PDI", "Material Handling"],
+    )
+    inputs = {
+        "crew_config": crew, "shift": 480, "days": 20, "safety": 1.0,
+        "efficiency": 1.0, "new_hire_pct": 0.0, "new_hire_productivity": 1.0,
+        "absenteeism": 0.0, "overtime": 0.0,
+        "support_minutes_per_unit": 30.0, "mh_folded_stations": ("Ship",),
+    }
+    direct = app._compute_weekly_utilization(full, machine_df, acc_df, inputs)
+    via_cache = app._weekly_utilization_for(full, machine_df, acc_df, inputs)
+    assert direct is not None
+    assert (direct.loc["Material Handling"] > 0).all(), direct.loc["Material Handling"]
+    pd.testing.assert_frame_equal(via_cache, direct)
+
+
+def test_week_span_labels_name_the_working_days():
+    # November 2026 opens on a Sunday: week 1 has no working day, week 6 one.
+    assert app._month_week_span(2026, 11, 1) == ""
+    assert app._month_week_span(2026, 11, 2) == "Nov 2–6"
+    assert app._month_week_span(2026, 11, 6) == "Nov 30"
+
+
+# ---------------------------------------------------------------------------
 # The guide's catalog step in manual mode (bare mode, like test_plan_guide)
 # ---------------------------------------------------------------------------
 @pytest.fixture

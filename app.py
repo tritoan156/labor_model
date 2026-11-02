@@ -1915,6 +1915,20 @@ def _month_week_label(year: int, month: int, week: int, with_month: bool) -> str
     return f"{calendar.month_abbr[int(month)]} Wk {week}" if with_month else f"Wk {week}"
 
 
+def _month_week_span(year: int, month: int, week: int) -> str:
+    """The M–F working days a month-week covers — ``Nov 2–6``, or ``Nov 30``
+    for a one-day week — or ``""`` when it has none. Printed under the heatmap's
+    ``Wk N`` labels: a month that opens on a weekend starts at "Wk 2", which
+    reads like a missing week without its dates."""
+    days = [d for d in _working_days_in_month(int(year), int(month))
+            if week_of_month(d) == int(week)]
+    if not days:
+        return ""
+    first, last = days[0], days[-1]
+    mon = calendar.month_abbr[int(month)]
+    return f"{mon} {first.day}" if first == last else f"{mon} {first.day}–{last.day}"
+
+
 def _first_working_day_of_week(year: int, month: int, week: int) -> pd.Timestamp:
     """First M–F working day of week ``week`` in (year, month); the month's
     first working day when that week has none (a weekend-only week 1)."""
@@ -6314,7 +6328,8 @@ def _compute_weekly_utilization_cached(schedule_df_full, machine_df, acc_df,
                                        crew_config, shift_minutes, safety_factor,
                                        efficiency_factor, new_hire_pct,
                                        new_hire_productivity, absenteeism,
-                                       overtime):
+                                       overtime, support_minutes_per_unit=0.0,
+                                       mh_folded_stations=()):
     """Content-keyed cache around _compute_weekly_utilization.
 
     The helper expands the schedule once per week and prices each slice, so
@@ -6322,7 +6337,10 @@ def _compute_weekly_utilization_cached(schedule_df_full, machine_df, acc_df,
     times over (~0.3 s per rerun, for an Overview chart whose inputs rarely
     change). Hashing them once here turns a rerun into a single lookup. The
     scalars are passed positionally (same shape as _build_capacity_table_cached)
-    so every distinct sidebar setting is its own key."""
+    so every distinct sidebar setting is its own key. The Material Handling
+    pair must be passed too: without it every week was priced with no support
+    minutes and nothing folded, so the heatmap showed Material Handling at 0%
+    while its station card said 82%."""
     return _compute_weekly_utilization(schedule_df_full, machine_df, acc_df, {
         "crew_config": crew_config,
         "shift": shift_minutes,
@@ -6332,6 +6350,8 @@ def _compute_weekly_utilization_cached(schedule_df_full, machine_df, acc_df,
         "new_hire_productivity": new_hire_productivity,
         "absenteeism": absenteeism,
         "overtime": overtime,
+        "support_minutes_per_unit": support_minutes_per_unit,
+        "mh_folded_stations": mh_folded_stations,
     })
 
 
@@ -6346,6 +6366,8 @@ def _weekly_utilization_for(schedule_df_full, machine_df, acc_df, inputs):
         inputs.get("new_hire_productivity", 1.0),
         inputs.get("absenteeism", 0.0),
         inputs.get("overtime", 0.0),
+        float(inputs.get("support_minutes_per_unit", 0.0) or 0.0),
+        tuple(inputs.get("mh_folded_stations", ()) or ()),
     )
 
 
@@ -7220,13 +7242,24 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     # weekly heatmap side-by-side with the current one so the comparison
     # is glanceable.
     # =============================================================
+    # The heatmaps and the station cards describe the same stations: one the
+    # plan doesn't use (⚪ N/A) is left out of both, and one with demand but
+    # no people is a grey "no staff" cell — its 0% would paint it green.
+    _unused = capacity[capacity["overall_status"] == "⚪ N/A"].index.tolist()
+    _unstaffed = set(no_station_list)
+
     def _make_heatmap(df_util, title=None):
+        z = df_util.loc[[s for s in df_util.index if s not in _unused]].astype(float)
+        text = [
+            ["no staff" if s in _unstaffed else f"{v:.0%}" for v in z.loc[s]]
+            for s in z.index
+        ]
+        z.loc[[s for s in z.index if s in _unstaffed]] = float("nan")
         # Clip the color scale at 1.5× so spikes don't wash out the lower end.
         # zmin=0 keeps green visible; zmax=1.5 means anything ≥150% looks
         # the same deep red — which is fine since that's "definitely red".
         fig = px.imshow(
-            df_util,
-            text_auto=".0%",
+            z,
             color_continuous_scale=[
                 (0.00, "#16A34A"),  # green
                 (0.60, "#A3E635"),  # light green
@@ -7236,10 +7269,36 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             ],
             zmin=0, zmax=1.5,
             aspect="auto",
-            labels={"x": "Week", "y": "Station", "color": "Util %"},
         )
+        fig.update_traces(
+            text=text, texttemplate="%{text}",
+            hovertemplate="%{y} · %{x}: %{text}<extra></extra>",
+        )
+        # The "no staff" cells are NaN in the colored layer; a flat grey layer
+        # under it fills exactly those cells (a grey plot background framed
+        # the whole chart instead).
+        if _unstaffed & set(z.index):
+            fig.add_trace(go.Heatmap(
+                z=[[1.0 if s in _unstaffed else None for _ in z.columns] for s in z.index],
+                x=list(z.columns), y=list(z.index),
+                colorscale=[(0, "#D1D5DB"), (1, "#D1D5DB")], showscale=False,
+                hoverinfo="skip",
+            ))
+            fig.data = (fig.data[1], fig.data[0])
+        # "Wk 2" over "Nov 2–6": the dated months are the ones main() found
+        # on PRODUCTION DAY, the same rows the weekly columns come from.
+        _months = st.session_state.get(SCHEDULE_DATED_MONTHS_KEY) or []
+        _spans = {
+            _month_week_label(y, m, w, len(_months) > 1): _month_week_span(y, m, w)
+            for y, m in _months for w in range(1, 7)
+        }
+        fig.update_xaxes(
+            title=None, tickmode="array", tickvals=list(z.columns),
+            ticktext=[f"{c}<br>{_spans[c]}" if _spans.get(c) else c for c in z.columns],
+        )
+        fig.update_yaxes(title=None)
         layout = dict(
-            height=min(400, 60 + 28 * max(len(df_util.index), 1)),
+            height=min(400, 70 + 28 * max(len(z.index), 1)),
             margin=dict(l=4, r=4, t=40 if title else 8, b=4),
             coloraxis_showscale=False,
         )
@@ -7392,7 +7451,6 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
             "🟡 TIGHT":      ("#F2D75D", "#333"),
             "🟢 OK":         ("#70AD47", "white"),
         }
-        _unused = capacity[capacity["overall_status"] == "⚪ N/A"].index.tolist()
         stations_to_show = [s for s in capacity.index if s not in _unused]
         for i in range(0, len(stations_to_show), 4):
             cols = st.columns(4)
@@ -7400,7 +7458,12 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
                 row = capacity.loc[st_name]
                 status = row["overall_status"]
                 bg, fg = color_map.get(status, ("#EEEEEE", "#333"))
-                util_pct = row["labor_util_safe"] * 100 if not row.get("station_missing") else 0
+                # An unstaffed station has demand but no capacity to load:
+                # say so rather than print a 0% that reads as "idle".
+                big = (
+                    "No staff" if row.get("station_missing")
+                    else f"{row['labor_util_safe'] * 100:.0f}%"
+                )
                 hc = int(row["HC"])
                 req = int(row["required_hc"])
                 status_label = status.split(" ", 1)[1] if " " in status else status
@@ -7409,7 +7472,7 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
 <div style="background:{bg};color:{fg};padding:12px;border-radius:8px;margin-bottom:8px;">
 <div style="font-weight:600;font-size:0.95rem;">{st_name}</div>
 <div style="font-size:0.78rem;opacity:0.85;">{status_label}</div>
-<div style="font-size:1.6rem;font-weight:700;margin-top:6px;">{util_pct:.0f}%</div>
+<div style="font-size:1.6rem;font-weight:700;margin-top:6px;">{big}</div>
 <div style="font-size:0.78rem;opacity:0.85;">{hc} people · need {req}</div>
 </div>
 """,
@@ -7424,23 +7487,30 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     if _has_weeks:
         with _view_tabs["📅 By week"]:
             st.caption(
-                "Labor utilization per station and week (5-working-day weeks) — "
-                "the week a station peaks, which the month view averages out."
+                "Labor utilization per station and week — the week a station "
+                "peaks, which the month view averages out."
             )
             st.plotly_chart(
                 _make_heatmap(weekly_util), width="stretch",
                 key="overview_weekly_heatmap_full",
             )
 
+    # One neutral color: plotly's default palette made one battery type red,
+    # which on this page reads as "over capacity". Types with no batteries in
+    # the plan (often UNKNOWN 0) get no bar.
     with _view_tabs["🔋 Batteries"]:
-        fig = px.bar(
-            batt_type, x="batt_type", y="total_batteries", color="batt_type",
-            text="total_batteries",
-            labels={"batt_type": "Battery type", "total_batteries": "Batteries"},
-        )
-        fig.update_traces(textposition="outside")
-        fig.update_layout(showlegend=False, height=340, margin=dict(t=20, b=20))
-        st.plotly_chart(fig, width="stretch")
+        _bt = batt_type[batt_type["total_batteries"] > 0] if not batt_type.empty else batt_type
+        if _bt.empty:
+            st.caption("No batteries in this plan.")
+        else:
+            fig = px.bar(
+                _bt, x="batt_type", y="total_batteries", text="total_batteries",
+                labels={"batt_type": "Battery type", "total_batteries": "Batteries"},
+            )
+            fig.update_traces(marker_color="#4C78A8", textposition="outside", cliponaxis=False)
+            fig.update_xaxes(type="category")
+            fig.update_layout(showlegend=False, height=320, margin=dict(t=24, b=20))
+            st.plotly_chart(fig, width="stretch")
 
 
 def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, total_units: int = 0, units=None):
@@ -13010,13 +13080,15 @@ def _render_action_jumps(over, missing, near) -> None:
     """Under the Overview's recommended actions: the controls they name."""
     if not (over or missing or near):
         return
-    c1, c2, _ = st.columns([2, 2, 4])
-    if c1.button(
-        "👥 Edit headcount", key="overview_edit_crew_btn", width="stretch",
+    # A row sized to the labels: fixed columns squeezed "🔧 Recommendations"
+    # onto three lines at a laptop width.
+    row = st.container(horizontal=True)
+    if row.button(
+        "👥 Edit headcount", key="overview_edit_crew_btn", width="content",
         help="Opens 👥 Station headcount in the sidebar.",
     ):
         _jump_to(None, open_crew=True)
-    if c2.button("🔧 Recommendations", key="overview_recommendations_btn", width="stretch"):
+    if row.button("🔧 Recommendations", key="overview_recommendations_btn", width="content"):
         _jump_to(TAB_RECOMMENDATIONS)
 
 

@@ -268,73 +268,30 @@ doing — it rewrites history and can lose other people's commits.
 
 ---
 
-## Staging branch workflow (testing new features safely)
+## Branch and PR workflow
 
-The repo has two long-lived branches:
+`main` is the live branch: Streamlit Cloud reads it and the app's catalog,
+crew, scenario and schedule saves write to it. Code changes go through a
+short-lived task branch and a PR against `main`, as requested by the planner.
+The existing `staging` branch is unused; testing there is not a prerequisite.
 
-- **`main`** — what the team uses every day. Streamlit Cloud's live app
-  reads/writes here.
-- **`staging`** — your experimentation branch. A second Streamlit Cloud
-  app reads/writes here. The two apps share the same repo but never
-  touch each other's data, because catalog/scenario/schedule saves are
-  branch-aware (`core/catalog_storage.GITHUB_BRANCH` is resolved from
-  `st.secrets["github_branch"]`).
+1. Fetch/pull the latest `main` before starting. Preserve local data and
+   untracked design documents.
+2. Create a task branch (`codex/<task>` for Codex). Make the change and follow
+   the cache-schema, stale-module and sidebar-rerun rules above.
+3. Run `.venv\Scripts\python.exe -m pytest -q` locally and review the diff.
+   Record any known environment-only failures in the PR.
+4. Add only the intended files, commit, and rebase the task branch on current
+   `origin/main` if needed. Push the task branch and open/update its PR against
+   `main`. Merge through review; do not push code commits directly to `main`.
 
-### Set this up once
+### Optional isolated test app
 
-1. Create the branch (already done — `staging` exists on GitHub).
-2. share.streamlit.io → **New app** → repo `tritoan156/labor_model`,
-   branch `staging`, file `app.py`. Give it a distinct URL like
-   `labor-model-staging.streamlit.app`.
-3. In the new app's **Settings → Secrets**:
-   ```toml
-   github_token  = "<your PAT>"
-   github_branch = "staging"
-   ```
-4. Deploy. The staging app now reads `data/*.csv` from the `staging`
-   branch and writes saves back to the `staging` branch.
-
-### Experiment-then-promote loop
-
-```bash
-# Make sure your local staging is current
-git checkout staging
-git pull origin staging
-
-# (optionally) bring in the latest main work first
-git merge main
-
-# Code, commit, push to staging — only the staging Streamlit Cloud
-# app sees these changes. Live users are untouched.
-git push origin staging
-
-# Once you're happy with the experiment, promote to main:
-git checkout main
-git pull
-git merge staging
-git push origin main
-```
-
-### Keep staging in sync with main
-
-If the team commits to `main` (e.g. catalog edits land via the live
-app), pull those into staging so the two stay close in step:
-
-```bash
-git checkout staging
-git pull origin main   # brings main's commits into staging
-git push origin staging
-```
-
-### Hard rules
-
-- **Never** point the staging app's `github_branch` secret at `"main"`.
-  That would route experimental saves into the live data file.
-- **Never** push experimental commits directly to `main`. Always commit
-  on `staging` first, verify on the staging URL, then merge.
-- If you need to throw away an experiment, just reset the staging
-  branch back to main: `git checkout staging && git reset --hard
-  origin/main && git push --force-with-lease origin staging`.
+The branch-aware save mechanism still supports a separate test app if the
+maintainer chooses to revive one. Point the app at a test branch and set
+`github_branch` in its Streamlit Secrets to that **same test branch**.
+Never leave a test app's save target on `main`: that would write experimental
+catalog/crew/schedule changes into live data.
 
 ---
 
@@ -399,10 +356,10 @@ us twice with Python 3.14 + new pandas combinations.
 
 If you know a major release is coming and want to verify before the
 team's deploy:
-1. Create a branch `staging` and push there.
-2. Configure a second Streamlit Cloud app pointing at the `staging`
-   branch. Test there.
-3. Merge to `main` when happy.
+1. Create a task branch and test the dependency change locally.
+2. If Cloud-specific validation is needed, use an isolated test app whose
+   code branch and `github_branch` save target both point at that task branch.
+3. Open a PR against `main` with the validation results.
 
 If you want stricter pinning, edit `requirements.txt` with version
 ranges like `streamlit<2,>=1.30` and re-deploy.

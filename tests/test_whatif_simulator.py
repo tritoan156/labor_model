@@ -149,14 +149,14 @@ class TestHelpers:
         assert "**QC** (no people)" in flagged
         assert "Battery" not in flagged
 
-    def test_headline_falls_back_like_the_capacity_tab(self):
+    def test_headline_uses_actual_capacity_even_when_potential_is_positive(self):
         single = {"lines": [{"line": "PM"}], "total": 40}
         assert app._headline_max_units(
-            {"potential_util_safe": 2.0, "potential_max_units": 25}, single, 50) == 25
-        assert app._headline_max_units({"potential_util_safe": 0.0}, single, 50) == 50
+            {"max_units": 40, "potential_util_safe": 2.0, "potential_max_units": 25}, single, 50) == 40
+        assert app._headline_max_units({"max_units": 50}, single, 50) == 50
         blocked = {"lines": [{"line": "PM"}, {"line": "EBOSS"}], "total": 0}
         assert app._headline_max_units(
-            {"potential_util_safe": 2.0, "potential_max_units": 25}, blocked, 50) == 25
+            {"max_units": 0, "potential_util_safe": 2.0, "potential_max_units": 25}, blocked, 50) == 0
 
 
 # ---------------------------------------------------------------------------

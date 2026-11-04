@@ -100,6 +100,7 @@ class TestNewCoreNamesAreProbed:
         'hasattr(core.data_loader, "_read_schedule_table")',       # load_schedule calls it
         'hasattr(core.data_loader, "_excel_serial_month")',        # coerce month calls it
         'hasattr(core.excel_io, "read_schedule_workbook")',        # app imports it
+        'hasattr(core.labor_calculator, "capacity_rates")',       # Sequencer budgets
     ])
     def test_probed_in_stale_block(self, probe):
         assert STALE_BLOCK, "couldn't find the `_stale = (...)` block in app.py"

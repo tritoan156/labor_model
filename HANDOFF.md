@@ -40,8 +40,9 @@ against per-station headcount + throughput capacity.
 
 ## Hard rules (don't break these)
 
-1. **Commit straight to `main`** — staging exists but is intentionally unused
-   right now.
+1. **Open a PR against `main`** — work on a task branch (`codex/*` for Codex),
+   validate it, then push that branch for review. Do not commit directly to
+   `main`. Staging exists but is intentionally unused right now.
 2. **`_LOADER_SCHEMA_VERSION` in `app.py` is a cache-buster.** Bump it after ANY
    CSV column add/remove/rename/type change, or users get stale cached data.
    The current value lives in `app.py` (search for the constant) — this doc
@@ -52,8 +53,9 @@ against per-station headcount + throughput capacity.
    `_`-prefixed params when building the cache key, which is how this used to
    be broken).
 3. **Commit ritual:** `git add` specific files → commit with a
-   `Co-Authored-By: Claude` trailer → `git pull --rebase origin main` →
-   `git push origin main`. (`data/usage_log.jsonl` is untracked and
+   `Co-Authored-By: Claude` trailer → `git pull --rebase origin main` on the
+   task branch → push the task branch → open/update its PR against `main`.
+   (`data/usage_log.jsonl` is untracked and
    git-ignored, so there is nothing to stash first.)
 4. Local dev on Windows: run Python as `./.venv/Scripts/python.exe`. Syntax
    check with `python -m compileall -q app.py`.

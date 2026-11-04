@@ -105,8 +105,8 @@ _stale = (
     or not hasattr(core.data_loader, "_excel_serial_month")
     # A workbook upload picks the whole-plan sheet and names the others.
     or not hasattr(core.excel_io, "read_schedule_workbook")
-    # What-if ⚖️ Balance people — app.py imports it directly.
-    or not hasattr(core.labor_calculator, "balance_headcount")
+    # Shared capacity budgets for the Sequencer and capacity table.
+    or not hasattr(core.labor_calculator, "capacity_rates")
 )
 if _stale:
     # Reload in DEPENDENCY ORDER: constants first (every other module imports
@@ -173,7 +173,7 @@ from core.excel_io import (
     CatalogImportError,
 )
 from core.labor_calculator import (
-    expand_schedule, build_capacity_table,
+    expand_schedule, build_capacity_table, capacity_rates, cycle_for_unit,
     battery_demand_by_sku, battery_demand_by_type,
     compute_unit_labor, unit_labor_split,
     buildable_by_line, balance_headcount, classify_fg_category,
@@ -1191,6 +1191,92 @@ def _transfer_to_plan_month(df, machine_df, acc_df, location, plan_month):
     return out, n
 
 
+def _sequencer_rates(inputs):
+    return capacity_rates(
+        inputs["shift"], inputs["safety"], inputs["efficiency"],
+        inputs.get("new_hire_pct", 0.0),
+        inputs.get("new_hire_productivity", 1.0),
+        inputs.get("absenteeism", 0.0), inputs.get("overtime", 0.0),
+    )
+
+
+def _sequencer_rows(schedule_df, machine_df, acc_df, inputs):
+    """Additive labor and cell-time loads, using the dashboard's unit expansion.
+
+    Sum of cycles = units touching × weighted average cycle. This lets the
+    placer price a candidate week without expanding/repricing its entire mix
+    for every candidate day. Battery counts packs; Material Handling has no
+    cell constraint. Unresolved FGs retain the existing fallback LPT weight.
+    """
+    from core.constants import (BATTERY_CYCLE_MINUTES, LABOR_ONLY_STATIONS,
+                                STATION_KEY_TO_DISPLAY)
+    rows = []
+    profiles = {}
+    for idx, row in schedule_df.iterrows():
+        fg = row.get("FG_BASE") or row.get("FG SKU ID")
+        acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or ""
+        qty = max(0, int(row.get("BUILD QTY", 0) or 0))
+        key = (fg, acc)
+        if key not in profiles:
+            unit = expand_schedule(pd.DataFrame([{
+                "FG_BASE": fg, "FG_RAW": fg, "ACC": acc,
+                "BUILD QTY": 1, "CARRYOVER": False,
+            }]), machine_df, acc_df,
+                support_minutes_per_unit=inputs.get("support_minutes_per_unit", 0.0),
+                mh_folded_stations=mh_folded_station_keys(
+                    inputs.get("mh_folded_stations", ())))
+            labor, cycles, invalid = {}, {}, set()
+            if not unit.empty:
+                u = unit.iloc[0]
+                for station in STATION_KEYS:
+                    work = float(u.get(station, 0) or 0)
+                    if work <= 0:
+                        continue
+                    labor[station] = work
+                    if station in LABOR_ONLY_STATIONS:
+                        continue
+                    disp = STATION_KEY_TO_DISPLAY[station]
+                    crew = (int(inputs["crew_config"].loc[disp, "Crew"])
+                            if disp in inputs["crew_config"].index else 0)
+                    cycle = (float(u["Bat"]) * BATTERY_CYCLE_MINUTES
+                             if station == "Battery" else
+                             cycle_for_unit(station, work, u["Class"], crew))
+                    cycles[station] = cycle
+                    if cycle <= 0:
+                        invalid.add(station)
+            profiles[key] = labor, cycles, invalid
+        labor, cycles, invalid = profiles[key]
+        rows.append({
+            "idx": idx, "fg": str(fg), "qty": qty,
+            "labor": {s: v * qty for s, v in labor.items()},
+            "cycles": {s: v * qty for s, v in cycles.items()},
+            "invalid": invalid if qty else set(),
+            "total": sum(labor.values()) * qty if labor else max(qty, 1) * 100.0,
+        })
+    return rows
+
+
+def _sequencer_limits(inputs, rates, days):
+    from core.constants import LABOR_ONLY_STATIONS, STATION_KEY_TO_DISPLAY
+    crew = inputs["crew_config"]
+    limits = {}
+    for s in STATION_KEYS:
+        disp = STATION_KEY_TO_DISPLAY[s]
+        hc, cells = ((int(crew.loc[disp, "HC"]), int(crew.loc[disp, "Conc"]))
+                     if disp in crew.index else (0, 0))
+        limits[s] = (hc * days * rates["labor_minutes"],
+                     float("inf") if s in LABOR_ONLY_STATIONS
+                     else cells * days * rates["cell_minutes"])
+    return limits
+
+
+def _sequencer_offenders(labor, cycles, invalid, limits):
+    """Zero capacity with positive demand is blocked, never unlimited."""
+    return [s for s in STATION_KEYS if labor.get(s, 0) > 0 and (
+        labor[s] > limits[s][0] + 1e-9 or
+        cycles.get(s, 0) > limits[s][1] + 1e-9 or s in invalid)]
+
+
 def _suggest_schedule_dates(
     schedule_df: pd.DataFrame, machine_df, acc_df, inputs: dict,
 ) -> "tuple[pd.DataFrame, list[dict]]":
@@ -1200,8 +1286,8 @@ def _suggest_schedule_dates(
       1. **Overrides** existing PRODUCTION DAY values — the planner clicked
          "Suggest" so they want a fresh re-spread, not an additive one.
       2. **Per-station capacity check** — for each candidate day, the placer
-         verifies that putting this unit's labor into that week wouldn't
-         tip any station above ``UTIL_THRESHOLD_OVER`` (1.0). If every day
+         verifies that putting this row's labor and cell time into that week
+         wouldn't exceed the capacity table's budgets. If every day
          fails, the unit lands on the least-loaded day and the offending
          station(s) are recorded in the returned overload list.
       3. **Returns a new DataFrame** rather than mutating the original, so
@@ -1240,32 +1326,14 @@ def _suggest_schedule_dates(
     # partial first / last calendar week (1–4 working days) absorb a full
     # week's units — the Calendar then showed a lone Monday carrying five
     # days of work and the Overview heatmap lit that week up at 500%.
-    from core.constants import STATION_KEY_TO_DISPLAY, UTIL_THRESHOLD_OVER
-    crew_config = inputs["crew_config"]
-    shift = float(inputs["shift"])
-    eff = float(inputs["efficiency"])
-    safety = float(inputs["safety"])
-
-    station_capacity: dict[str, float] = {}
-    for st_key in STATION_KEYS:
-        st_disp = STATION_KEY_TO_DISPLAY.get(st_key)
-        if not st_disp or st_disp not in crew_config.index:
-            station_capacity[st_key] = 0.0
-            continue
-        try:
-            hc = int(crew_config.loc[st_disp, "HC"])
-        except Exception:
-            hc = 0
-        station_capacity[st_key] = hc * shift * eff * safety if hc > 0 else 0.0
+    rates = _sequencer_rates(inputs)
 
     # Map each working day → its week, and each week → its working days.
     day_to_week = {d: week_of_month(d) for d in working}
     weeks = sorted(set(day_to_week.values()))
     week_ndays = {w: sum(1 for d in working if day_to_week[d] == w) for w in weeks}
 
-    def _week_cap(st_key: str, w: int) -> float:
-        """A station's labor capacity over the working days of week ``w``."""
-        return station_capacity.get(st_key, 0.0) * week_ndays.get(w, 5)
+    week_limits = {w: _sequencer_limits(inputs, rates, week_ndays[w]) for w in weeks}
 
     def _per_day(w: int) -> float:
         """Week ``w``'s running load per working day — the balance key."""
@@ -1277,39 +1345,24 @@ def _suggest_schedule_dates(
     # first few days (LPT minimizes makespan; balancing weeks first then
     # days within a week gives the level-loaded heatmap planners expect).
     station_load: dict = {(st, w): 0.0 for st in STATION_KEYS for w in weeks}
+    cell_load = {(st, w): 0.0 for st in STATION_KEYS for w in weeks}
+    invalid_cycles = {w: set() for w in weeks}
     day_total_load: dict = {d: 0.0 for d in working}
     week_total_load: dict = {w: 0.0 for w in weeks}
 
-    # Per-row labor breakdown
-    def _row_breakdown(row) -> "tuple[dict, float]":
-        fg = row.get("FG_BASE") or row.get("FG SKU ID")
-        acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or None
-        try:
-            qty = float(row.get("BUILD QTY", 0) or 0)
-        except (TypeError, ValueError):
-            qty = 0.0
-        try:
-            labor = compute_unit_labor(fg, acc, machine_df, acc_df)
-            if labor is None:
-                return {}, max(qty, 1.0) * 100.0
-            breakdown = {
-                s: float(labor.get(s, 0) or 0) * qty for s in STATION_KEYS
-            }
-            total = sum(breakdown.values())
-            return breakdown, total
-        except Exception:
-            return {}, max(qty, 1.0) * 100.0
-
     # Compute all breakdowns up front and sort largest-first (LPT)
-    rows = []
-    for idx in new_df.index:
-        br, total = _row_breakdown(new_df.loc[idx])
-        rows.append((idx, br, total))
-    rows.sort(key=lambda r: r[2], reverse=True)
+    rows = _sequencer_rows(new_df, machine_df, acc_df, inputs)
+    rows.sort(key=lambda r: r["total"], reverse=True)
 
     overloads: list[dict] = []
     assigned: dict = {}
-    for idx, breakdown, total in rows:
+    for row in rows:
+        idx, breakdown, total = row["idx"], row["labor"], row["total"]
+        def offenders(w):
+            return _sequencer_offenders(
+                {s: station_load[s, w] + breakdown.get(s, 0) for s in STATION_KEYS},
+                {s: cell_load[s, w] + row["cycles"].get(s, 0) for s in STATION_KEYS},
+                invalid_cycles[w] | row["invalid"], week_limits[w])
         # Walk candidate days lightest-first, where "light" means the
         # day's *week* has the least load. Within a week, prefer the
         # lightest day. Without the week-level key, a small plan would
@@ -1320,21 +1373,13 @@ def _suggest_schedule_dates(
             key=lambda d: (_per_day(day_to_week[d]), day_total_load[d]),
         )
         placed_day = None
+        checked_weeks = set()
         for cand in candidates:
             w = day_to_week[cand]
-            ok = True
-            for st_key, cost in breakdown.items():
-                if cost <= 0:
-                    continue
-                cap = _week_cap(st_key, w)
-                if cap <= 0:
-                    # Station doesn't exist here — skip the constraint check
-                    # (treat it like infinite capacity for this purpose).
-                    continue
-                if (station_load[(st_key, w)] + cost) / cap > UTIL_THRESHOLD_OVER:
-                    ok = False
-                    break
-            if ok:
+            if w in checked_weeks:
+                continue
+            checked_weeks.add(w)
+            if not offenders(w):
                 placed_day = cand
                 break
 
@@ -1348,14 +1393,8 @@ def _suggest_schedule_dates(
                 key=lambda d: (_per_day(day_to_week[d]), day_total_load[d]),
             )
             w = day_to_week[placed_day]
-            offenders = []
-            for st_key, cost in breakdown.items():
-                if cost <= 0:
-                    continue
-                cap = _week_cap(st_key, w)
-                if cap > 0 and (station_load[(st_key, w)] + cost) / cap > UTIL_THRESHOLD_OVER:
-                    offenders.append(st_key)
-            if offenders:
+            blocked = offenders(w)
+            if blocked:
                 fg_label = (
                     new_df.loc[idx].get("FG_BASE")
                     or new_df.loc[idx].get("FG SKU ID")
@@ -1365,7 +1404,7 @@ def _suggest_schedule_dates(
                     "row_idx": idx,
                     "fg": str(fg_label),
                     "week": int(w),
-                    "stations": offenders,
+                    "stations": blocked,
                 })
 
         # Commit the placement
@@ -1375,6 +1414,9 @@ def _suggest_schedule_dates(
         week_total_load[wk] = week_total_load.get(wk, 0.0) + total
         for st_key, cost in breakdown.items():
             station_load[(st_key, wk)] = station_load.get((st_key, wk), 0.0) + cost
+        for st_key, cost in row["cycles"].items():
+            cell_load[st_key, wk] += cost
+        invalid_cycles[wk].update(row["invalid"])
 
     # ---- Write the proposed dates back ---------------------------------
     new_days = pd.Series(
@@ -1394,129 +1436,90 @@ def _suggest_schedule_dates(
 
 
 def _diagnose_overloads(
-    schedule_df: pd.DataFrame,
-    machine_df,
-    acc_df,
-    inputs: dict,
+    schedule_df: pd.DataFrame, machine_df, acc_df, inputs: dict,
     overloads: "list[dict]",
 ) -> "list[dict]":
-    """Turn an overload list into actionable diagnoses.
+    """Explain the final proposal's overloaded weeks using its own budgets.
 
-    For each station that's binding (i.e. some unit couldn't fit there at
-    safe capacity), compute:
-      • monthly demand at that station (p-min)
-      • monthly capacity at the current settings (p-min)
-      • shortfall (demand − capacity, p-min)
-      • three concrete fixes:
-          1. HC to add — ``ceil(shortfall / (shift × days × eff × safety))``
-          2. Extra working days needed
-          3. Which heaviest units to defer to free up the shortfall
-
-    Returns a list of dicts (one per binding station), sorted by severity:
-    ``[{station, demand, capacity, shortfall, shortfall_pct,
-        hire_hc, extend_days, defer_units}, …]``.
-
-    Returns ``[]`` when ``overloads`` is empty (sanity guard).
+    A monthly surplus cannot hide a short week. Labor gaps are person-minutes;
+    cell gaps are elapsed bay-minutes. Extra people cannot resolve a cell gap.
+    The sidebar's time-window day count never changes this whole-month proposal.
     """
     if not overloads or schedule_df is None or schedule_df.empty:
         return []
     from core.constants import STATION_KEY_TO_DISPLAY
 
-    crew_config = inputs["crew_config"]
-    shift = float(inputs["shift"])
-    eff = float(inputs["efficiency"])
-    safety = float(inputs["safety"])
-    days = float(inputs["days"])
-
-    # 1) Identify the set of stations called out as binding.
-    binding_stations: set = set()
-    for o in overloads:
-        for s in o.get("stations", []):
-            binding_stations.add(s)
-    if not binding_stations:
-        return []
-
-    # 2) Compute monthly demand + capacity per binding station.
-    diagnoses: list[dict] = []
-    for st_key in binding_stations:
-        # Sum p-min of this station across the whole schedule.
-        demand = 0.0
-        for _, row in schedule_df.iterrows():
-            try:
-                fg = row.get("FG_BASE") or row.get("FG SKU ID")
-                acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or None
-                qty = float(row.get("BUILD QTY", 0) or 0)
-                labor = compute_unit_labor(fg, acc, machine_df, acc_df)
-                if labor is None:
-                    continue
-                demand += float(labor.get(st_key, 0) or 0) * qty
-            except Exception:
-                continue
-        if demand <= 0:
+    target = inputs.get("plan_month")
+    if target is None:
+        dated = pd.to_datetime(schedule_df["PRODUCTION DAY"]).dropna()
+        if dated.empty:
+            return []
+        target = (dated.iloc[0].year, dated.iloc[0].month)
+    working = _working_days_in_month(*target)
+    week_ndays = {}
+    for day in working:
+        w = week_of_month(day)
+        week_ndays[w] = week_ndays.get(w, 0) + 1
+    rates = _sequencer_rates(inputs)
+    profiles = _sequencer_rows(schedule_df, machine_df, acc_df, inputs)
+    by_week = {}
+    for row in profiles:
+        day = pd.Timestamp(schedule_df.loc[row["idx"], "PRODUCTION DAY"])
+        if pd.isna(day) or (day.year, day.month) != tuple(target):
             continue
+        by_week.setdefault(week_of_month(day), []).append(row)
 
-        st_disp = STATION_KEY_TO_DISPLAY.get(st_key, st_key)
-        if st_disp not in crew_config.index:
-            continue
-        try:
-            hc = int(crew_config.loc[st_disp, "HC"])
-        except Exception:
-            hc = 0
+    diagnoses = []
+    for week, rows in sorted(by_week.items()):
+        days = week_ndays.get(week, 0)
+        limits = _sequencer_limits(inputs, rates, days)
+        labor = {s: sum(r["labor"].get(s, 0) for r in rows) for s in STATION_KEYS}
+        cycles = {s: sum(r["cycles"].get(s, 0) for r in rows) for s in STATION_KEYS}
+        invalid = set().union(*(r["invalid"] for r in rows))
+        for station in _sequencer_offenders(labor, cycles, invalid, limits):
+            demand, cell_demand = labor[station], cycles[station]
+            capacity, cell_capacity = limits[station]
+            shortfall = max(0.0, demand - capacity)
+            cell_shortfall = max(0.0, cell_demand - cell_capacity)
+            invalid_cycle = station in invalid
+            # None means this intervention cannot fix the gap at current rates.
+            def extra(gap, budget):
+                return math.ceil(gap / budget) if budget > 0 else (None if gap > 0 else 0)
+            hire = extra(shortfall, rates["labor_minutes"] * days)
+            cells = (None if invalid_cycle else
+                     extra(cell_shortfall, rates["cell_minutes"] * days))
+            labor_days = extra(shortfall, capacity / days if days else 0)
+            cell_days = (None if invalid_cycle else
+                         extra(cell_shortfall, cell_capacity / days if days else 0))
+            extend = (max(labor_days, cell_days)
+                      if labor_days is not None and cell_days is not None else None)
 
-        capacity = hc * shift * days * eff * safety if hc > 0 else 0.0
-        shortfall = max(demand - capacity, 0.0)
-        if shortfall <= 0:
-            continue  # not actually short at the monthly level
-        shortfall_pct = (demand / capacity - 1.0) if capacity > 0 else float("inf")
-
-        # 3a) HC to add: ceil(shortfall / per-HC monthly cap)
-        per_hc_month = shift * days * eff * safety
-        hire_hc = int((shortfall + per_hc_month - 1) // per_hc_month) if per_hc_month > 0 else 0
-
-        # 3b) Extra working days: ceil(shortfall / per-day cap)
-        per_day_cap = hc * shift * eff * safety if hc > 0 else 0.0
-        extend_days = int((shortfall + per_day_cap - 1) // per_day_cap) if per_day_cap > 0 else 0
-
-        # 3c) Heaviest units to defer: pick FG SKUs by descending labor at
-        # this station × qty, accumulate until shortfall is covered.
-        per_row_labor: list[tuple] = []
-        for idx, row in schedule_df.iterrows():
-            try:
-                fg = row.get("FG_BASE") or row.get("FG SKU ID")
-                acc = row.get("ACC") or row.get("FG ACCRY SKU ID") or None
-                qty = float(row.get("BUILD QTY", 0) or 0)
-                labor = compute_unit_labor(fg, acc, machine_df, acc_df)
-                if labor is None:
-                    continue
-                row_total = float(labor.get(st_key, 0) or 0) * qty
-                if row_total > 0:
-                    per_row_labor.append((row_total, str(fg), int(qty)))
-            except Exception:
-                continue
-        per_row_labor.sort(reverse=True)
-        defer_units: list[dict] = []
-        freed = 0.0
-        for total, fg, qty in per_row_labor:
-            if freed >= shortfall:
-                break
-            defer_units.append({"fg": fg, "qty": qty, "labor_at_station": total})
-            freed += total
-
-        diagnoses.append({
-            "station_key": st_key,
-            "station_display": st_disp,
-            "demand": demand,
-            "capacity": capacity,
-            "shortfall": shortfall,
-            "shortfall_pct": shortfall_pct,
-            "hire_hc": hire_hc,
-            "extend_days": extend_days,
-            "defer_units": defer_units,
-            "freed_by_defer": freed,
-        })
-
-    # Sort severity (largest shortfall first)
-    diagnoses.sort(key=lambda d: d["shortfall"], reverse=True)
+            # Defer complete input rows (never split or drop their BUILD QTY).
+            # Cover BOTH shortages, including all rows with invalid cycles.
+            candidates = [r for r in rows if r["labor"].get(station, 0) > 0]
+            candidates.sort(key=lambda r: (
+                station in r["invalid"],
+                r["cycles"].get(station, 0) if cell_shortfall > 0
+                else r["labor"].get(station, 0)), reverse=True)
+            deferred, freed, cell_freed = [], 0.0, 0.0
+            invalid_left = sum(station in r["invalid"] for r in candidates)
+            for r in candidates:
+                if freed >= shortfall and cell_freed >= cell_shortfall and not invalid_left:
+                    break
+                value = r["labor"].get(station, 0)
+                deferred.append({"fg": r["fg"], "qty": r["qty"], "labor_at_station": value})
+                freed += value
+                cell_freed += r["cycles"].get(station, 0)
+                invalid_left -= station in r["invalid"]
+            diagnoses.append({
+                "station_key": station, "station_display": STATION_KEY_TO_DISPLAY[station],
+                "week": week, "working_days": days,
+                "demand": demand, "capacity": capacity, "shortfall": shortfall,
+                "cell_demand": cell_demand, "cell_capacity": cell_capacity,
+                "cell_shortfall": cell_shortfall, "invalid_cycle": invalid_cycle,
+                "hire_hc": hire, "add_cells": cells, "extend_days": extend,
+                "defer_units": deferred, "freed_by_defer": freed,
+            })
     return diagnoses
 
 
@@ -2479,6 +2482,12 @@ def _render_sequencer_controls(
                 "Review the comparison heatmap on the **🏠 Overview** tab. "
                 "Accept to switch the analysis to this sequence, or Discard to keep your current one."
             )
+            st.caption(
+                "Checks weekly labor and cell capacity across the full Plan month, "
+                "using each week's Mon–Fri days and current workforce settings. "
+                "Dates are level-loading suggestions; material readiness and operation "
+                "precedence are not checked."
+            )
             if overloads:
                 _ol_summary = ", ".join(
                     f"{o['fg']} (Wk {o['week']}: {', '.join(o['stations'])})"
@@ -2501,32 +2510,42 @@ def _render_sequencer_controls(
                     for d in diagnoses:
                         with st.container():
                             st.markdown(
-                                f"**Bottleneck: {d['station_display']}** "
-                                f"— short **{_fmt_min_hr(d['shortfall'])}** "
-                                f"({d['shortfall_pct']*100:+.0f}% over capacity)"
+                                f"**Week {d['week']} · {d['station_display']}** "
+                                f"— {d['working_days']} working day(s)"
                             )
                             st.caption(
-                                f"Monthly demand: **{_fmt_min_hr(d['demand'])}** "
-                                f"· Capacity at current settings: "
-                                f"**{_fmt_min_hr(d['capacity'])}**"
+                                f"Labor demand: **{_fmt_min_hr(d['demand'])}** "
+                                f"· Capacity: **{_fmt_min_hr(d['capacity'])}** "
+                                f"· Shortfall: **{_fmt_min_hr(d['shortfall'])}**"
                             )
+                            if d["cell_shortfall"] > 0:
+                                st.caption(
+                                    f"Cell time: {d['cell_demand']:,.0f} min needed "
+                                    f"/ {d['cell_capacity']:,.0f} min available. "
+                                    "Additional headcount alone does not close this cell gap."
+                                )
+                            if d["invalid_cycle"]:
+                                st.warning("No valid cycle time. Check crew and catalog settings.")
 
                             colA, colB, colC = st.columns(3)
                             with colA:
-                                st.markdown(
-                                    f"🧑 **Hire** &nbsp; +{d['hire_hc']} HC"
-                                )
-                                st.caption(
-                                    f"at {d['station_display']}. Bring weekly "
-                                    "capacity up by enough to absorb the gap."
-                                )
+                                st.markdown("🧑 **Add capacity**")
+                                if d["hire_hc"] is None:
+                                    st.caption("Restore productive labor time before sizing headcount.")
+                                elif d["hire_hc"]:
+                                    st.caption(f"+{d['hire_hc']} people for the labor gap.")
+                                else:
+                                    st.caption("No additional people needed for the labor demand.")
+                                if d["add_cells"]:
+                                    st.caption(f"+{d['add_cells']} stations/cells for the cell gap.")
                             with colB:
-                                st.markdown(
-                                    f"📅 **Extend** &nbsp; +{d['extend_days']} day(s)"
-                                )
-                                st.caption(
-                                    "Run overtime / Saturdays. Keeps current HC."
-                                )
+                                if d["extend_days"] is None:
+                                    st.markdown("📅 **Extra days cannot resolve this**")
+                                    st.caption("Restore the missing capacity or correct the cycle first.")
+                                else:
+                                    st.markdown(f"📅 **Extend** &nbsp; +{d['extend_days']} day(s)")
+                                    st.caption("Extra days at current staffing and shift settings; "
+                                               "these are not added to the calendar automatically.")
                             with colC:
                                 defer_label = "🚚 **Defer** "
                                 if d["defer_units"]:
@@ -2540,7 +2559,8 @@ def _render_sequencer_controls(
                                     if len(d["defer_units"]) > 5:
                                         _names += f" … (+{len(d['defer_units']) - 5} more)"
                                     st.caption(
-                                        f"Push heaviest units to next month: "
+                                        f"Move these rows out of week {d['week']} "
+                                        f"and check the destination's capacity: "
                                         f"{_names}. Frees "
                                         f"~{_fmt_min_hr(d['freed_by_defer'])}."
                                     )
@@ -2549,7 +2569,7 @@ def _render_sequencer_controls(
                                     st.caption("No clear deferral candidates.")
                             st.markdown("")  # spacer between stations
                     st.caption(
-                        "Pick one of the three options above, change the "
+                        "Resolve each labor and cell gap, change the "
                         "matching sidebar setting (or the schedule), and "
                         "click **💡 Level-load the month** in the plan guide "
                         "again. Or hit ✅ Accept to live with the overload."
@@ -5165,6 +5185,7 @@ The table's **`#`** column numbers the rows for you. A row takes the next number
 - **Headcount (HC) / People** — number of people assigned to a station for the whole shift.
 - **Stations/Cells (Conc)** — how many identical bays/cells run in parallel at one station (units worked on at the same time) — *not* the number of process steps.
 - **Crew per unit** — number of people working together on one unit at a station. Drives processing (cycle) time.
+- **HS Final exception** — Final cycle uses **one person** for HS units regardless of the Final crew setting. Final labor still comes directly from the catalog's `FN_Assy`, including zero.
 - **Required HC** — people needed to meet the schedule given safety + efficiency, rounded up per station. The facility total sums those per-station round-ups (assumes dedicated crews; shared floaters could need fewer).
 
 ### Safety & efficiency
@@ -5188,7 +5209,7 @@ Each station has **two** utilization checks. The overall flag (🟢/🟡/🟠/�
 - `thru_capacity = Stations/Cells × (shift ÷ avg_cycle) × efficiency × safety` (units/day the station can physically push through).
 - **Fix when red:** add more cells, shorten cycle time, extend working days. **Adding people only helps if the step is labor-paced** (more crew lowers `p-min ÷ Crew`, so each cell clears units faster); for **machine/process-paced** steps like Battery, crew size can't change the per-cell time — you need more cells. Tuned by the **Stations/Cells** sidebar control.
 
-**The classic example: Battery Assembly.** Each battery cell takes ~170 calendar minutes to build, regardless of how many people you put around it. If you have 4 cells but the plan needs 50 batteries/day, throughput maxes out at ~11/day — hiring more people does nothing. You need more cells.
+**The classic example: Battery Assembly.** Each battery takes 170 calendar minutes per cell, regardless of crew size. With 4 cells and a 480-minute shift (no overtime), raw throughput is `4 × 480 ÷ 170 ≈ 11.3 batteries/day`. At 0.50 efficiency and 1.00 safety, safe capacity is about **5.6 batteries/day**. Hiring alone does not raise this fixture limit; more cells or operating time does.
 
 The Overview's **🎯 Recommended actions** splits these two cases so you don't waste a hiring request on a throughput bottleneck.
 
@@ -5206,9 +5227,11 @@ The Overview's **🎯 Recommended actions** splits these two cases so you don't 
             st.markdown(
                 """
 ### Unit classes
-- **STD** — Standard trailer (full assembly with marry)
+- **STD** — Standard trailer
 - **HS** — Head Skid only (no trailer)
-- **HT** — Head + Trailer (mount only, no marry)
+- **HT** — Head + Trailer
+
+Final Assembly labor reads `FN_Assy` literally, including zero. Classes do not add fixed mount or marry minutes; those operations are not scheduled separately here.
 
 ### SKU naming
 - **FG SKU** — finished-good SKU from `machine_clean.csv` (e.g. `BOSS25-006`).
@@ -5231,7 +5254,7 @@ The Overview's **🎯 Recommended actions** splits these two cases so you don't 
 - `Trailer` = Trailer Assembly — trailer sub-assembly (STD/HT only)
 - `AccKIT` = Accessories KIT — kit prep
 - `ETO` = Engineering To Order — special engineering (BOSS220/BOSS400)
-- `Final` = Final Assembly — mount + marry (where used)
+- `Final` = Final Assembly — catalog `FN_Assy` labor, routed to the facility's configured team
 - `PDI / QC / Ship` — Pre-Delivery Inspection · Quality Check · Shipping
                 """
             )
@@ -6379,17 +6402,21 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
     Scales the schedule proportionally until any station hits its safe
     capacity (HC × shift × days × efficiency × safety) OR its throughput cap
     (bays × cycle). Returns the floor of that scaling, plus the bottleneck
-    station that dictated the limit. If any station the mix needs has HC = 0,
-    the build is infeasible (returns max_units = 0 and names the station).
+    station that dictated the limit. A required station with no people, no
+    cells, or an invalid cycle blocks the mix (max_units = 0). Labor-only
+    stations such as Material Handling do not need cells.
 
     ``excluded_stations`` is an optional iterable of station DISPLAY names to
     ignore when sizing the cap — neither counted as a bottleneck nor as a
-    missing (HC=0) blocker — so a station the model over-constrains (e.g.
+    missing-capacity blocker — so a station the model over-constrains (e.g.
     Battery) can be set aside until it's fixed.
 
-    Reuses ``build_capacity_table`` columns: HC, labor_demand, labor_util_safe,
-    thru_util_safe, station_display.
+    Reuses ``build_capacity_table`` columns and the same blocked-throughput
+    rule as ``buildable_by_line``. Potential caps exclude blocked stations;
+    they are conditional ceilings, never the buildable headline.
     """
+    from core.constants import LABOR_ONLY_STATIONS
+
     excluded = {str(s).strip() for s in (excluded_stations or [])}
     if capacity is None or capacity.empty or total_units <= 0:
         # Return the full key set (matching the other branches) so any caller
@@ -6399,12 +6426,14 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
         _z = int(max(total_units, 0))
         return {"max_units": _z, "bottleneck": "",
                 "max_util_safe": 0.0, "infeasible": False, "missing_stations": [],
+                "blocking_reasons": {},
                 "labor_max_units": _z, "labor_bottleneck": "", "labor_max_util_safe": 0.0,
                 "thru_max_units": _z, "thru_bottleneck": "", "thru_max_util_safe": 0.0,
                 "potential_max_units": _z, "potential_bottleneck": "",
                 "potential_util_safe": 0.0}
 
     missing: list[str] = []
+    blocking_reasons: dict[str, str] = {}
     max_util = 0.0
     bottleneck = ""
     # Track labor and throughput separately so we can tell the planner WHICH
@@ -6423,8 +6452,17 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
         if labor_demand <= 0 and need_per_day <= 0:
             continue
         hc = int(row.get("HC", 0) or 0)
+        reasons = []
         if hc <= 0:
+            reasons.append("no staff")
+        if need_per_day > 0 and row.get("station_key") not in LABOR_ONLY_STATIONS:
+            if int(row.get("Conc", 0) or 0) <= 0:
+                reasons.append("no cells")
+            elif float(row.get("avg_cycle", 0) or 0) <= 0:
+                reasons.append("invalid cycle")
+        if reasons:
             missing.append(str(st_disp))
+            blocking_reasons[str(st_disp)] = ", ".join(reasons)
             continue
         util_labor = float(row.get("labor_util_safe", 0) or 0)
         util_thru = float(row.get("thru_util_safe", 0) or 0)
@@ -6442,9 +6480,8 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
     def _cap(util: float) -> int:
         return int(total_units // util) if util > 0 else int(total_units)
 
-    # "Potential" = what the staffed stations alone could absorb, ignoring
-    # the HC=0 gaps. Useful even in the infeasible case so planners see the
-    # upper bound they'd unlock by staffing the missing stations.
+    # "Potential" = what the remaining stations alone could absorb, ignoring
+    # blocked stations. Those gaps must be resolved before this is achievable.
     potential_max = _cap(max_util)
     labor_cap_units = _cap(labor_max_util)
     thru_cap_units = _cap(thru_max_util)
@@ -6462,6 +6499,7 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
         return {"max_units": 0, "bottleneck": missing[0],
                 "max_util_safe": float("inf"), "infeasible": True,
                 "missing_stations": missing,
+                "blocking_reasons": blocking_reasons,
                 "potential_max_units": potential_max,
                 "potential_bottleneck": bottleneck,
                 "potential_util_safe": max_util,
@@ -6471,6 +6509,7 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
         # No binding station — capacity is effectively unbounded for this mix.
         return {"max_units": int(total_units), "bottleneck": "",
                 "max_util_safe": 0.0, "infeasible": False, "missing_stations": [],
+                "blocking_reasons": {},
                 "potential_max_units": int(total_units),
                 "potential_bottleneck": "", "potential_util_safe": 0.0,
                 **extras}
@@ -6481,6 +6520,7 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
         "max_util_safe": max_util,
         "infeasible": False,
         "missing_stations": [],
+        "blocking_reasons": {},
         "potential_max_units": potential_max,
         "potential_bottleneck": bottleneck,
         "potential_util_safe": max_util,
@@ -6490,30 +6530,48 @@ def _max_units_at_current_mix(capacity: pd.DataFrame, total_units: int,
 
 def _headline_max_units(mu: dict, bl: dict, total_units: int) -> int:
     """The Capacity tab's headline "Max units" figure: the sum of the parallel
-    lines' caps when the plan spans more than one line (and any line can
-    build), else the tighter of the labor / throughput caps for the mix.
+    lines' caps when the plan spans more than one line, else the actual
+    whole-mix cap. A blocked plan must never fall back to potential capacity.
 
     ``mu`` is :func:`_max_units_at_current_mix`, ``bl`` is
     ``buildable_by_line`` — the 🧪 What-if simulator quotes the same number."""
     bl_total = int(bl.get("total", 0) or 0)
-    if len(bl.get("lines", [])) > 1 and bl_total > 0:
+    if len(bl.get("lines", [])) > 1:
         return bl_total
-    if float(mu.get("potential_util_safe", 0) or 0) > 0:
-        return int(mu.get("potential_max_units", 0) or 0)
-    return int(total_units)
+    return int(mu.get("max_units", total_units) or 0)
+
+
+def _mix_blockers(mu: dict) -> str:
+    """Name the missing resource without calling a zero-cell station unstaffed."""
+    return "; ".join(
+        f"{station} ({reason})"
+        for station, reason in mu.get("blocking_reasons", {}).items()
+    )
+
+
+def _space_util(row: pd.Series) -> float | None:
+    """Physical utilization; positive demand with no cell capacity is blocked."""
+    from core.constants import LABOR_ONLY_STATIONS
+
+    if (float(row.get("need_per_day", 0) or 0) <= 0
+            or row.get("station_key") in LABOR_ONLY_STATIONS):
+        return None
+    if float(row.get("thru_cap_safe", 0) or 0) <= 0:
+        return float("inf")
+    util = float(row.get("thru_util_safe", 0) or 0)
+    return util if util > 0 else None
 
 
 def _area_space_cap(sub: pd.DataFrame, total_units: int,
                     excluded_stations=None) -> dict | None:
     """Throughput (space) cap for a group of stations — independent of HC.
 
-    Unlike ``_max_units_at_current_mix`` (which is labor-aware and skips
-    HC=0 stations), this looks ONLY at physical throughput: a station's
+    Unlike ``_max_units_at_current_mix`` (which checks labor too), this
+    looks ONLY at physical throughput: a station's
     cells exist whether or not it is staffed, so an unstaffed-but-celled
     station must still count toward the area's space bottleneck. Uses the
-    same inclusion rule as the per-station Space-limits table
-    (need_per_day > 0 AND thru_cap_safe > 0 AND thru_util_safe > 0), so the
-    two views stay consistent.
+    same inclusion rule as the per-station Space-limits table. Zero cells
+    with demand impose a zero ceiling; labor-only stations impose none.
 
     The binding cell is the station with the highest throughput utilization;
     the area cap scales the current mix until that cell saturates. Returns
@@ -6527,10 +6585,8 @@ def _area_space_cap(sub: pd.DataFrame, total_units: int,
     for st_disp, row in sub.iterrows():
         if str(st_disp) in excluded:
             continue  # planner excluded this station from buildable sizing
-        need = float(row.get("need_per_day", 0) or 0)
-        cap = float(row.get("thru_cap_safe", 0) or 0)
-        util = float(row.get("thru_util_safe", 0) or 0)
-        if need <= 0 or cap <= 0 or util <= 0:
+        util = _space_util(row)
+        if util is None:
             continue
         if util > best_util:
             best_util = util
@@ -6540,7 +6596,7 @@ def _area_space_cap(sub: pd.DataFrame, total_units: int,
     return {
         "max_units": int(total_units // best_util),
         "limiting_cell": limiting or "—",
-        "cells_used_pct": round(best_util * 100),
+        "cells_used_pct": round(best_util * 100) if math.isfinite(best_util) else None,
     }
 
 
@@ -6556,7 +6612,7 @@ def _render_buildable_by_line(bl: dict, total: int) -> None:
 
     def _bound(r):
         if r.get("infeasible"):
-            return "⚠️ unstaffed"
+            return "⚠️ no cell capacity" if r.get("binding_kind") == "throughput" else "⚠️ unstaffed"
         mu = r.get("max_util")
         if not mu:
             return "spare capacity"
@@ -7195,22 +7251,20 @@ def tab_overview(units, capacity, batt_type, inputs, schedule_month: str = "", w
     _lb = _mu.get("labor_bottleneck", "") or "—"
     _tb = _mu.get("thru_bottleneck", "") or "—"
     if _mu["infeasible"]:
-        _missing = list(_mu["missing_stations"])
         _pm = int(_mu.get("potential_max_units", 0))
         _pb = _mu.get("potential_bottleneck", "")
         _pu = float(_mu.get("potential_util_safe", 0) or 0)
         if _pm > 0 and _pb:
-            _next = f" Next limit once staffed: **{_pb}** at {_pu:.0%} ({_pm:,} units)."
-        elif _pm > 0:
-            _next = f" Once staffed, the mix could reach **{_pm:,} units**."
+            _next = (
+                f" Potential ceiling excluding blocked stations: **{_pm:,} units** "
+                f"(**{_pb}** at {_pu:.0%})."
+            )
         else:
             _next = ""
         st.markdown(
-            f"🎯 **Bottleneck: {', '.join(_missing)} "
-            f"{'has' if len(_missing) == 1 else 'have'} no staff**, so the whole "
-            f"mix can't scale.{_next}",
+            f"🎯 **Whole-mix cap: 0 units** — {_mix_blockers(_mu)}.{_next}",
             help=(
-                _how + " With an unstaffed station the mix can't scale as one "
+                _how + " With a blocked station the mix can't scale as one "
                 "block (whole-mix cap 0), but lines that don't route through it "
                 "still count toward Buildable — see the per-line breakdown."
             ),
@@ -7537,6 +7591,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
             + " — still shown below, but they don't cap Buildable units. "
             "Change this in the sidebar → **⏱️ Working-time settings**."
         )
+    _render_cell_staffing_warning(_whatif_display(inputs["crew_config"]), capacity)
 
     # =============================================================
     # Headline caps — how many units this mix can build, broken out by
@@ -7556,18 +7611,17 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
         _bl = buildable_by_line(units, capacity, excluded_stations=_excluded) if units is not None else {"lines": [], "total": 0}
         _bl_total = int(_bl.get("total", 0) or 0)
         _multi_line = len(_bl.get("lines", [])) > 1
-        if _lu > 0 or _tu > 0:
+        if _lu > 0 or _tu > 0 or _mu["infeasible"]:
             st.markdown("#### 🏭 Unit caps for this mix")
             if _mu["infeasible"]:
-                _ms = ", ".join(f"**{s}**" for s in _mu["missing_stations"])
                 st.warning(
-                    f"⚠️ **{_ms}** {'have' if len(_mu['missing_stations'])>1 else 'has'} no HC — "
-                    "current build is blocked at **0 units**. Caps below show "
-                    "what would be possible once those stations are staffed."
+                    f"⚠️ **Whole-mix cap: 0 units** — {_mix_blockers(_mu)}. "
+                    "Lines that avoid those stations can still build. "
+                    "Potential labor and throughput caps exclude blocked stations; "
+                    "resolve those gaps before using the potential figures."
                 )
             cP, cL, cT = st.columns(3)
-            _pb = _mu.get("potential_bottleneck", "") or "—"
-            _pu = float(_mu.get("potential_util_safe", 0) or 0)
+            _pb = _mu.get("bottleneck", "") or "—"
             cP.metric(
                 "Max units (all lines)" if _multi_line else "Max units (tighter cap)",
                 f"{_headline_max_units(_mu, _bl, total_units):,}",
@@ -7579,7 +7633,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                 "The smaller of the labor and throughput caps for the current mix.",
             )
             cL.metric(
-                "Labor-capped units",
+                "Potential labor-capped units" if _mu["infeasible"] else "Labor-capped units",
                 f"{_lm:,}" if _lu > 0 else "—",
                 help=(
                     "Person-minute constraint. Relieve by adding HC, "
@@ -7587,7 +7641,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                 ),
             )
             cT.metric(
-                "Throughput-capped units",
+                "Potential throughput-capped units" if _mu["infeasible"] else "Throughput-capped units",
                 f"{_tm:,}" if _tu > 0 else "—",
                 help=(
                     "Bays × cycle-time constraint. Relieve by adding "
@@ -7595,8 +7649,8 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                 ),
             )
             cP.caption(
-                f"Sum across {len(_bl['lines'])} lines · global bottleneck **{_pb}**"
-                if _multi_line else f"Bottleneck: **{_pb}** · {_pu:.0%} util"
+                f"Sum across {len(_bl['lines'])} lines · whole-mix cap: {_mu['max_units']:,}"
+                if _multi_line else f"Bottleneck: **{_pb}**"
             )
             cL.caption(f"Bottleneck: **{_lb}** · {_lu:.0%} util")
             cT.caption(f"Bottleneck: **{_tb}** · {_tu:.0%} util")
@@ -7628,17 +7682,17 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                 if sub.empty:
                     continue
                 _amu = _max_units_at_current_mix(sub, total_units, excluded_stations=_excluded)
-                _a_pm = int(_amu.get("potential_max_units", 0) or 0)
-                _a_pu = float(_amu.get("potential_util_safe", 0) or 0)
+                _a_pm = int(_amu["max_units"])
+                _a_pu = float(_amu["max_util_safe"])
                 # Only meaningful when the area actually carries demand.
                 if _a_pu <= 0:
                     continue
                 area_rows.append({
                     "Area": area,
                     "Max units": _a_pm,
-                    "Bottleneck": _amu.get("potential_bottleneck", "") or "—",
-                    "Util %": round(_a_pu * 100),
-                    "Blocked?": "⚠️ unstaffed" if _amu.get("infeasible") else "",
+                    "Bottleneck": _amu.get("bottleneck", "") or "—",
+                    "Util %": None if _amu["infeasible"] else round(_a_pu * 100),
+                    "Blocked?": _mix_blockers(_amu),
                 })
 
             if area_rows:
@@ -7668,7 +7722,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                                 "Util %", format="%d%%",
                                 help="The bottleneck station's utilization at the current plan."),
                             "Blocked?": st.column_config.TextColumn(
-                                "Blocked?", help="Flagged when a needed station in the area has no HC."),
+                                "Blocked?", help="Missing people, cells, or a valid cycle at a required station."),
                         },
                     )
 
@@ -7682,12 +7736,9 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
             _space_days = int(inputs.get("days", 0) or 0)
             stn_rows = []
             for st_disp, row in capacity.iterrows():
-                need_day = float(row.get("need_per_day", 0) or 0)
                 cap_day = float(row.get("thru_cap_safe", 0) or 0)
-                util = float(row.get("thru_util_safe", 0) or 0)
-                # Only stations carrying demand AND with a defined cell cap
-                # are space-constrained; skip the rest.
-                if need_day <= 0 or cap_day <= 0 or util <= 0:
+                util = _space_util(row)
+                if util is None:
                     continue
                 conc = int(row.get("Conc", 0) or 0)
                 is_batt = "Battery" in str(st_disp)
@@ -7699,7 +7750,7 @@ def tab_capacity_vs_demand(capacity, inputs, batt_sku=None, batt_type=None, tota
                     "Max units/day (cells)": int(round(cap_day)),
                     "Cell capacity / plan": int(round(cap_day * _space_days)),
                     "Mix ceiling (units)": int(total_units // util),
-                    "Cells used %": round(util * 100),
+                    "Cells used %": round(util * 100) if math.isfinite(util) else None,
                     "Status": row.get("thru_status_safe", "") or "—",
                 })
 
@@ -8273,6 +8324,7 @@ def _whatif_outcome(units: pd.DataFrame, crew_config: pd.DataFrame, days: int,
         "thru_util": float(mu.get("thru_max_util_safe", 0) or 0),
         "thru_bottleneck": mu.get("thru_bottleneck", "") or "—",
         "lines": bl.get("lines", []),
+        "blocking_reasons": mu["blocking_reasons"],
         "over": cap.index[cap["overall_status"] == "🔴 OVER"].tolist(),
         "near": cap.index[cap["overall_status"] == "🟠 NEAR-CAP"].tolist(),
         "busiest": busiest,
@@ -8346,6 +8398,8 @@ def _whatif_plan_table(plan: dict) -> pd.DataFrame:
 def _whatif_understaffed(scenario: pd.DataFrame, capacity: pd.DataFrame) -> list[str]:
     """Stations whose throughput assumes more people than the scenario has:
     every cell running at once needs Cells × Crew per unit."""
+    from core.constants import LABOR_ONLY_STATIONS
+
     out = []
     for station, row in scenario.iterrows():
         people = int(row["People"] or 0)
@@ -8354,9 +8408,22 @@ def _whatif_understaffed(scenario: pd.DataFrame, capacity: pd.DataFrame) -> list
         busy = station in capacity.index and float(capacity.loc[station, "labor_demand"] or 0) > 0
         if busy and people == 0:
             out.append(f"**{station}** (no people)")
-        elif busy and 0 < people < cells * crew:
+        elif (busy and capacity.loc[station].get("station_key") not in LABOR_ONLY_STATIONS
+              and 0 < people < cells * crew):
             out.append(f"**{station}** ({people} people < {cells} cells × {crew})")
     return out
+
+
+def _render_cell_staffing_warning(scenario: pd.DataFrame, capacity: pd.DataFrame) -> None:
+    """Capacity and What-if use the same warning without changing their math."""
+    understaffed = _whatif_understaffed(scenario, capacity)
+    if understaffed:
+        st.warning(
+            "⚠️ **Can't confirm every cell can be staffed at once** — "
+            + ", ".join(understaffed)
+            + ". Throughput assumes all cells run together with a full crew "
+            "each; check staffing before relying on that cell capacity."
+        )
 
 
 def _whatif_button(location: str, units: pd.DataFrame, inputs: dict, action: str) -> None:
@@ -8558,17 +8625,21 @@ def _render_whatif_simulator(units: pd.DataFrame, inputs: dict, *,
               help="Production people (Lead / Other aren't counted). Need = "
                    "Required HC summed over the stations at the scenario's days.")
 
-    understaffed = _whatif_understaffed(edited, scn["capacity"])
-    if understaffed:
+    _render_cell_staffing_warning(edited, scn["capacity"])
+    for label, outcome in (("Current", cur), ("Scenario", scn)):
+        if not outcome["blocking_reasons"]:
+            continue
         st.warning(
-            "⚠️ **Can't confirm every cell can be staffed at once** — "
-            + ", ".join(understaffed)
-            + ". Throughput assumes all cells run together with a full crew "
-            "each; with fewer people, the real output there is lower than shown."
+            f"**{label} whole-mix cap: 0 units** — {_mix_blockers(outcome)}. "
+            "Lines that avoid those stations can still build. Comparison values "
+            "marked 'potential' exclude blocked stations."
         )
 
-    def _cap_cell(units_cap: int, util: float, station: str) -> str:
-        return f"{units_cap:,} ({station})" if util > 0 else "—"
+    def _cap_cell(outcome: dict, kind: str) -> str:
+        if outcome[f"{kind}_util"] <= 0:
+            return "—"
+        value = f"{outcome[f'{kind}_units']:,} ({outcome[f'{kind}_bottleneck']})"
+        return value + (" — potential" if outcome["blocking_reasons"] else "")
 
     def _names(stations: list) -> str:
         if not stations:
@@ -8589,11 +8660,9 @@ def _render_whatif_simulator(units: pd.DataFrame, inputs: dict, *,
             ("Max units (all lines)", f"{cur['max_units']:,}", f"{scn['max_units']:,}"),
             ("Units/day", f"{cur['units_per_day']:.1f}", f"{scn['units_per_day']:.1f}"),
             ("Labor-capped units",
-             _cap_cell(cur["labor_units"], cur["labor_util"], cur["labor_bottleneck"]),
-             _cap_cell(scn["labor_units"], scn["labor_util"], scn["labor_bottleneck"])),
+             _cap_cell(cur, "labor"), _cap_cell(scn, "labor")),
             ("Throughput-capped units",
-             _cap_cell(cur["thru_units"], cur["thru_util"], cur["thru_bottleneck"]),
-             _cap_cell(scn["thru_units"], scn["thru_util"], scn["thru_bottleneck"])),
+             _cap_cell(cur, "thru"), _cap_cell(scn, "thru")),
             ("Stations over capacity", _names(cur["over"]), _names(scn["over"])),
             ("Stations near capacity", _names(cur["near"]), _names(scn["near"])),
             ("Busiest week (labor)", _week(cur), _week(scn)),
@@ -11334,8 +11403,9 @@ def tab_process_flow(units_df, machine_df, acc_df, inputs):
         "**Where does this unit go on the floor?** Pick an FG SKU "
         "(+ optional Accessory) to see the route. The graph is built from "
         "**editable per-class edges** managed in the **🔧 Edit process flow** "
-        "panel below — no need to touch any file by hand. Use it to correct the "
-        "manufacturing precedence for your facility."
+        "panel below. These edges are shared across facilities and change "
+        "the diagram only; they do not change capacity, Build Time, or "
+        "Sequencer dates. Station labor follows the active facility's catalog routing."
     )
 
     # ---- Load edges from JSON -------------------------------------------

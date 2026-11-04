@@ -33,7 +33,8 @@ class TestMaxUnitsAtCurrentMix:
     def _cap(self, rows):
         """rows: {station: (HC, labor_demand, need_per_day, labor_util, thru_util)}."""
         df = pd.DataFrame(
-            [{"HC": hc, "labor_demand": ld, "need_per_day": npd,
+            [{"HC": hc, "Conc": 1, "avg_cycle": 1,
+              "labor_demand": ld, "need_per_day": npd,
               "labor_util_safe": lu, "thru_util_safe": tu}
              for (hc, ld, npd, lu, tu) in rows.values()],
             index=list(rows.keys()),
@@ -95,7 +96,8 @@ class TestAreaSpaceCap:
     def _cap(self, rows):
         """rows: {station: (HC, need_per_day, thru_cap_safe, thru_util_safe)}."""
         df = pd.DataFrame(
-            [{"HC": hc, "need_per_day": npd, "thru_cap_safe": cap,
+            [{"HC": hc, "Conc": 1, "avg_cycle": 1,
+              "need_per_day": npd, "thru_cap_safe": cap,
               "thru_util_safe": tu}
              for (hc, npd, cap, tu) in rows.values()],
             index=list(rows.keys()),

@@ -276,9 +276,9 @@ def load_machine_labor(path: Path | str | None = None) -> pd.DataFrame:
         normalized = normalized.where(raw != "", default_station)
         return normalized.values
 
-    # Emit all 9 per-facility routing columns. The caller (app.py) projects
-    # the right facility's columns into legacy "Final Station" /
-    # "AccKIT Station" / "PDI Station" names before invoking compute, so the
+    # Emit all 15 per-facility routing columns (5 stations × 3 facilities).
+    # The caller (app.py) projects the active facility onto the legacy Final /
+    # AccKIT / PDI / Wire / Undercarriage Station names before compute, so the
     # downstream labor calculator keeps reading the legacy names unchanged.
     out["Final Station HND"]  = _read_station_col(final_station_hnd_col,  "Final")
     out["Final Station SPB"]  = _read_station_col(final_station_spb_col,  "Final")

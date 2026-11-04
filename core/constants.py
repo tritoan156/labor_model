@@ -111,13 +111,8 @@ UTIL_THRESHOLD_OVER = 1.00   # above this → 🔴 OVER capacity
 UTIL_THRESHOLD_NEAR = 0.90   # above this → 🟠 Near capacity
 UTIL_THRESHOLD_TIGHT = 0.75  # above this → 🟡 Tight
 
-# === Final Assembly labor by unit class (person-mins) ===
-# HS = PM only, Final = 30 (1 person × 30 min)
-# HT = Head Trailer (Mount only) = 60 (2 ppl × 30 min)
-# STD = Standard (Mount + Marry batched) = 60 + 96 = 156
-FINAL_LABOR = {"HS": 30, "HT": 60, "STD": 156}
-
-# Final Assembly crew override for HS units (uses 1 person, not 2)
+# Final labor reads FN_Assy literally, including zero; no class-based defaults.
+# HS Final cycle always uses one person, regardless of the configured crew.
 HS_FINAL_CREW = 1
 
 # === Battery defaults (when Acc data is missing) ===

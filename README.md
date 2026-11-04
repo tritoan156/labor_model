@@ -211,7 +211,7 @@ The reader and the diff live in `core/excel_io.py` (`read_catalog_workbook`, `di
 ## Configuration
 
 - **Sidebar** — pick facility, switch between CSV upload and manual SKU entry, edit working time (days / shift / safety / efficiency), per-facility station headcount, save scenarios / schedules.
-- **`core/constants.py`** — station defaults, FINAL_LABOR by class, battery type rules, utilization thresholds (`UTIL_THRESHOLD_OVER/NEAR/TIGHT`).
+- **`core/constants.py`** — station defaults, the one-person HS Final cycle override, battery type rules, utilization thresholds (`UTIL_THRESHOLD_OVER/NEAR/TIGHT`). Final labor comes directly from the catalog's `FN_Assy`, including zero.
 
 ---
 

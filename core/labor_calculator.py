@@ -501,6 +501,26 @@ def weighted_avg_cycle(units_df: pd.DataFrame, station: str, crew: int) -> float
 # Capacity vs Demand
 # ---------------------------------------------------------------
 
+def capacity_rates(shift_minutes: float, safety_factor: float,
+                   efficiency_factor: float = 1.0, new_hire_pct: float = 0.0,
+                   new_hire_productivity: float = 1.0, absenteeism: float = 0.0,
+                   overtime: float = 0.0) -> dict:
+    """Daily budgets shared by the capacity table and the monthly level-loader.
+
+    Labor is person-minutes per headcount; cells are elapsed minutes per bay.
+    Workforce availability reduces labor only. Overtime extends both budgets.
+    Multiply by the period's actual working days and HC / cells respectively.
+    """
+    shift = shift_minutes * (1.0 + max(0.0, float(overtime or 0.0)))
+    cell = shift * efficiency_factor * safety_factor
+    return {
+        "raw_minutes": shift,
+        "cell_minutes": cell,
+        "labor_minutes": cell * labor_availability_factor(
+            new_hire_pct, new_hire_productivity, absenteeism),
+    }
+
+
 def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
                           shift_minutes: int, working_days: int,
                           safety_factor: float,
@@ -539,12 +559,13 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
     # Labor-availability drag (new-hire ramp + absenteeism). Applied to LABOR
     # capacity and Required-HC only — NEVER to physical throughput (cells), so
     # the Space-limits view stays judged purely on equipment, not staffing.
-    labor_factor = labor_availability_factor(
-        new_hire_pct, new_hire_productivity, absenteeism)
+    rates = capacity_rates(shift_minutes, safety_factor, efficiency_factor,
+                           new_hire_pct, new_hire_productivity, absenteeism,
+                           overtime)
 
     # Overtime extends working time, so it scales the effective shift used for
     # BOTH labor capacity and throughput (cells run longer → more units/day).
-    effective_shift = shift_minutes * (1.0 + max(0.0, float(overtime or 0.0)))
+    effective_shift = rates["raw_minutes"]
 
     rows = []
     for st_key in STATION_KEYS:
@@ -562,12 +583,12 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
         #   raw  = theoretical maximum (HC × shift × days)
         #   safe = raw × efficiency × safety  (planning capacity)
         labor_cap_raw = hc * effective_shift * working_days
-        labor_cap_safe = labor_cap_raw * efficiency_factor * safety_factor * labor_factor
+        labor_cap_safe = hc * working_days * rates["labor_minutes"]
 
         # Required HC to meet labor demand at the safe rate (rounded up).
         # Uses efficiency × safety × labor-availability so the number reflects
         # realistic planning (new-hire ramp + absenteeism raise the HC needed).
-        denom = effective_shift * working_days * efficiency_factor * safety_factor * labor_factor
+        denom = working_days * rates["labor_minutes"]
         if denom > 0:
             required_hc = int(math.ceil(labor_demand / denom)) if labor_demand > 0 else 0
         else:
@@ -592,7 +613,7 @@ def build_capacity_table(units_df: pd.DataFrame, crew_config: pd.DataFrame,
         need_per_day = count_for_table / working_days if working_days > 0 else 0
         if avg_cycle > 0 and not labor_only:
             thru_cap_raw = conc * (effective_shift / avg_cycle)
-            thru_cap_safe = thru_cap_raw * efficiency_factor * safety_factor
+            thru_cap_safe = conc * rates["cell_minutes"] / avg_cycle
         else:
             # No cells to fill (or no work here): throughput never limits it.
             thru_cap_raw = thru_cap_safe = 0
